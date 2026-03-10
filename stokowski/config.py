@@ -359,4 +359,33 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
         errors.append("Missing tracker API key (set LINEAR_API_KEY or tracker.api_key)")
     if not cfg.tracker.project_slug:
         errors.append("Missing tracker.project_slug")
+
+    # Pipeline validation
+    if cfg.pipeline:
+        if not cfg.pipeline.stages:
+            errors.append("Pipeline defined but has no stages")
+
+        for stage in cfg.pipeline.stages:
+            if stage.startswith("gate:"):
+                gate_name = stage[5:]
+                if gate_name not in cfg.pipeline.gates:
+                    errors.append(
+                        f"Gate '{gate_name}' referenced in pipeline but not defined in gates"
+                    )
+
+        for gate_name, gate_cfg in cfg.pipeline.gates.items():
+            if gate_cfg.rework_to:
+                if gate_cfg.rework_to not in cfg.pipeline.stages:
+                    errors.append(
+                        f"Gate '{gate_name}' rework_to target '{gate_cfg.rework_to}' "
+                        f"is not a stage in the pipeline"
+                    )
+
+        if not cfg.tracker.gate_states:
+            errors.append("Pipeline defined but no gate_states configured in tracker")
+        if not cfg.tracker.gate_approved_state:
+            errors.append("Pipeline defined but no gate_approved_state configured")
+        if not cfg.tracker.rework_state:
+            errors.append("Pipeline defined but no rework_state configured")
+
     return errors
