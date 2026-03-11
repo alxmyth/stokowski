@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import tempfile
@@ -11,6 +12,8 @@ from typing import Any
 
 import yaml
 
+log = logging.getLogger(__name__)
+
 
 @dataclass
 class TrackerConfig:
@@ -18,13 +21,6 @@ class TrackerConfig:
     endpoint: str = "https://api.linear.app/graphql"
     api_key: str = ""
     project_slug: str = ""
-    active_states: list[str] = field(default_factory=lambda: ["Todo", "In Progress"])
-    terminal_states: list[str] = field(
-        default_factory=lambda: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
-    )
-    gate_states: list[str] = field(default_factory=lambda: ["Awaiting Gate"])
-    gate_approved_state: str = "Gate Approved"
-    rework_state: str = "Rework"
 
 
 @dataclass
@@ -79,23 +75,28 @@ class ServerConfig:
 
 
 @dataclass
-class GateConfig:
-    """Human gate checkpoint configuration."""
-    rework_to: str = ""
-    prompt: str = ""
+class LinearStatesConfig:
+    """Maps logical state names to actual Linear state names."""
+    active: str = "In Progress"
+    review: str = "Human Review"
+    gate_approved: str = "Gate Approved"
+    rework: str = "Rework"
+    terminal: list[str] = field(default_factory=lambda: ["Done", "Closed", "Cancelled"])
 
 
 @dataclass
-class PipelineConfig:
-    """Ordered pipeline of stages and gates."""
-    stages: list[str] = field(default_factory=list)
-    gates: dict[str, GateConfig] = field(default_factory=dict)
+class PromptsConfig:
+    """Prompt file references."""
+    global_prompt: str | None = None
 
 
 @dataclass
-class StageConfig:
-    """Per-stage overrides and prompt template."""
+class StateConfig:
+    """A single state in the state machine."""
     name: str = ""
+    type: str = "agent"              # "agent", "gate", "terminal"
+    prompt: str | None = None        # path to prompt .md file
+    linear_state: str = "active"     # key into LinearStatesConfig
     runner: str = "claude"
     model: str | None = None
     max_turns: int | None = None
@@ -104,9 +105,10 @@ class StageConfig:
     session: str = "inherit"
     permission_mode: str | None = None
     allowed_tools: list[str] | None = None
-    append_system_prompt: str | None = None
+    rework_to: str | None = None     # gate only
+    max_rework: int | None = None    # gate only
+    transitions: dict[str, str] = field(default_factory=dict)
     hooks: HooksConfig | None = None
-    prompt_template: str = ""
 
 
 @dataclass
@@ -124,7 +126,9 @@ class ServiceConfig:
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
-    pipeline: PipelineConfig | None = None
+    linear_states: LinearStatesConfig = field(default_factory=LinearStatesConfig)
+    prompts: PromptsConfig = field(default_factory=PromptsConfig)
+    states: dict[str, StateConfig] = field(default_factory=dict)
 
     def resolved_api_key(self) -> str:
         key = self.tracker.api_key
@@ -133,6 +137,51 @@ class ServiceConfig:
         if key.startswith("$"):
             return os.environ.get(key[1:], "")
         return key
+
+    @property
+    def entry_state(self) -> str | None:
+        """Return the first agent state (first key in states dict)."""
+        for name, sc in self.states.items():
+            if sc.type == "agent":
+                return name
+        return None
+
+    def active_linear_states(self) -> list[str]:
+        """Return Linear state names for all agent states."""
+        ls = self.linear_states
+        seen: list[str] = []
+        for sc in self.states.values():
+            if sc.type == "agent":
+                linear_name = _resolve_linear_state_name(sc.linear_state, ls)
+                if linear_name and linear_name not in seen:
+                    seen.append(linear_name)
+        return seen
+
+    def gate_linear_states(self) -> list[str]:
+        """Return Linear state names for all gate states."""
+        ls = self.linear_states
+        seen: list[str] = []
+        for sc in self.states.values():
+            if sc.type == "gate":
+                linear_name = _resolve_linear_state_name(sc.linear_state, ls)
+                if linear_name and linear_name not in seen:
+                    seen.append(linear_name)
+        return seen
+
+    def terminal_linear_states(self) -> list[str]:
+        """Return the terminal Linear state names."""
+        return list(self.linear_states.terminal)
+
+
+def _resolve_linear_state_name(key: str, ls: LinearStatesConfig) -> str:
+    """Resolve a logical state key to the actual Linear state name."""
+    mapping: dict[str, str] = {
+        "active": ls.active,
+        "review": ls.review,
+        "gate_approved": ls.gate_approved,
+        "rework": ls.rework,
+    }
+    return mapping.get(key, key)
 
 
 def _resolve_env(val: str) -> str:
@@ -158,122 +207,87 @@ def _coerce_list(val: Any) -> list[str]:
     return []
 
 
-def parse_stage_file(path: Path) -> StageConfig:
-    """Parse a stage .md file into StageConfig."""
-    content = path.read_text()
-    config_raw: dict[str, Any] = {}
-    prompt_body = content
-
-    if content.startswith("---"):
-        parts = content.split("---", 2)
-        if len(parts) >= 3:
-            config_raw = yaml.safe_load(parts[1]) or {}
-            prompt_body = parts[2]
-
-    if not isinstance(config_raw, dict):
-        config_raw = {}
-
-    h = config_raw.get("hooks", {}) or {}
-    hooks = None
-    if h:
-        hooks = HooksConfig(
-            after_create=h.get("after_create"),
-            before_run=h.get("before_run"),
-            after_run=h.get("after_run"),
-            before_remove=h.get("before_remove"),
-            on_stage_enter=h.get("on_stage_enter"),
-            timeout_ms=_coerce_int(h.get("timeout_ms"), 60_000),
-        )
-
-    # on_stage_enter can be top-level or under hooks
-    on_stage_enter = config_raw.get("on_stage_enter")
-    if on_stage_enter and not (hooks and hooks.on_stage_enter):
-        if hooks is None:
-            hooks = HooksConfig(on_stage_enter=on_stage_enter)
-        else:
-            hooks = HooksConfig(
-                after_create=hooks.after_create,
-                before_run=hooks.before_run,
-                after_run=hooks.after_run,
-                before_remove=hooks.before_remove,
-                on_stage_enter=on_stage_enter,
-                timeout_ms=hooks.timeout_ms,
-            )
-
-    allowed = config_raw.get("allowed_tools")
-
-    return StageConfig(
-        name=path.stem,
-        runner=str(config_raw.get("runner", "claude")),
-        model=config_raw.get("model"),
-        max_turns=config_raw.get("max_turns"),
-        turn_timeout_ms=config_raw.get("turn_timeout_ms"),
-        stall_timeout_ms=config_raw.get("stall_timeout_ms"),
-        session=str(config_raw.get("session", "inherit")),
-        permission_mode=config_raw.get("permission_mode"),
-        allowed_tools=_coerce_list(allowed) if allowed is not None else None,
-        append_system_prompt=config_raw.get("append_system_prompt"),
-        hooks=hooks,
-        prompt_template=prompt_body.strip(),
+def _parse_hooks(raw: dict[str, Any] | None) -> HooksConfig | None:
+    """Parse a hooks dict into HooksConfig, returning None if empty."""
+    if not raw:
+        return None
+    return HooksConfig(
+        after_create=raw.get("after_create"),
+        before_run=raw.get("before_run"),
+        after_run=raw.get("after_run"),
+        before_remove=raw.get("before_remove"),
+        on_stage_enter=raw.get("on_stage_enter"),
+        timeout_ms=_coerce_int(raw.get("timeout_ms"), 60_000),
     )
 
 
-def load_stage_configs(
-    workflow_path: Path, pipeline: PipelineConfig
-) -> dict[str, StageConfig]:
-    """Load all stage files referenced by the pipeline. Returns {stage_name: StageConfig}."""
-    stages_dir = workflow_path.parent / "stages"
-    configs: dict[str, StageConfig] = {}
+def _parse_state_config(name: str, raw: dict[str, Any]) -> StateConfig:
+    """Parse a single state entry from YAML into StateConfig."""
+    allowed = raw.get("allowed_tools")
+    hooks_raw = raw.get("hooks")
 
-    for stage_name in pipeline.stages:
-        if stage_name.startswith("gate:"):
-            continue
-        stage_file = stages_dir / f"{stage_name}.md"
-        if not stage_file.exists():
-            raise FileNotFoundError(
-                f"Stage file not found: {stage_file} (referenced in pipeline)"
-            )
-        configs[stage_name] = parse_stage_file(stage_file)
+    return StateConfig(
+        name=name,
+        type=str(raw.get("type", "agent")),
+        prompt=raw.get("prompt"),
+        linear_state=str(raw.get("linear_state", "active")),
+        runner=str(raw.get("runner", "claude")),
+        model=raw.get("model"),
+        max_turns=raw.get("max_turns"),
+        turn_timeout_ms=raw.get("turn_timeout_ms"),
+        stall_timeout_ms=raw.get("stall_timeout_ms"),
+        session=str(raw.get("session", "inherit")),
+        permission_mode=raw.get("permission_mode"),
+        allowed_tools=_coerce_list(allowed) if allowed is not None else None,
+        rework_to=raw.get("rework_to"),
+        max_rework=raw.get("max_rework"),
+        transitions=raw.get("transitions") or {},
+        hooks=_parse_hooks(hooks_raw) if hooks_raw else None,
+    )
 
-    return configs
 
-
-def merge_stage_config(
-    stage: StageConfig, root_claude: ClaudeConfig, root_hooks: HooksConfig
+def merge_state_config(
+    state: StateConfig, root_claude: ClaudeConfig, root_hooks: HooksConfig
 ) -> tuple[ClaudeConfig, HooksConfig]:
-    """Merge stage overrides with root defaults. Returns (claude_cfg, hooks_cfg)."""
+    """Merge state overrides with root defaults. Returns (claude_cfg, hooks_cfg)."""
     claude = ClaudeConfig(
         command=root_claude.command,
-        permission_mode=stage.permission_mode or root_claude.permission_mode,
-        allowed_tools=stage.allowed_tools if stage.allowed_tools is not None else root_claude.allowed_tools,
-        model=stage.model or root_claude.model,
-        max_turns=stage.max_turns if stage.max_turns is not None else root_claude.max_turns,
-        turn_timeout_ms=stage.turn_timeout_ms if stage.turn_timeout_ms is not None else root_claude.turn_timeout_ms,
-        stall_timeout_ms=stage.stall_timeout_ms if stage.stall_timeout_ms is not None else root_claude.stall_timeout_ms,
-        append_system_prompt=stage.append_system_prompt or root_claude.append_system_prompt,
+        permission_mode=state.permission_mode or root_claude.permission_mode,
+        allowed_tools=state.allowed_tools if state.allowed_tools is not None else root_claude.allowed_tools,
+        model=state.model or root_claude.model,
+        max_turns=state.max_turns if state.max_turns is not None else root_claude.max_turns,
+        turn_timeout_ms=state.turn_timeout_ms if state.turn_timeout_ms is not None else root_claude.turn_timeout_ms,
+        stall_timeout_ms=state.stall_timeout_ms if state.stall_timeout_ms is not None else root_claude.stall_timeout_ms,
+        append_system_prompt=root_claude.append_system_prompt,
     )
-    hooks = stage.hooks if stage.hooks is not None else root_hooks
+    hooks = state.hooks if state.hooks is not None else root_hooks
     return claude, hooks
 
 
 def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
-    """Parse a WORKFLOW.md file into config + prompt template."""
+    """Parse a workflow file (.yaml/.yml or .md with front matter) into config."""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Workflow file not found: {path}")
 
     content = path.read_text()
     config_raw: dict[str, Any] = {}
-    prompt_body = content
+    prompt_body = ""
 
-    if content.startswith("---"):
+    # Detect format: pure YAML or markdown with front matter
+    if path.suffix in (".yaml", ".yml"):
+        config_raw = yaml.safe_load(content) or {}
+    elif content.startswith("---"):
         parts = content.split("---", 2)
         if len(parts) >= 3:
             config_raw = yaml.safe_load(parts[1]) or {}
             prompt_body = parts[2]
+    else:
+        # Try parsing as pure YAML
+        config_raw = yaml.safe_load(content) or {}
 
     if not isinstance(config_raw, dict):
-        raise ValueError("WORKFLOW.md front matter must be a YAML mapping")
+        raise ValueError("Workflow file must contain a YAML mapping")
 
     prompt_template = prompt_body.strip()
 
@@ -284,12 +298,6 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
         endpoint=str(t.get("endpoint", "https://api.linear.app/graphql")),
         api_key=str(t.get("api_key", "")),
         project_slug=str(t.get("project_slug", "")),
-        active_states=_coerce_list(t.get("active_states")) or ["Todo", "In Progress"],
-        terminal_states=_coerce_list(t.get("terminal_states"))
-        or ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
-        gate_states=_coerce_list(t.get("gate_states")) or ["Awaiting Gate"],
-        gate_approved_state=str(t.get("gate_approved_state", "Gate Approved")),
-        rework_state=str(t.get("rework_state", "Rework")),
     )
 
     # Parse polling
@@ -307,10 +315,11 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
         before_run=h.get("before_run"),
         after_run=h.get("after_run"),
         before_remove=h.get("before_remove"),
+        on_stage_enter=h.get("on_stage_enter"),
         timeout_ms=_coerce_int(h.get("timeout_ms"), 60_000),
     )
 
-    # Parse claude (replaces codex)
+    # Parse claude
     c = config_raw.get("claude", {}) or {}
     claude = ClaudeConfig(
         command=str(c.get("command", "claude")),
@@ -336,22 +345,28 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
     s = config_raw.get("server", {}) or {}
     server = ServerConfig(port=s.get("port"))
 
-    # Parse pipeline (optional - enables staged workflows)
-    pipeline = None
-    pl = config_raw.get("pipeline", {}) or {}
-    if pl and pl.get("stages"):
-        gates_raw = pl.get("gates", {}) or {}
-        gates = {}
-        for gate_name, gate_data in gates_raw.items():
-            gd = gate_data or {}
-            gates[gate_name] = GateConfig(
-                rework_to=str(gd.get("rework_to", "")),
-                prompt=str(gd.get("prompt", "")),
-            )
-        pipeline = PipelineConfig(
-            stages=_coerce_list(pl.get("stages")),
-            gates=gates,
-        )
+    # Parse linear_states
+    ls_raw = config_raw.get("linear_states", {}) or {}
+    linear_states = LinearStatesConfig(
+        active=str(ls_raw.get("active", "In Progress")),
+        review=str(ls_raw.get("review", "Human Review")),
+        gate_approved=str(ls_raw.get("gate_approved", "Gate Approved")),
+        rework=str(ls_raw.get("rework", "Rework")),
+        terminal=_coerce_list(ls_raw.get("terminal")) or ["Done", "Closed", "Cancelled"],
+    )
+
+    # Parse prompts
+    pr_raw = config_raw.get("prompts", {}) or {}
+    prompts = PromptsConfig(
+        global_prompt=pr_raw.get("global_prompt"),
+    )
+
+    # Parse states
+    states_raw = config_raw.get("states", {}) or {}
+    states: dict[str, StateConfig] = {}
+    for state_name, state_data in states_raw.items():
+        sd = state_data or {}
+        states[state_name] = _parse_state_config(state_name, sd)
 
     cfg = ServiceConfig(
         tracker=tracker,
@@ -361,15 +376,19 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
         claude=claude,
         agent=agent,
         server=server,
-        pipeline=pipeline,
+        linear_states=linear_states,
+        prompts=prompts,
+        states=states,
     )
 
     return WorkflowDefinition(config=cfg, prompt_template=prompt_template)
 
 
 def validate_config(cfg: ServiceConfig) -> list[str]:
-    """Validate config for dispatch readiness. Returns list of errors."""
-    errors = []
+    """Validate state machine config for dispatch readiness. Returns list of errors."""
+    errors: list[str] = []
+
+    # Basic tracker checks
     if cfg.tracker.kind != "linear":
         errors.append(f"Unsupported tracker kind: {cfg.tracker.kind}")
     if not cfg.resolved_api_key():
@@ -377,32 +396,78 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
     if not cfg.tracker.project_slug:
         errors.append("Missing tracker.project_slug")
 
-    # Pipeline validation
-    if cfg.pipeline:
-        if not cfg.pipeline.stages:
-            errors.append("Pipeline defined but has no stages")
+    if not cfg.states:
+        errors.append("No states defined")
+        return errors
 
-        for stage in cfg.pipeline.stages:
-            if stage.startswith("gate:"):
-                gate_name = stage[5:]
-                if gate_name not in cfg.pipeline.gates:
-                    errors.append(
-                        f"Gate '{gate_name}' referenced in pipeline but not defined in gates"
-                    )
+    # Valid linear_state keys
+    valid_linear_keys = {"active", "review", "gate_approved", "rework", "terminal"}
 
-        for gate_name, gate_cfg in cfg.pipeline.gates.items():
-            if gate_cfg.rework_to:
-                if gate_cfg.rework_to not in cfg.pipeline.stages:
-                    errors.append(
-                        f"Gate '{gate_name}' rework_to target '{gate_cfg.rework_to}' "
-                        f"is not a stage in the pipeline"
-                    )
+    has_agent = False
+    has_terminal = False
+    all_state_names = set(cfg.states.keys())
 
-        if not cfg.tracker.gate_states:
-            errors.append("Pipeline defined but no gate_states configured in tracker")
-        if not cfg.tracker.gate_approved_state:
-            errors.append("Pipeline defined but no gate_approved_state configured")
-        if not cfg.tracker.rework_state:
-            errors.append("Pipeline defined but no rework_state configured")
+    for name, sc in cfg.states.items():
+        # Check type
+        if sc.type not in ("agent", "gate", "terminal"):
+            errors.append(f"State '{name}' has invalid type: {sc.type}")
+            continue
+
+        if sc.type == "agent":
+            has_agent = True
+            # Agent states should have a prompt
+            if not sc.prompt:
+                errors.append(f"Agent state '{name}' is missing 'prompt' field")
+
+        elif sc.type == "gate":
+            # Gates must have rework_to
+            if not sc.rework_to:
+                errors.append(f"Gate state '{name}' is missing 'rework_to' field")
+            elif sc.rework_to not in all_state_names:
+                errors.append(
+                    f"Gate state '{name}' rework_to target '{sc.rework_to}' "
+                    f"is not a defined state"
+                )
+            # Gates must have approve transition
+            if "approve" not in sc.transitions:
+                errors.append(f"Gate state '{name}' is missing 'approve' transition")
+
+        elif sc.type == "terminal":
+            has_terminal = True
+
+        # Validate linear_state key
+        if sc.linear_state not in valid_linear_keys:
+            errors.append(
+                f"State '{name}' has invalid linear_state: '{sc.linear_state}' "
+                f"(valid: {', '.join(sorted(valid_linear_keys))})"
+            )
+
+        # Validate all transitions point to existing states
+        for trigger, target in sc.transitions.items():
+            if target not in all_state_names:
+                errors.append(
+                    f"State '{name}' transition '{trigger}' points to "
+                    f"unknown state '{target}'"
+                )
+
+    if not has_agent:
+        errors.append("No agent states defined (need at least one state with type 'agent')")
+    if not has_terminal:
+        errors.append("No terminal states defined (need at least one state with type 'terminal')")
+
+    # Warn about unreachable states (non-entry states that no transition points to)
+    entry = cfg.entry_state
+    reachable: set[str] = set()
+    if entry:
+        reachable.add(entry)
+    for sc in cfg.states.values():
+        for target in sc.transitions.values():
+            reachable.add(target)
+        if sc.rework_to:
+            reachable.add(sc.rework_to)
+
+    unreachable = all_state_names - reachable
+    for name in unreachable:
+        log.warning("State '%s' is unreachable (no transitions lead to it)", name)
 
     return errors
