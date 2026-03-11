@@ -17,7 +17,7 @@ Stokowski is a long-running Python daemon that:
 6. Reconciles running agents against Linear state changes
 7. Exposes a live web dashboard and terminal UI
 
-The agent prompt, runtime config, and workspace setup all live in `WORKFLOW.md` in the operator's directory — not in this codebase.
+The agent prompt, runtime config, and workspace setup all live in `workflow.yaml` in the operator's directory — not in this codebase.
 
 ---
 
@@ -25,11 +25,13 @@ The agent prompt, runtime config, and workspace setup all live in `WORKFLOW.md` 
 
 ```
 stokowski/
-  config.py        WORKFLOW.md parser + typed config dataclasses
+  config.py        workflow.yaml parser + typed config dataclasses
   linear.py        Linear GraphQL client (httpx async)
   models.py        Domain models: Issue, RunAttempt, RetryEntry
   orchestrator.py  Main poll loop, dispatch, reconciliation, retry
+  prompt.py        Three-layer prompt assembly for state machine workflows
   runner.py        Claude Code CLI integration, stream-json parser
+  tracking.py      State machine tracking via structured Linear comments
   workspace.py     Per-issue workspace lifecycle and hooks
   web.py           Optional FastAPI dashboard
   main.py          CLI entry point, keyboard handler
@@ -53,8 +55,20 @@ Simpler operational story — single process, no BEAM runtime, no distributed co
 ### No persistent database
 All state lives in memory. The orchestrator recovers from restart by re-polling Linear and re-discovering active issues. Workspace directories on disk act as durable state.
 
-### WORKFLOW.md as the operator contract
-The operator's `WORKFLOW.md` contains both the runtime config (YAML front matter) and the agent prompt template (Jinja2 body). Stokowski re-parses it on every poll tick — config changes take effect without restart.
+### workflow.yaml as the operator contract
+The operator's `workflow.yaml` defines the runtime config and state machine. Stokowski re-parses it on every poll tick — config changes take effect without restart. Both `.yaml` and legacy `.md` (YAML front matter + Jinja2 body) formats are supported. Prompt templates are now separate `.md` files referenced by path from the config.
+
+### State machine workflow
+Each workflow defines a set of internal states that map to Linear states. States have types: `agent` (runs Claude Code), `gate` (waits for human review), or `terminal` (issue complete). Transitions between states are declared explicitly in config.
+
+**Three-layer prompt assembly:** Every agent turn's prompt is built from three layers concatenated together:
+1. **Global prompt** — shared context loaded from a `.md` file (referenced by `prompts.global_prompt`)
+2. **Stage prompt** — state-specific instructions loaded from the state's `prompt` path
+3. **Lifecycle injection** — auto-generated section with issue metadata, transitions, rework context, and recent comments
+
+**Gate protocol:** When an agent completes a state that transitions to a gate, Stokowski moves the issue to the gate's Linear state and posts a structured tracking comment. Humans approve or request rework via Linear state changes. On approval, Stokowski advances to the gate's `approve` transition target. On rework, it returns to the gate's `rework_to` state.
+
+**Structured comment tracking:** State transitions and gate decisions are persisted as HTML comments on Linear issues (`<!-- stokowski:state {...} -->` and `<!-- stokowski:gate {...} -->`). These enable crash recovery and provide context for rework runs.
 
 ### Workspace isolation
 Each issue gets its own directory under `workspace.root`. Agents run with `cwd` set to that directory. Workspaces persist across turns for the same session; they're deleted when the issue reaches a terminal state.
@@ -67,14 +81,25 @@ Every first-turn launch appends a system prompt via `--append-system-prompt` tha
 ## Component deep-dives
 
 ### config.py
-Parses `WORKFLOW.md` front matter into typed dataclasses:
-- `TrackerConfig` — Linear endpoint, API key, project slug, state lists
+Parses `workflow.yaml` (or legacy `.md` with front matter) into typed dataclasses:
+- `TrackerConfig` — Linear endpoint, API key, project slug
 - `PollingConfig` — interval
 - `WorkspaceConfig` — root path (supports `~` and `$VAR` expansion)
-- `HooksConfig` — shell scripts for lifecycle events + timeout
+- `HooksConfig` — shell scripts for lifecycle events + timeout (includes `on_stage_enter`)
 - `ClaudeConfig` — command, permission mode, model, timeouts, system prompt
 - `AgentConfig` — concurrency limits (global + per-state)
 - `ServerConfig` — optional web dashboard port
+- `LinearStatesConfig` — maps logical state names (`active`, `review`, `gate_approved`, `rework`, `terminal`) to actual Linear state names
+- `PromptsConfig` — global prompt file reference
+- `StateConfig` — a single state in the state machine: type, prompt path, linear_state key, runner, session mode, transitions, per-state overrides (model, max_turns, timeouts, hooks), gate-specific fields (rework_to, max_rework)
+
+`ServiceConfig` provides helper methods: `entry_state` (first agent state), `active_linear_states()`, `gate_linear_states()`, `terminal_linear_states()`.
+
+`merge_state_config(state, root_claude, root_hooks)` merges per-state overrides with root defaults — only specified fields are overridden. Returns `(ClaudeConfig, HooksConfig)`.
+
+`parse_workflow_file()` detects format by file extension: `.yaml`/`.yml` files are parsed as pure YAML; `.md` files are split on `---` delimiters for front matter + body.
+
+`validate_config()` checks state machine integrity: all transitions point to existing states, gates have `rework_to` and `approve` transition, at least one agent and one terminal state exist, warns about unreachable states.
 
 `ServiceConfig.resolved_api_key()` resolves the key in priority order:
 1. Literal value in YAML
@@ -164,61 +189,47 @@ CLI entry point (`cli()`) and keyboard handler.
 
 **`_load_dotenv()`** reads `.env` from cwd on startup — supports `KEY=value` format, ignores comments and blank lines. The project-local `.env` takes precedence over the shell environment (uses direct assignment, overrides existing env vars).
 
-### Pipeline mode (optional)
+### prompt.py
+Three-layer prompt assembly for state machine workflows. Main entry point is `assemble_prompt()`.
 
-When `WORKFLOW.md` includes a `pipeline:` section, Stokowski operates in staged pipeline mode instead of single-prompt mode.
+**`load_prompt_file(path, workflow_dir)`** resolves a prompt file path (absolute or relative to workflow dir) and returns its contents.
 
-**Stage files** live in `stages/` alongside `WORKFLOW.md`. Each is a Markdown file with YAML front matter (overrides) and a Jinja2 prompt body. Stage overrides are merged with root config defaults — only specified fields are overridden.
+**`render_template(template_str, context)`** renders a Jinja2 template with `_SilentUndefined` — missing variables render as empty strings instead of raising errors.
 
-**Gates** are human checkpoints declared inline as `gate:name` in the stage list. When reached, Stokowski moves the issue to a gate Linear state, posts a tracking comment, and waits. Each gate declares a `rework_to` target stage for when humans request changes.
+**`build_template_context(issue, state_name, run, attempt, last_run_at)`** builds the flat dict used for Jinja2 rendering. Includes: `issue_id`, `issue_identifier`, `issue_title`, `issue_description`, `issue_url`, `issue_priority`, `issue_state`, `issue_branch`, `issue_labels`, `state_name`, `run`, `attempt`, `last_run_at`.
 
-**Stage tracking** is persisted as structured HTML comments on Linear issues:
-- `<!-- stokowski:stage {...} -->` — machine-readable stage position
-- `<!-- stokowski:gate {...} -->` — gate status (waiting/approved/rework)
+**`build_lifecycle_section()`** generates the auto-injected lifecycle section appended to every prompt. Includes issue metadata, rework context with review comments, recent activity, available transitions, and completion instructions. Clearly demarcated with HTML comments.
 
-**Recovery on restart:** Stokowski reads the latest tracking comment to recover pipeline position.
-
-**Session modes per stage:**
-- `session: inherit` — resumes the prior Claude Code session (default)
-- `session: fresh` — starts a new session (for blind review, different runners)
-
-**Runner types:**
-- `runner: claude` — uses Claude Code CLI (default). Supports `--resume`, stream-json, token tracking.
-- `runner: codex` — uses Codex CLI. No session resume, no stream-json. Exit code only.
-
-**Linear states for pipeline mode:**
-- Active states (e.g., "In Progress") — agent is working on a stage
-- Gate states (e.g., "Awaiting Gate") — waiting for human decision
-- Gate Approved — human approved, Stokowski advances to next stage
-- Rework — human wants changes, Stokowski returns to the gate's `rework_to` stage
-- Terminal states — pipeline complete or cancelled
-
-**Pipeline run counter:** Tracks how many times the pipeline has been restarted due to rework. Visible in tracking comments.
+**`assemble_prompt()`** orchestrates the three layers: loads and renders global prompt, loads and renders stage prompt, generates lifecycle section, joins with double newlines.
 
 ### tracking.py
-Handles reading/writing structured tracking comments:
-- `make_stage_comment()` — builds stage entry comment with hidden JSON + human-readable text
-- `make_gate_comment()` — builds gate status comment (waiting/approved/rework)
-- `parse_latest_tracking()` — scans comments to find latest tracking entry for crash recovery
-- `resolve_stage_index()` — finds a stage's position in the pipeline
+State machine tracking via structured Linear comments:
+- `make_state_comment(state, run)` — builds state entry comment with hidden JSON (`<!-- stokowski:state {...} -->`) + human-readable text
+- `make_gate_comment(state, status, prompt, rework_to, run)` — builds gate status comment (waiting/approved/rework/escalated)
+- `parse_latest_tracking(comments)` — scans comments (oldest-first) to find latest state or gate tracking entry for crash recovery
+- `get_last_tracking_timestamp(comments)` — finds the timestamp of the latest tracking comment
+- `get_comments_since(comments, since_timestamp)` — filters to non-tracking comments after a given timestamp (used to gather review feedback for rework runs)
 
 ---
 
 ## Data flow: issue dispatch to PR
 
 ```
-Linear poll → Issue fetched → _dispatch() called
-    → RunAttempt created in self.running
-    → _run_worker() task spawned
-        → ensure_workspace() → after_create hook (git clone, npm install, etc.)
-        → _render_prompt() → Jinja2 renders WORKFLOW.md body with issue vars
-        → run_agent_turn() called in loop (up to max_turns)
-            → build_claude_args() → claude -p subprocess
-            → NDJSON streamed: tool_use events, assistant messages, result
-            → session_id captured for next turn
-        → _on_worker_exit() called
-            → tokens/timing aggregated
-            → retry or continuation scheduled
+workflow.yaml parsed → states + config loaded
+    → Linear poll → Issue fetched → state resolved from tracking comments
+    → _dispatch() called
+        → RunAttempt created in self.running
+        → _run_worker() task spawned
+            → ensure_workspace() → after_create hook (git clone, npm install, etc.)
+            → assemble_prompt() → 3 layers: global + stage + lifecycle
+            → run_agent_turn() called in loop (up to max_turns)
+                → build_claude_args() → claude -p subprocess
+                → NDJSON streamed: tool_use events, assistant messages, result
+                → session_id captured for next turn
+            → _on_worker_exit() called
+                → state transition on success → tracking comment posted
+                → tokens/timing aggregated
+                → retry or continuation scheduled
 ```
 
 The agent itself handles: moving Linear state, posting comments, creating branches, opening PRs via `gh pr create`, linking PR to issue. Stokowski doesn't do any of that — it's the scheduler, not the agent.
@@ -282,3 +293,5 @@ There are no automated tests beyond `--dry-run`. The system is best verified by 
 - **`--verbose` with stream-json**: Claude Code requires `--verbose` when using `--output-format stream-json`. Without it you get an error.
 - **Linear project slug**: The `project_slug` is the hex `slugId` from the project URL, not the human-readable name. These look like `abc123def456`.
 - **Uvicorn signal handlers**: Must be monkey-patched (`server.install_signal_handlers = lambda: None`) before calling `serve()`, otherwise uvicorn hijacks SIGINT.
+- **workflow.yaml is pure YAML**: No markdown front matter. The legacy `.md` format with `---` delimiters is still supported but `.yaml` is the canonical format.
+- **Prompt files use Jinja2 with silent undefined**: Missing variables become empty strings rather than raising errors. This is intentional — not all variables are available in every context.
