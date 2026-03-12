@@ -2,9 +2,9 @@
 
 # Stokowski
 
-**Autonomous Claude Code agents, orchestrated by Linear issues.**
+**Autonomous coding agents, orchestrated by Linear issues.**
 
-A Python implementation of the [OpenAI Symphony](https://github.com/openai/symphony) workflow specification — adapted for [Claude Code](https://claude.ai/claude-code) and [Linear](https://linear.app).
+A Python implementation of the [OpenAI Symphony](https://github.com/openai/symphony) workflow specification — adapted for [Claude Code](https://claude.ai/claude-code), [Codex](https://openai.com/index/introducing-codex/), and [Linear](https://linear.app).
 
 [![Python](https://img.shields.io/badge/python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-22c55e)](LICENSE)
@@ -94,18 +94,19 @@ This separation lets you build a genuinely autonomous pipeline without compromis
 
 | | Stokowski | Emdash |
 |---|---|---|
+| Agent runners | Claude Code + Codex — mix providers per state in the same pipeline | Claude Code only |
 | Agent instructions | Separate `workflow.yaml` + `prompts/` — doesn't affect interactive sessions | Applied via project rules, shared with interactive context |
 | Prompt template | Three-layer Jinja2 prompt assembly with full issue context | Managed by Emdash |
 | Quality gate hooks | `before_run` / `after_run` shell scripts per turn | Not available |
 | MCP servers | Any `.mcp.json` in your repo — Figma, iOS Simulator, Playwright, etc. | Emdash-managed integrations |
 | Per-state concurrency | Configurable per Linear state | Not available |
-| Cost | Your existing Claude subscription | Additional Emdash subscription |
+| Cost | Your existing Claude / OpenAI subscriptions | Additional Emdash subscription |
 | Open source | Yes — fork it, modify it, self-host it | Closed source SaaS |
 | Maintenance | You maintain it | Emdash maintains it |
 
 **When to choose Emdash:** You want a polished managed product, don't want to run infrastructure, and your workflow fits their model.
 
-**When to choose Stokowski:** You want full control over the agent prompt and workflow, need the interactive/autonomous context separation, have specialised MCP tooling (Figma, iOS, etc.), or want to run quality gates on every turn.
+**When to choose Stokowski:** You want full control over the agent prompt and workflow, need the interactive/autonomous context separation, want to mix Claude Code and Codex in the same pipeline, have specialised MCP tooling (Figma, iOS, etc.), or want to run quality gates on every turn.
 
 ---
 
@@ -113,17 +114,19 @@ This separation lets you build a genuinely autonomous pipeline without compromis
 
 [Symphony](https://github.com/openai/symphony) is OpenAI's open specification for autonomous coding agent orchestration: poll a tracker for issues, create isolated workspaces, run agents, manage multi-turn sessions, retry failures, and reconcile state. It ships with a Codex/Elixir reference implementation.
 
-**Stokowski implements the same spec for Claude Code.** Point it at your Linear project and git repo, and agents autonomously pick up issues, write code, run tests, open PRs, and move tickets through your workflow — all while you do other things.
+**Stokowski implements the same spec with multi-runner support.** Point it at your Linear project and git repo, and agents autonomously pick up issues, write code, run tests, open PRs, and move tickets through your workflow — all while you do other things.
+
+Different states in the same pipeline can use different runners and models. Use Claude Code Opus for investigation, Sonnet for implementation, Codex for a second opinion on code review — all in the same run, configured per-state in `workflow.yaml`.
 
 ```
-Linear issue → isolated git clone → claude -p → PR + Human Review → merge
+Linear issue → isolated git clone → agent (Claude or Codex) → PR + Human Review → merge
 ```
 
 ### How it maps to Symphony
 
 | Symphony | Stokowski |
 |----------|-----------|
-| `codex app-server` JSON-RPC | `claude -p --output-format stream-json` |
+| `codex app-server` JSON-RPC | `claude -p --output-format stream-json` or `codex --quiet` |
 | `thread/start` → thread_id | First turn → `session_id` |
 | `turn/start` on thread | `claude -p --resume <session_id>` |
 | `approval_policy: never` | `--dangerously-skip-permissions` |
@@ -135,9 +138,10 @@ Linear issue → isolated git clone → claude -p → PR + Human Review → merg
 ## Features
 
 - **Configurable state machine** — define agent stages, human gates, and transitions in `workflow.yaml`; issues flow through your pipeline automatically
+- **Multi-runner** — Claude Code and Codex in the same pipeline; different states can use different runners and models (e.g. Opus for investigation, Sonnet for implementation, Codex for review)
 - **Three-layer prompt assembly** — global prompt + per-stage prompt + auto-injected lifecycle context; each layer is a Jinja2 template with full issue variables
 - **Linear-driven dispatch** — polls for issues in configured states, dispatches agents with bounded concurrency
-- **Session continuity** — multi-turn Claude Code sessions via `--resume`; agents pick up where they left off
+- **Session continuity** — multi-turn agent sessions via `--resume` (Claude Code); agents pick up where they left off
 - **Isolated workspaces** — per-issue git clones so parallel agents never conflict
 - **Lifecycle hooks** — `after_create`, `before_run`, `after_run`, `before_remove`, `on_stage_enter` shell scripts for setup, quality gates, and cleanup
 - **Retry with backoff** — failed turns retry automatically with exponential backoff
@@ -477,8 +481,9 @@ agent:
   max_concurrent_agents: 3             # global concurrency cap (default: 5)
   max_retry_backoff_ms: 300000         # max retry delay (default: 5m)
   max_concurrent_agents_by_state:      # optional per-state concurrency limits
-    in progress: 2
-    rework: 1
+    investigate: 2
+    implement: 2
+    code-review: 1
 
 prompts:
   global_prompt: prompts/global.md     # loaded for every agent turn (optional)
@@ -488,8 +493,11 @@ states:                                # the state machine pipeline
     type: agent
     prompt: prompts/investigate.md     # Jinja2 template for this stage
     linear_state: active
+    runner: claude                     # "claude" (default) or "codex"
+    model: claude-opus-4-6            # per-state model override
+    max_turns: 8
     transitions:
-      done: review_investigation
+      complete: review_investigation   # key must be "complete" for agent states
 
   review_investigation:
     type: gate
@@ -497,21 +505,23 @@ states:                                # the state machine pipeline
     rework_to: investigate
     max_rework: 3
     transitions:
-      approve: implement
+      approve: implement               # key must be "approve" for gate states
 
   implement:
     type: agent
     prompt: prompts/implement.md
     linear_state: active
-    session: new                       # fresh session (default: inherit)
+    runner: claude
+    model: claude-sonnet-4-6
+    max_turns: 30
     transitions:
-      done: review_implementation
+      complete: review_implementation
 
   review_implementation:
     type: gate
     linear_state: review
     rework_to: implement
-    max_rework: 3
+    max_rework: 5
     transitions:
       approve: code_review
 
@@ -519,10 +529,10 @@ states:                                # the state machine pipeline
     type: agent
     prompt: prompts/code-review.md
     linear_state: active
-    session: new
-    model: claude-opus-4-6            # per-state model override
+    runner: codex                      # use Codex for an independent review
+    session: fresh                     # fresh session — no prior context
     transitions:
-      done: review_merge
+      complete: review_merge
 
   review_merge:
     type: gate
@@ -536,7 +546,29 @@ states:                                # the state machine pipeline
     linear_state: terminal
 ```
 
-Each state can override `model`, `max_turns`, `turn_timeout_ms`, `stall_timeout_ms`, `permission_mode`, `allowed_tools`, and `hooks` from the root `claude` / `hooks` defaults.
+### State types
+
+| Type | Has prompt | What Stokowski does |
+|------|-----------|---------------------|
+| `agent` (default) | Yes | Dispatches a runner (Claude Code or Codex), runs turns, follows `transitions.complete` on success |
+| `gate` | No | Moves issue to review Linear state, waits for human. Follows `transitions.approve` on Gate Approved, `rework_to` on Rework |
+| `terminal` | No | Moves issue to terminal Linear state, deletes workspace |
+
+### Per-state runner config
+
+Each state can override these fields from the root `claude` / `hooks` defaults. Only fields you specify are overridden — everything else inherits.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `runner` | `claude` | `claude` (Claude Code CLI) or `codex` (Codex CLI) |
+| `model` | root `claude.model` | Model override for this state |
+| `max_turns` | root `claude.max_turns` | Max turns for this state |
+| `turn_timeout_ms` | root value | Per-turn timeout |
+| `stall_timeout_ms` | root value | Stall detection timeout |
+| `session` | `inherit` | `inherit` (resume prior session) or `fresh` (new session, no prior context) |
+| `permission_mode` | root value | Permission mode override |
+| `allowed_tools` | root value | Tool whitelist override |
+| `hooks` | root value | State-specific lifecycle hooks |
 
 </details>
 
@@ -696,14 +728,15 @@ prompts/       →  Jinja2 stage prompt files
     └── after_run hook     →  tests, lint, etc.
           │
           ▼
-    Agent Runner
-    ├── claude -p --output-format stream-json
-    ├── --resume <session_id>  (multi-turn continuity)
+    Agent Runner (per-state configurable)
+    ├── Claude Code: claude -p --output-format stream-json
+    │   └── --resume <session_id>  (multi-turn continuity)
+    ├── Codex: codex --quiet --prompt
     ├── stall detection + turn timeout
     └── PID tracking for clean shutdown
           │
           ▼
-    Claude Code (headless)
+    Agent (headless)
     reads code · writes code · runs tests · opens PRs
 ```
 
@@ -715,7 +748,7 @@ prompts/       →  Jinja2 stage prompt files
 | `stokowski/linear.py` | Linear GraphQL client (httpx async) |
 | `stokowski/models.py` | Domain models: `Issue`, `RunAttempt`, `RetryEntry` |
 | `stokowski/orchestrator.py` | Poll loop, state machine dispatch, reconciliation, retry |
-| `stokowski/runner.py` | Claude Code CLI integration, stream-json parser |
+| `stokowski/runner.py` | Multi-runner CLI integration (Claude Code + Codex), stream-json parser |
 | `stokowski/workspace.py` | Per-issue workspace lifecycle and hooks |
 | `stokowski/web.py` | Optional FastAPI dashboard |
 | `stokowski/main.py` | CLI entry point, keyboard handler |
@@ -763,8 +796,8 @@ git diff HEAD@{1} workflow.example.yaml
 
 ## Security
 
-- **`permission_mode: auto`** passes `--dangerously-skip-permissions` to Claude Code. Agents can execute arbitrary commands in the workspace. Only use in trusted environments or Docker containers.
-- **`permission_mode: allowedTools`** scopes Claude to a specific tool list — safer for production.
+- **`permission_mode: auto`** passes `--dangerously-skip-permissions` to Claude Code. Agents can execute arbitrary commands in the workspace. Only use in trusted environments or Docker containers. (Codex runs with `--quiet` which auto-approves.)
+- **`permission_mode: allowedTools`** scopes Claude Code to a specific tool list — safer for production.
 - API keys are loaded from `.env` and never hardcoded. `.env` is gitignored.
 - Each agent only has access to its own isolated workspace directory.
 
@@ -779,4 +812,5 @@ git diff HEAD@{1} workflow.example.yaml
 ## Credits
 
 - [OpenAI Symphony](https://github.com/openai/symphony) — the spec and architecture Stokowski implements
-- [Anthropic Claude Code](https://claude.ai/claude-code) — the agent runtime
+- [Anthropic Claude Code](https://claude.ai/claude-code) — agent runtime
+- [OpenAI Codex](https://openai.com/index/introducing-codex/) — agent runtime

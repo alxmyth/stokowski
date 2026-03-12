@@ -71,7 +71,8 @@ hooks:
   timeout_ms: 120000
 
 # ---------------------------------------------------------------------------
-# Claude defaults (inherited by all states unless overridden)
+# Claude defaults (inherited by all agent states unless overridden)
+# States using runner: codex will use the Codex CLI instead.
 # ---------------------------------------------------------------------------
 claude:
   permission_mode: auto
@@ -110,7 +111,7 @@ server:
 # Order matters: the first agent state is the entry state for new issues.
 #
 # Transitions fire automatically on agent success or human action:
-#   - Agent finishes successfully  → "success" transition
+#   - Agent finishes successfully  → "complete" transition
 #   - Human approves a gate        → "approve" transition
 #   - Human requests rework        → rework_to target
 #
@@ -127,7 +128,7 @@ states:
     max_turns: 8
     session: inherit
     transitions:
-      success: research-review
+      complete: research-review
 
   # ── 2. Research Review (gate) ───────────────────────────────────────────
   # Human reviews the investigation before implementation starts.
@@ -151,7 +152,7 @@ states:
     max_turns: 30
     session: inherit
     transitions:
-      success: implementation-review
+      complete: implementation-review
 
   # ── 4. Implementation Review (gate) ─────────────────────────────────────
   # Human reviews the PR before automated code review.
@@ -167,15 +168,18 @@ states:
   # ── 5. Code Review ─────────────────────────────────────────────────────
   # Automated adversarial review: fresh session, no prior context.
   # Opus reviews the diff and posts findings.
+  # Tip: set runner: codex here to get a second-opinion from a different
+  # provider — different states can use different runners in the same run.
   code-review:
     type: agent
     prompt: prompts/review.example.md
     linear_state: active
+    runner: claude              # "claude" (default) or "codex"
     model: claude-opus-4-6
     max_turns: 10
     session: fresh              # no prior context — adversarial review
     transitions:
-      success: merge-review
+      complete: merge-review
 
   # ── 6. Merge Review (gate) ──────────────────────────────────────────────
   # Human reviews the code review findings and decides to merge or rework.
@@ -197,7 +201,7 @@ states:
     max_turns: 5
     session: inherit
     transitions:
-      success: done
+      complete: done
 
   # ── 8. Done (terminal) ─────────────────────────────────────────────────
   done:
