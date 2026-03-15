@@ -25,7 +25,7 @@ from .config import (
 )
 from .linear import LinearClient
 from .models import Issue, RetryEntry, RunAttempt
-from .prompt import assemble_prompt
+from .prompt import assemble_prompt, build_lifecycle_section
 from .runner import run_agent_turn, run_turn
 from .tracking import make_gate_comment, make_state_comment, parse_latest_tracking
 from .workspace import ensure_workspace, remove_workspace
@@ -724,10 +724,24 @@ class Orchestrator:
                     except Exception as e:
                         logger.warning(f"State check failed, continuing: {e}")
 
+                    # Build continuation prompt with lifecycle context
+                    # so the agent knows its state boundaries and transitions
+                    lifecycle = ""
+                    if state_name and state_cfg:
+                        lifecycle = "\n\n" + build_lifecycle_section(
+                            issue=issue,
+                            state_name=state_name,
+                            state_cfg=state_cfg,
+                            linear_states=self.cfg.linear_states,
+                            run=self._issue_state_runs.get(issue.id, 1),
+                        )
                     prompt = (
                         f"Continue working on {issue.identifier}. "
+                        f"You are in the **{state_name}** stage. "
                         f"The issue is still in '{current_state}' state. "
-                        f"Check your progress and continue the task."
+                        f"Check your progress and continue the task. "
+                        f"Do NOT proceed beyond the scope of the {state_name} stage."
+                        f"{lifecycle}"
                     )
 
                 attempt = await run_turn(
