@@ -646,11 +646,17 @@ class Orchestrator:
                 try:
                     client = self._ensure_linear_client()
                     active_state = self.cfg.linear_states.active
-                    await client.update_issue_state(issue.id, active_state)
-                    issue.state = active_state
-                    logger.info(
-                        f"Moved {issue.identifier} from '{todo_state}' to '{active_state}'"
-                    )
+                    moved = await client.update_issue_state(issue.id, active_state)
+                    if moved:
+                        issue.state = active_state
+                        logger.info(
+                            f"Moved {issue.identifier} from '{todo_state}' to '{active_state}'"
+                        )
+                    else:
+                        logger.warning(
+                            f"Failed to move {issue.identifier} from '{todo_state}' to '{active_state}' "
+                            f"— Linear API returned failure"
+                        )
                 except Exception as e:
                     logger.warning(f"Failed to move {issue.identifier} to active: {e}")
 

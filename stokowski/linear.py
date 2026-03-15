@@ -120,21 +120,18 @@ mutation($issueId: String!, $stateId: String!) {
 }
 """
 
-WORKFLOW_STATES_QUERY = """
-query($teamId: String!) {
-  workflowStates(filter: { team: { id: { eq: $teamId } } }) {
-    nodes {
-      id
-      name
-    }
-  }
-}
-"""
-
-ISSUE_TEAM_QUERY = """
+ISSUE_TEAM_AND_STATES_QUERY = """
 query($issueId: String!) {
   issue(id: $issueId) {
-    team { id }
+    team {
+      id
+      states {
+        nodes {
+          id
+          name
+        }
+      }
+    }
   }
 }
 """
@@ -326,19 +323,16 @@ class LinearClient:
     async def update_issue_state(self, issue_id: str, state_name: str) -> bool:
         """Move an issue to a new state by name. Returns True on success."""
         try:
-            # Get team ID from issue
-            issue_data = await self._graphql(ISSUE_TEAM_QUERY, {"issueId": issue_id})
-            team_id = issue_data.get("issue", {}).get("team", {}).get("id")
-            if not team_id:
+            # Get team and its workflow states in one query
+            data = await self._graphql(
+                ISSUE_TEAM_AND_STATES_QUERY, {"issueId": issue_id}
+            )
+            team = data.get("issue", {}).get("team", {})
+            if not team:
                 logger.error(f"Could not find team for issue {issue_id}")
                 return False
 
-            # Get workflow states for the team
-            states_data = await self._graphql(
-                WORKFLOW_STATES_QUERY, {"teamId": team_id}
-            )
-            states = states_data.get("workflowStates", {}).get("nodes", [])
-
+            states = team.get("states", {}).get("nodes", [])
             state_id = None
             for s in states:
                 if s.get("name", "").strip().lower() == state_name.strip().lower():
@@ -347,19 +341,21 @@ class LinearClient:
 
             if not state_id:
                 logger.error(
-                    f"State '{state_name}' not found for team {team_id}. "
+                    f"State '{state_name}' not found. "
                     f"Available: {[s.get('name') for s in states]}"
                 )
                 return False
 
             # Update the issue
-            data = await self._graphql(
+            result = await self._graphql(
                 ISSUE_UPDATE_MUTATION,
                 {"issueId": issue_id, "stateId": state_id},
             )
-            success = data.get("issueUpdate", {}).get("success", False)
+            success = result.get("issueUpdate", {}).get("success", False)
             if success:
                 logger.info(f"Moved issue {issue_id} to state '{state_name}'")
+            else:
+                logger.error(f"Linear rejected state update for {issue_id}")
             return success
         except Exception as e:
             logger.error(f"Failed to update state for {issue_id}: {e}")
