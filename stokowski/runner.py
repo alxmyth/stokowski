@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from .config import ClaudeConfig, HooksConfig
+from .config import ClaudeConfig, DockerConfig, HooksConfig
+from .docker_runner import build_docker_run_args, container_name_for, kill_container
 from .events import EventCallback, process_event
 from .models import Issue, RunAttempt
 
@@ -42,6 +43,40 @@ HEADLESS_CONTEXT = (
     "going. Stop early only for a true blocker you cannot work around, such as "
     "missing credentials — and say exactly what is missing."
 )
+
+
+def _prepare_docker_args(
+    docker_cfg: DockerConfig | None,
+    args: list[str],
+    workspace_path: Path,
+    workspace_key: str,
+    issue: Issue,
+    attempt: RunAttempt,
+    env: dict[str, str] | None,
+    docker_image: str = "",
+) -> tuple[list[str], str | None, str | None, dict[str, str] | None]:
+    """Wrap CLI args in docker run if Docker is enabled.
+
+    Returns (args, container_name, cwd, env) -- when Docker is enabled,
+    cwd and env are None (handled by docker run args).
+    """
+    if not (docker_cfg and docker_cfg.enabled):
+        return args, None, str(workspace_path), env
+
+    container_name = container_name_for(
+        issue.identifier, attempt.turn_count + 1, attempt.attempt
+    )
+    attempt.container_name = container_name
+    image = docker_image or docker_cfg.default_image
+    docker_args = build_docker_run_args(
+        docker_cfg=docker_cfg,
+        image=image,
+        command=args,
+        workspace_key=workspace_key,
+        env=env or {},
+        container_name=container_name,
+    )
+    return docker_args, container_name, None, None
 
 
 def build_claude_args(
@@ -115,6 +150,9 @@ async def run_codex_turn(
     turn_timeout_ms: int = 3_600_000,
     stall_timeout_ms: int = 300_000,
     env: dict[str, str] | None = None,
+    docker_cfg: DockerConfig | None = None,
+    workspace_key: str = "",
+    docker_image: str = "",
 ) -> RunAttempt:
     """Run a single Codex turn. Returns updated RunAttempt.
 
@@ -122,6 +160,11 @@ async def run_codex_turn(
     We capture stdout/stderr and use exit code for status.
     """
     args = build_codex_args(model, prompt, workspace_path)
+
+    # Docker wrapping
+    args, container_name, sub_cwd, sub_env = _prepare_docker_args(
+        docker_cfg, args, workspace_path, workspace_key, issue, attempt, env, docker_image
+    )
 
     logger.info(
         f"Launching codex issue={issue.identifier} "
@@ -134,7 +177,8 @@ async def run_codex_turn(
         from .workspace import run_hook
 
         ok = await run_hook(
-            hooks_cfg.before_run, workspace_path, hooks_cfg.timeout_ms, "before_run"
+            hooks_cfg.before_run, workspace_path, hooks_cfg.timeout_ms, "before_run",
+            docker_cfg=docker_cfg, docker_image=docker_image, workspace_key=workspace_key,
         )
         if not ok:
             attempt.status = "failed"
@@ -149,18 +193,18 @@ async def run_codex_turn(
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
-            cwd=str(workspace_path),
+            cwd=sub_cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
             limit=10 * 1024 * 1024,  # 10MB line buffer (default 64KB)
-            env=env,
+            env=sub_env,
         )
         if on_pid and proc.pid:
             on_pid(proc.pid, True)
     except FileNotFoundError:
         attempt.status = "failed"
-        attempt.error = "Codex command not found: codex"
+        attempt.error = "Docker command not found" if container_name else "Codex command not found: codex"
         logger.error(attempt.error, extra={"linked_to": issue.identifier})
         return attempt
 
@@ -195,6 +239,8 @@ async def run_codex_turn(
                     extra={"linked_to": issue.identifier},
                 )
                 proc.kill()
+                if container_name:
+                    asyncio.create_task(kill_container(container_name))
                 attempt.status = "stalled"
                 attempt.error = f"No output for {elapsed:.0f}s"
                 return
@@ -212,6 +258,8 @@ async def run_codex_turn(
         if not done:
             logger.warning(f"Codex turn timeout issue={issue.identifier}", extra={"linked_to": issue.identifier})
             proc.kill()
+            if container_name:
+                asyncio.create_task(kill_container(container_name))
             attempt.status = "timed_out"
             attempt.error = f"Turn exceeded {turn_timeout_s}s"
         else:
@@ -251,7 +299,8 @@ async def run_codex_turn(
         from .workspace import run_hook
 
         await run_hook(
-            hooks_cfg.after_run, workspace_path, hooks_cfg.timeout_ms, "after_run"
+            hooks_cfg.after_run, workspace_path, hooks_cfg.timeout_ms, "after_run",
+            docker_cfg=docker_cfg, docker_image=docker_image, workspace_key=workspace_key,
         )
 
     # Unregister PID
@@ -277,10 +326,18 @@ async def run_agent_turn(
     on_event: EventCallback | None = None,
     on_pid: PidCallback | None = None,
     env: dict[str, str] | None = None,
+    docker_cfg: DockerConfig | None = None,
+    workspace_key: str = "",
+    docker_image: str = "",
 ) -> RunAttempt:
     """Run a single Claude Code turn. Returns updated RunAttempt."""
     args = build_claude_args(
         claude_cfg, prompt, workspace_path, attempt.session_id
+    )
+
+    # Docker wrapping
+    args, container_name, sub_cwd, sub_env = _prepare_docker_args(
+        docker_cfg, args, workspace_path, workspace_key, issue, attempt, env, docker_image
     )
 
     logger.info(
@@ -295,7 +352,8 @@ async def run_agent_turn(
         from .workspace import run_hook
 
         ok = await run_hook(
-            hooks_cfg.before_run, workspace_path, hooks_cfg.timeout_ms, "before_run"
+            hooks_cfg.before_run, workspace_path, hooks_cfg.timeout_ms, "before_run",
+            docker_cfg=docker_cfg, docker_image=docker_image, workspace_key=workspace_key,
         )
         if not ok:
             attempt.status = "failed"
@@ -310,18 +368,18 @@ async def run_agent_turn(
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
-            cwd=str(workspace_path),
+            cwd=sub_cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
             limit=10 * 1024 * 1024,  # 10MB line buffer (default 64KB)
-            env=env,
+            env=sub_env,
         )
         if on_pid and proc.pid:
             on_pid(proc.pid, True)
     except FileNotFoundError:
         attempt.status = "failed"
-        attempt.error = f"Claude command not found: {claude_cfg.command}"
+        attempt.error = "Docker command not found" if container_name else f"Claude command not found: {claude_cfg.command}"
         logger.error(attempt.error, extra={"linked_to": issue.identifier})
         return attempt
 
@@ -362,6 +420,8 @@ async def run_agent_turn(
                     extra={"linked_to": issue.identifier},
                 )
                 proc.kill()
+                if container_name:
+                    asyncio.create_task(kill_container(container_name))
                 attempt.status = "stalled"
                 attempt.error = f"No output for {elapsed:.0f}s"
                 return
@@ -381,6 +441,8 @@ async def run_agent_turn(
             # Turn timeout
             logger.warning(f"Turn timeout issue={issue.identifier}", extra={"linked_to": issue.identifier})
             proc.kill()
+            if container_name:
+                asyncio.create_task(kill_container(container_name))
             attempt.status = "timed_out"
             attempt.error = f"Turn exceeded {turn_timeout_s}s"
         else:
@@ -421,7 +483,8 @@ async def run_agent_turn(
         from .workspace import run_hook
 
         await run_hook(
-            hooks_cfg.after_run, workspace_path, hooks_cfg.timeout_ms, "after_run"
+            hooks_cfg.after_run, workspace_path, hooks_cfg.timeout_ms, "after_run",
+            docker_cfg=docker_cfg, docker_image=docker_image, workspace_key=workspace_key,
         )
 
     # Unregister PID
@@ -451,6 +514,9 @@ async def run_turn(
     on_event: EventCallback | None = None,
     on_pid: PidCallback | None = None,
     env: dict[str, str] | None = None,
+    docker_cfg: DockerConfig | None = None,
+    workspace_key: str = "",
+    docker_image: str = "",
 ) -> RunAttempt:
     """Route to the correct runner based on runner_type."""
     if runner_type == "codex":
@@ -465,6 +531,9 @@ async def run_turn(
             turn_timeout_ms=claude_cfg.turn_timeout_ms,
             stall_timeout_ms=claude_cfg.stall_timeout_ms,
             env=env,
+            docker_cfg=docker_cfg,
+            workspace_key=workspace_key,
+            docker_image=docker_image,
         )
     elif runner_type == "claude":
         return await run_agent_turn(
@@ -477,6 +546,9 @@ async def run_turn(
             on_event=on_event,
             on_pid=on_pid,
             env=env,
+            docker_cfg=docker_cfg,
+            workspace_key=workspace_key,
+            docker_image=docker_image,
         )
     else:
         raise ValueError(f"Unknown runner type: {runner_type}")

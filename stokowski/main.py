@@ -39,6 +39,7 @@ from rich.text import Text
 
 from .orchestrator import MultiOrchestrator
 
+logger = logging.getLogger(__name__)
 console = Console()
 
 # Module-level update message, set once at startup
@@ -223,6 +224,7 @@ class KeyboardHandler:
 
     def _run(self):
         if not sys.stdin.isatty():
+            logger.info("Non-interactive mode: keyboard handler disabled, use web dashboard")
             return
 
         fd = sys.stdin.fileno()
@@ -366,6 +368,11 @@ async def run_orchestrator(workflow_path: str, host_ip: str | None = None, port:
             console.print(
                 "[yellow]Install web extras for dashboard: pip install stokowski[web][/yellow]"
             )
+
+    if not sys.stdin.isatty() and not port:
+        logger.warning(
+            "Running non-interactively without web dashboard — consider using --port"
+        )
 
     await check_for_updates()
 
@@ -552,7 +559,7 @@ def show_stats(workflow_path: str) -> None:
 
 
 def _force_kill_children():
-    """Kill any lingering claude -p processes."""
+    """Kill any lingering claude -p processes and Docker containers."""
     import subprocess
     try:
         result = subprocess.run(
@@ -569,6 +576,20 @@ def _force_kill_children():
                         os.kill(pid, signal.SIGKILL)
                 except (ValueError, ProcessLookupError, PermissionError, OSError):
                     pass
+    except Exception:
+        pass
+
+    # Kill Docker containers
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "-q", "--filter", "label=stokowski=true"],
+            capture_output=True, text=True,
+        )
+        for cid in result.stdout.strip().split("\n"):
+            if cid.strip():
+                subprocess.run(
+                    ["docker", "kill", cid.strip()], capture_output=True
+                )
     except Exception:
         pass
 
