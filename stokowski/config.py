@@ -557,7 +557,9 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
             errors.append("docker.enabled is true but docker.default_image is not set")
         if cfg.docker.inherit_claude_config:
             host_dir = os.path.expandvars(os.path.expanduser(cfg.docker.host_claude_dir))
-            if not Path(host_dir).exists():
+            # Only warn if running locally — in DooD mode this is a host path
+            # that won't exist inside the orchestrator container
+            if not os.environ.get("HOST_HOME") and not Path(host_dir).exists():
                 log.warning(
                     "docker.host_claude_dir '%s' does not exist — "
                     "agents may fail to authenticate",

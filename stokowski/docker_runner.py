@@ -127,10 +127,15 @@ def build_docker_run_args(
         # Read-write mount: agents can write session data for --resume support.
         # This means agents can also modify host Claude config — accepted tradeoff
         # for inherit mode. Use inherit_claude_config: false for full isolation.
+        # Mount into /home/agent (non-root user in Dockerfile.agent)
+        home = "/home/agent"
         host_dir = resolve_host_path(docker_cfg.host_claude_dir)
-        args.extend(["-v", f"{host_dir}:/root/.claude"])
+        args.extend(["-v", f"{host_dir}:{home}/.claude"])
+        # Claude Code also reads ~/.claude.json for its main config
+        host_json = os.path.join(os.path.dirname(host_dir), ".claude.json")
+        args.extend(["-v", f"{host_json}:{home}/.claude.json"])
     else:
-        args.extend(["-v", f"{docker_cfg.sessions_volume}:/root/.claude"])
+        args.extend(["-v", f"{docker_cfg.sessions_volume}:/home/agent/.claude"])
 
     # Operator-declared extra volumes
     for v in docker_cfg.extra_volumes:

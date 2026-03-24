@@ -17,12 +17,17 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 # Install Claude Code
 RUN npm install -g @anthropic-ai/claude-code
 
+# Create non-root user (Claude Code refuses --dangerously-skip-permissions as root)
+RUN useradd -m -s /bin/bash agent
+
 # Pre-populate GitHub SSH known hosts
-RUN mkdir -p /root/.ssh && \
-    ssh-keyscan github.com >> /root/.ssh/known_hosts 2>/dev/null
+RUN mkdir -p /home/agent/.ssh && \
+    ssh-keyscan github.com >> /home/agent/.ssh/known_hosts 2>/dev/null && \
+    chown -R agent:agent /home/agent/.ssh
 
 # Default git config (operators should override via volume mount)
-RUN git config --global user.name "Stokowski Agent" && \
-    git config --global user.email "agent@stokowski.dev"
+RUN su agent -c 'git config --global user.name "Stokowski Agent"' && \
+    su agent -c 'git config --global user.email "agent@stokowski.dev"'
 
+USER agent
 WORKDIR /workspace
