@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -15,6 +16,9 @@ from .events import EventCallback, process_event
 from .models import Issue, RunAttempt
 
 logger = logging.getLogger("stokowski.runner")
+
+# Pattern for agent-requested transition directives in result text
+TRANSITION_PATTERN = re.compile(r"<!--\s*transition:(\w[\w-]*)\s*-->")
 
 # Callback for registering/unregistering child PIDs
 PidCallback = Callable[[int, bool], None]  # (pid, is_register)
