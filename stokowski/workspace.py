@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -48,7 +49,11 @@ async def run_hook(
             image=docker_image,
             command=inner_cmd,
             workspace_key=workspace_key,
-            env={},
+            env={
+                var: os.environ[var]
+                for var in docker_cfg.extra_env
+                if var in os.environ
+            },
             container_name=hook_container_name,
         )
         try:

@@ -353,8 +353,10 @@ async def run_orchestrator(workflow_path: str, host_ip: str | None = None, port:
             import uvicorn
 
             app = create_app(orch)
+            # Bind 0.0.0.0 in containers so the port forward works on macOS Docker
+            bind_host = "0.0.0.0" if not sys.stdin.isatty() else "127.0.0.1"
             server_config = uvicorn.Config(
-                app, host=effective_host_ip, port=effective_port, log_level="warning",
+                app, host=bind_host, port=port, log_level="warning",
             )
             _uvicorn_server = uvicorn.Server(server_config)
             _uvicorn_server.install_signal_handlers = lambda: None
