@@ -599,11 +599,13 @@ class Orchestrator:
         """
         current_state_name = self._issue_current_state.get(issue.id)
         if not current_state_name:
+            self.claimed.discard(issue.id)
             logger.warning(f"No current state for {issue.identifier}, cannot transition", extra={"linked_to": issue.identifier})
             return
 
         current_cfg = self._states_for(issue).get(current_state_name)
         if not current_cfg:
+            self.claimed.discard(issue.id)
             logger.warning(f"Unknown state '{current_state_name}' for {issue.identifier}", extra={"linked_to": issue.identifier})
             return
 
@@ -611,14 +613,19 @@ class Orchestrator:
         if not target_name:
             logger.warning(
                 f"No '{transition_name}' transition from state '{current_state_name}' "
-                f"for {issue.identifier}",
-                extra={"linked_to": issue.identifier},
+                f"for {issue.identifier}, falling back to 'complete'"
             )
-            return
+            # Fall back to "complete" — the agent succeeded, don't lose its work
+            target_name = current_cfg.transitions.get("complete")
+            if not target_name:
+                self.claimed.discard(issue.id)
+                return
+            transition_name = "complete"
 
         target_cfg = self._states_for(issue).get(target_name)
         if not target_cfg:
             logger.warning(f"Transition target '{target_name}' not found in config")
+            self.claimed.discard(issue.id)
             return
 
         run = self._issue_state_runs.get(issue.id, 1)
@@ -1370,6 +1377,14 @@ class Orchestrator:
             except Exception as e:
                 logger.warning(f"Failed to fetch comments for prompt: {e}", extra={"linked_to": issue.identifier})
 
+            # Only flag as rework for inherit-session states. Fresh-session
+            # states (like review) start with zero context each time.
+            state_cfg_for_rework = self.cfg.states.get(state_name)
+            is_rework = (
+                run > 1
+                and (not state_cfg_for_rework or state_cfg_for_rework.session != "fresh")
+            )
+
             return assemble_prompt(
                 cfg=self.cfg,
                 workflow_dir=str(self.workflow_path.parent),
@@ -1377,7 +1392,7 @@ class Orchestrator:
                 state_name=state_name,
                 state_cfg=state_cfg,
                 run=run,
-                is_rework=False,
+                is_rework=is_rework,
                 attempt=attempt_num or 1,
                 last_run_at=last_run_at,
                 comments=comments,
@@ -1686,7 +1701,15 @@ class Orchestrator:
             self.total_seconds_running += elapsed
 
         if attempt.session_id:
-            self._last_session_ids[issue.id] = attempt.session_id
+            # Only persist session IDs for inherit-mode states.
+            # Fresh sessions must not overwrite the stored ID, or the
+            # next inherit-mode state resumes the wrong session.
+            should_persist = True
+            state_cfg = self.cfg.states.get(attempt.state_name or "")
+            if state_cfg and state_cfg.session == "fresh":
+                should_persist = False
+            if should_persist:
+                self._last_session_ids[issue.id] = attempt.session_id
 
         completed_at = datetime.now(timezone.utc)
         attempt.completed_at = completed_at
