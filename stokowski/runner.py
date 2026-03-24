@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -14,6 +15,9 @@ from .docker_runner import build_docker_run_args, container_name_for, kill_conta
 from .models import Issue, RunAttempt
 
 logger = logging.getLogger("stokowski.runner")
+
+# Pattern for agent-requested transition directives in result text
+TRANSITION_PATTERN = re.compile(r"<!--\s*transition:(\w[\w-]*)\s*-->")
 
 # Callback type for events from the runner to the orchestrator
 EventCallback = Callable[[str, str, dict[str, Any]], None]
@@ -87,9 +91,9 @@ def build_claude_args(
     if not session_id:
         headless_context = (
             "You are running in headless/unattended mode via Stokowski orchestrator. "
-            "Do NOT use interactive skills, slash commands, or the Skill tool. "
-            "Do NOT invoke brainstorming, plan mode, or any interactive workflow. "
-            "Work autonomously and directly on the task."
+            "Do NOT use plan mode or wait for human input. "
+            "You MAY use the Skill tool and Agent tool — when invoking skills, "
+            "operate in pipeline mode and skip all interactive prompts."
         )
         extra = claude_cfg.append_system_prompt or ""
         combined = f"{headless_context}\n{extra}".strip()
@@ -494,6 +498,16 @@ def _process_event(
         result_text = event.get("result", "")
         if isinstance(result_text, str) and result_text:
             attempt.last_message = result_text[:200]
+
+            # Parse agent-requested transition directive (use LAST match
+            # to avoid capturing quoted directives from earlier output)
+            matches = TRANSITION_PATTERN.findall(result_text)
+            if matches:
+                attempt.requested_transition = matches[-1]
+                logger.info(
+                    f"Transition directive parsed issue={identifier} "
+                    f"transition={matches[-1]}"
+                )
 
     elif event_type == "assistant":
         # Assistant message content

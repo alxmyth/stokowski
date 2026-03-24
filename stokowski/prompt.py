@@ -204,11 +204,27 @@ def build_lifecycle_section(
     # Instructions for completion
     lines.append("### When Done")
     lines.append("")
-    lines.append(
-        "When you have completed your work, post a summary comment on "
-        "the Linear issue describing what was done and any decisions made."
-    )
-    lines.append("")
+    if len(state_cfg.transitions) > 1:
+        lines.append(
+            "When you have completed your work, include a transition "
+            "directive in your final message to indicate the next step:"
+        )
+        lines.append("")
+        lines.append("```")
+        lines.append("<!-- transition:TRANSITION_NAME -->")
+        lines.append("```")
+        lines.append("")
+        lines.append(
+            "where TRANSITION_NAME is one of the transitions listed above. "
+            "If no directive is included, `complete` is used by default."
+        )
+        lines.append("")
+    else:
+        lines.append(
+            "When you have completed your work, the `complete` transition "
+            "will fire automatically. No special action is needed."
+        )
+        lines.append("")
     lines.append("<!-- END STOKOWSKI LIFECYCLE -->")
 
     return "\n".join(lines)

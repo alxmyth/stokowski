@@ -290,6 +290,41 @@ class Orchestrator:
     async def _enter_gate(self, issue: Issue, state_name: str):
         """Move issue to gate state and post tracking comment."""
         state_cfg = self.cfg.states.get(state_name)
+
+        # Check for skip labels — auto-approve if any match
+        if state_cfg and state_cfg.skip_labels:
+            issue_labels_lower = [l.lower() for l in (issue.labels or [])]
+            skip_labels_lower = [s.lower() for s in state_cfg.skip_labels]
+            should_skip = any(sl in issue_labels_lower for sl in skip_labels_lower)
+
+            if should_skip and "approve" in (state_cfg.transitions or {}):
+                target = state_cfg.transitions["approve"]
+                run = self._issue_state_runs.get(issue.id, 1)
+
+                client = self._ensure_linear_client()
+                comment = make_gate_comment(
+                    state=state_name, status="approved", run=run,
+                )
+                await client.post_comment(issue.id, comment)
+
+                self._issue_current_state[issue.id] = target
+                self._issue_state_runs[issue.id] = 1  # Reset for new state
+                self.running.pop(issue.id, None)
+                self._tasks.pop(issue.id, None)
+                # Keep claimed — prevents double-dispatch race with concurrent tick
+                self._pending_gates.pop(issue.id, None)
+
+                # Post state-entry comment for audit trail
+                state_comment = make_state_comment(state=target, run=1)
+                await client.post_comment(issue.id, state_comment)
+
+                logger.info(
+                    f"Gate auto-skipped issue={issue.identifier} "
+                    f"gate={state_name} (label match) -> {target}"
+                )
+                self._schedule_retry(issue, attempt_num=0, delay_ms=1000)
+                return
+
         prompt = state_cfg.prompt if state_cfg else ""
         run = self._issue_state_runs.get(issue.id, 1)
 
@@ -424,6 +459,15 @@ class Orchestrator:
         else:
             # Agent state — post state comment, ensure active Linear state, schedule retry
             self._issue_current_state[issue.id] = target_name
+
+            # Run counter: increment for rework, reset for forward transitions
+            if transition_name != "complete":
+                run = run + 1
+                self._issue_state_runs[issue.id] = run
+            else:
+                run = 1
+                self._issue_state_runs[issue.id] = run
+
             client = self._ensure_linear_client()
             comment = make_state_comment(
                 state=target_name,
@@ -617,15 +661,15 @@ class Orchestrator:
             if not self._is_eligible(issue):
                 continue
 
-            # Per-state concurrency check
-            state_key = issue.state.strip().lower()
-            state_limit = self.cfg.agent.max_concurrent_agents_by_state.get(state_key)
+            # Per-state concurrency check — use internal state machine name,
+            # not Linear state name (multiple states share "In Progress")
+            internal_state = self._issue_current_state.get(issue.id, "")
+            state_limit = self.cfg.agent.max_concurrent_agents_by_state.get(internal_state)
             if state_limit is not None:
                 state_count = sum(
                     1
                     for r in self.running.values()
-                    if self._last_issues.get(r.issue_id, Issue(id="", identifier="", title="")).state.strip().lower()
-                    == state_key
+                    if r.state_name == internal_state
                 )
                 if state_count >= state_limit:
                     continue
@@ -1030,8 +1074,30 @@ class Orchestrator:
 
         if attempt.status == "succeeded":
             if attempt.state_name and attempt.state_name in self.cfg.states:
-                # State machine mode: transition via "complete"
-                asyncio.create_task(self._safe_transition(issue, "complete"))
+                # State machine mode: use agent-requested transition or default
+                transition_name = attempt.requested_transition or "complete"
+                if not attempt.requested_transition:
+                    logger.info(
+                        f"No transition directive, defaulting to complete "
+                        f"for {issue.identifier}"
+                    )
+
+                # Safety cap: enforce max_rework for agent-initiated rework
+                if transition_name != "complete":
+                    sc = self.cfg.states[attempt.state_name]
+                    if sc.max_rework is not None:
+                        run = self._issue_state_runs.get(issue.id, 1)
+                        if run > sc.max_rework:
+                            logger.warning(
+                                f"Max rework ({sc.max_rework}) exceeded "
+                                f"for {issue.identifier} in state "
+                                f"{attempt.state_name}, forcing complete"
+                            )
+                            transition_name = "complete"
+
+                asyncio.create_task(
+                    self._safe_transition(issue, transition_name)
+                )
             else:
                 # Legacy mode
                 self._schedule_retry(issue, attempt_num=1, delay_ms=1000)

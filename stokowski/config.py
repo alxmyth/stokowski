@@ -121,7 +121,8 @@ class StateConfig:
     permission_mode: str | None = None
     allowed_tools: list[str] | None = None
     rework_to: str | None = None     # gate only
-    max_rework: int | None = None    # gate only
+    max_rework: int | None = None    # gate only; also used for agent-initiated rework cap
+    skip_labels: list[str] = field(default_factory=list)  # labels that auto-approve this gate
     transitions: dict[str, str] = field(default_factory=dict)
     hooks: HooksConfig | None = None
     docker_image: str | None = None           # Override default_image for this state
@@ -305,6 +306,7 @@ def _parse_state_config(name: str, raw: dict[str, Any]) -> StateConfig:
         allowed_tools=_coerce_list(allowed) if allowed is not None else None,
         rework_to=raw.get("rework_to"),
         max_rework=raw.get("max_rework"),
+        skip_labels=_coerce_list(raw.get("skip_labels")),
         transitions=raw.get("transitions") or {},
         hooks=_parse_hooks(hooks_raw) if hooks_raw else None,
         docker_image=raw.get("docker_image") or (raw.get("docker", {}) or {}).get("image"),
@@ -569,6 +571,19 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
         if sc.docker_image and not cfg.docker.enabled:
             log.warning(
                 "State '%s' has docker_image set but docker.enabled is false", name
+            )
+        if sc.skip_labels and sc.type != "gate":
+            log.warning(
+                "State '%s' has skip_labels but is not a gate — labels will be ignored",
+                name,
+            )
+
+    # Warn if max_concurrent_agents_by_state keys don't match state names
+    for state_key in cfg.agent.max_concurrent_agents_by_state:
+        if state_key not in cfg.states:
+            log.warning(
+                "max_concurrent_agents_by_state key '%s' does not match any defined state",
+                state_key,
             )
 
     return errors

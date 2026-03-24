@@ -49,6 +49,7 @@ class RunAttempt:
     last_message: str = ""
     completed_at: datetime | None = None
     state_name: str | None = None       # current internal state machine state
+    requested_transition: str | None = None  # agent-requested transition name
 
 
 @dataclass
