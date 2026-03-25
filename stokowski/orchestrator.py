@@ -419,6 +419,22 @@ class Orchestrator:
                 self._resolve_workflow(issue)
             return state_name, run
 
+        # If the issue is in the Todo/pickup state, treat as fresh — ignore stale
+        # tracking comments from a prior lifecycle (e.g., triage recycled the issue
+        # back to Todo with a new label). Resolve workflow from labels directly.
+        is_todo = (
+            issue.state
+            and issue.state.strip().lower() == self.cfg.linear_states.todo.strip().lower()
+        )
+        if is_todo:
+            workflow = self._resolve_workflow(issue)
+            entry = workflow.entry_state
+            if not entry:
+                raise RuntimeError(f"No entry state for workflow '{workflow.name}'")
+            self._issue_current_state[issue.id] = entry
+            self._issue_state_runs[issue.id] = 1
+            return entry, 1
+
         # Fetch comments from Linear and parse latest tracking
         client = self._ensure_linear_client()
         comments = await client.fetch_comments(issue.id)
