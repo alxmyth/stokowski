@@ -201,6 +201,79 @@ class TestLifecycleSection:
         assert "rework" in section
         assert "complete" in section
 
+    def test_explicit_transitions_override_state_cfg(self):
+        """When transitions parameter is provided, it overrides state_cfg.transitions."""
+        state = StateConfig(
+            name="implement",
+            transitions={"complete": "review"},  # state-level transitions
+        )
+        workflow_transitions = {"complete": "merge-review", "skip": "done"}
+        section = build_lifecycle_section(
+            issue=self._make_issue(),
+            state_name="implement",
+            state_cfg=state,
+            linear_states=LinearStatesConfig(),
+            transitions=workflow_transitions,
+        )
+        # Should show workflow transitions, not state_cfg.transitions
+        assert "merge-review" in section
+        assert "skip" in section
+        assert "done" in section
+        # The directive should appear (multiple transitions)
+        assert "<!-- transition:TRANSITION_NAME -->" in section
+
+    def test_transitions_none_falls_back_to_state_cfg(self):
+        """When transitions is None, falls back to state_cfg.transitions."""
+        state = StateConfig(
+            name="implement",
+            transitions={"complete": "review"},
+        )
+        section = build_lifecycle_section(
+            issue=self._make_issue(),
+            state_name="implement",
+            state_cfg=state,
+            linear_states=LinearStatesConfig(),
+            transitions=None,
+        )
+        # Should show state_cfg transitions
+        assert "review" in section
+        assert "automatically" in section.lower()
+
+    def test_single_workflow_transition_auto_fires(self):
+        """Single workflow transition shows 'fires automatically' message."""
+        state = StateConfig(
+            name="implement",
+            transitions={"complete": "review", "rework": "plan"},  # multi on state
+        )
+        section = build_lifecycle_section(
+            issue=self._make_issue(),
+            state_name="implement",
+            state_cfg=state,
+            linear_states=LinearStatesConfig(),
+            transitions={"complete": "done"},  # single workflow transition
+        )
+        assert "automatically" in section.lower()
+        assert "<!-- transition:TRANSITION_NAME -->" not in section
+        assert "done" in section
+
+    def test_multiple_workflow_transitions_directive(self):
+        """Multiple workflow transitions show the directive instruction."""
+        state = StateConfig(
+            name="implement",
+            transitions={"complete": "review"},  # single on state
+        )
+        section = build_lifecycle_section(
+            issue=self._make_issue(),
+            state_name="implement",
+            state_cfg=state,
+            linear_states=LinearStatesConfig(),
+            transitions={"complete": "merge-review", "rework": "plan"},
+        )
+        assert "<!-- transition:TRANSITION_NAME -->" in section
+        assert "merge-review" in section
+        assert "rework" in section
+        assert "plan" in section
+
 
 # ---------------------------------------------------------------------------
 # Config parsing

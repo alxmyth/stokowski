@@ -123,6 +123,7 @@ def build_lifecycle_section(
     run: int = 1,
     is_rework: bool = False,
     recent_comments: list[dict[str, Any]] | None = None,
+    transitions: dict[str, str] | None = None,
 ) -> str:
     """Generate the auto-injected lifecycle section.
 
@@ -137,6 +138,10 @@ def build_lifecycle_section(
         run: Current run number.
         is_rework: Whether this is a rework run after gate rejection.
         recent_comments: Non-tracking comments since last run.
+        transitions: Workflow-specific transitions for this state. When
+            provided, used instead of ``state_cfg.transitions`` for the
+            "Available Transitions" and "When Done" sections. ``None``
+            falls back to ``state_cfg.transitions`` (backward compat).
 
     Returns:
         A markdown string clearly demarcated as auto-generated.
@@ -204,18 +209,19 @@ def build_lifecycle_section(
                     lines.append(f"> — {created}")
                 lines.append("")
 
-    # Available transitions
-    if state_cfg.transitions:
+    # Available transitions — prefer workflow-specific when provided
+    effective_transitions = transitions if transitions is not None else state_cfg.transitions
+    if effective_transitions:
         lines.append("### Transitions")
         lines.append("")
-        for trigger, target in state_cfg.transitions.items():
+        for trigger, target in effective_transitions.items():
             lines.append(f"- `{trigger}` → **{target}**")
         lines.append("")
 
     # Instructions for completion
     lines.append("### When Done")
     lines.append("")
-    if len(state_cfg.transitions) > 1:
+    if len(effective_transitions) > 1:
         lines.append(
             "When you have completed your work, include a transition "
             "directive in your final message to indicate the next step:"
@@ -252,6 +258,7 @@ def assemble_prompt(
     attempt: int = 1,
     last_run_at: str | None = None,
     comments: list[dict[str, Any]] | None = None,
+    transitions: dict[str, str] | None = None,
 ) -> str:
     """Orchestrate three-layer prompt assembly.
 
@@ -273,6 +280,9 @@ def assemble_prompt(
         attempt: Retry attempt within this run.
         last_run_at: ISO timestamp of the last run.
         comments: All comments on the issue (for filtering).
+        transitions: Workflow-specific transitions for this state. Passed
+            through to ``build_lifecycle_section()``. ``None`` falls back
+            to ``state_cfg.transitions``.
 
     Returns:
         The fully assembled prompt string.
@@ -326,6 +336,7 @@ def assemble_prompt(
         run=run,
         is_rework=is_rework,
         recent_comments=recent,
+        transitions=transitions,
     )
     parts.append(lifecycle)
 

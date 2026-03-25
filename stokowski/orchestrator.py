@@ -1270,6 +1270,10 @@ class Orchestrator:
                 and (not state_cfg_for_rework or state_cfg_for_rework.session != "fresh")
             )
 
+            # Resolve workflow-specific transitions for lifecycle section
+            workflow = self._get_issue_workflow_config(issue.id)
+            wf_transitions = workflow.transitions.get(state_name)
+
             return assemble_prompt(
                 cfg=self.cfg,
                 workflow_dir=str(self.workflow_path.parent),
@@ -1281,6 +1285,7 @@ class Orchestrator:
                 attempt=attempt_num or 1,
                 last_run_at=last_run_at,
                 comments=comments,
+                transitions=wf_transitions,
             )
 
         # Legacy fallback
@@ -1299,6 +1304,10 @@ class Orchestrator:
             last_completed = self._last_completed_at.get(issue.id)
             last_run_at = last_completed.isoformat() if last_completed else None
 
+            # Resolve workflow-specific transitions for lifecycle section
+            workflow = self._get_issue_workflow_config(issue.id)
+            wf_transitions = workflow.transitions.get(state_name)
+
             return assemble_prompt(
                 cfg=self.cfg,
                 workflow_dir=str(self.workflow_path.parent),
@@ -1310,6 +1319,7 @@ class Orchestrator:
                 attempt=attempt_num or 1,
                 last_run_at=last_run_at,
                 comments=None,
+                transitions=wf_transitions,
             )
 
         # Legacy mode: use workflow prompt_template with Jinja2
