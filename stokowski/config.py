@@ -801,7 +801,7 @@ def _legacy_project_name(tracker_raw: dict[str, Any], workflow_path: Path) -> st
     return "default"
 
 
-def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
+def parse_workflow_file(path: str | Path) -> ParsedConfig:
     """Parse a workflow file (.yaml/.yml or .md with front matter) into config."""
     path = Path(path)
     workflow_dir = path.parent
@@ -924,7 +924,7 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
         workflow_dir=workflow_dir,
     )
 
-    return WorkflowDefinition(config=cfg, prompt_template=prompt_template)
+    return ParsedConfig(config=cfg, prompt_template=prompt_template)
 
 
 def _prompt_exists(workflow_dir: Path, prompt: str) -> bool:

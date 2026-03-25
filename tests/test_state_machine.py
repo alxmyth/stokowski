@@ -17,12 +17,19 @@ import pytest
 from stokowski.config import (
     LinearStatesConfig,
     StateConfig,
+    WorkflowConfig,
     _coerce_list,
     _parse_state_config,
+    derive_workflow_transitions,
 )
 from stokowski.models import RunAttempt
 from stokowski.prompt import build_lifecycle_section
 from stokowski.runner import TRANSITION_PATTERN
+from stokowski.tracking import (
+    make_gate_comment,
+    make_state_comment,
+    parse_latest_tracking,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -333,3 +340,277 @@ class TestGuardrailPromptText:
         )
         # No --append-system-prompt on continuation turns
         assert "--append-system-prompt" not in args
+
+
+# ---------------------------------------------------------------------------
+# Workflow transition derivation
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowTransitionDerivation:
+    """Tests for derive_workflow_transitions() and WorkflowConfig."""
+
+    def _make_states(self, specs: dict[str, str]) -> dict[str, StateConfig]:
+        """Build a states dict from {name: type} mapping."""
+        states: dict[str, StateConfig] = {}
+        for name, stype in specs.items():
+            states[name] = StateConfig(name=name, type=stype)
+        return states
+
+    def test_linear_agent_path(self):
+        """Linear path [a, b, c] with all agent states produces complete transitions."""
+        states = self._make_states({"a": "agent", "b": "agent", "c": "agent"})
+        transitions = derive_workflow_transitions(["a", "b", "c"], states)
+        assert transitions["a"] == {"complete": "b"}
+        assert transitions["b"] == {"complete": "c"}
+        # Last agent state has no successor
+        assert transitions["c"] == {}
+
+    def test_path_with_gate(self):
+        """Path with gate state gets approve and rework_to transitions."""
+        states = self._make_states({
+            "plan": "agent",
+            "review": "gate",
+            "implement": "agent",
+        })
+        transitions = derive_workflow_transitions(
+            ["plan", "review", "implement"], states
+        )
+        assert transitions["plan"] == {"complete": "review"}
+        assert transitions["review"] == {"approve": "implement", "rework_to": "plan"}
+        assert transitions["implement"] == {}
+
+    def test_gate_explicit_rework_to_wins(self):
+        """Gate with explicit rework_to on StateConfig overrides path-derived."""
+        states = self._make_states({
+            "plan": "agent",
+            "implement": "agent",
+            "review": "gate",
+            "done": "terminal",
+        })
+        # Explicitly set rework_to on the gate to a non-adjacent state
+        states["review"].rework_to = "plan"
+        transitions = derive_workflow_transitions(
+            ["plan", "implement", "review", "done"], states
+        )
+        # Explicit rework_to="plan" wins over path-derived "implement"
+        assert transitions["review"]["rework_to"] == "plan"
+        assert transitions["review"]["approve"] == "done"
+
+    def test_gate_derives_previous_agent(self):
+        """Gate without explicit rework_to derives nearest prior agent in path."""
+        states = self._make_states({
+            "plan": "agent",
+            "implement": "agent",
+            "review": "gate",
+            "done": "terminal",
+        })
+        # No explicit rework_to on gate
+        assert states["review"].rework_to is None
+        transitions = derive_workflow_transitions(
+            ["plan", "implement", "review", "done"], states
+        )
+        # Should derive rework_to as "implement" (nearest prior agent)
+        assert transitions["review"]["rework_to"] == "implement"
+
+    def test_terminal_at_end_of_path(self):
+        """Terminal state at end of path gets empty transitions."""
+        states = self._make_states({
+            "implement": "agent",
+            "done": "terminal",
+        })
+        transitions = derive_workflow_transitions(["implement", "done"], states)
+        assert transitions["implement"] == {"complete": "done"}
+        assert transitions["done"] == {}
+
+    def test_single_agent_plus_terminal(self):
+        """Single-state path [a, done] produces a->done."""
+        states = self._make_states({"a": "agent", "done": "terminal"})
+        transitions = derive_workflow_transitions(["a", "done"], states)
+        assert transitions["a"] == {"complete": "done"}
+        assert transitions["done"] == {}
+
+    def test_entry_state_is_first_agent(self):
+        """WorkflowConfig.entry_state should be first agent, not first state overall."""
+        states = self._make_states({
+            "done": "terminal",
+            "plan": "agent",
+            "implement": "agent",
+        })
+        path = ["plan", "implement", "done"]
+        transitions = derive_workflow_transitions(path, states)
+        # Simulate what config parsing would do: find first agent in path
+        entry = ""
+        for name in path:
+            if states[name].type == "agent":
+                entry = name
+                break
+        assert entry == "plan"
+
+        # Also verify WorkflowConfig can hold this correctly
+        wf = WorkflowConfig(
+            name="test",
+            path=path,
+            transitions=transitions,
+            entry_state=entry,
+        )
+        assert wf.entry_state == "plan"
+
+    def test_gate_at_start_no_prior_agent(self):
+        """Gate at path start without prior agent has no rework_to (no crash)."""
+        states = self._make_states({
+            "gate": "gate",
+            "implement": "agent",
+            "done": "terminal",
+        })
+        transitions = derive_workflow_transitions(
+            ["gate", "implement", "done"], states
+        )
+        # No prior agent exists, so only approve should be set
+        assert transitions["gate"] == {"approve": "implement"}
+        assert "rework_to" not in transitions["gate"]
+
+    def test_workflow_config_defaults(self):
+        """WorkflowConfig has sensible defaults."""
+        wf = WorkflowConfig()
+        assert wf.name == ""
+        assert wf.label is None
+        assert wf.default is False
+        assert wf.path == []
+        assert wf.terminal_state == "terminal"
+        assert wf.transitions == {}
+        assert wf.entry_state == ""
+
+    def test_workflow_config_with_fields(self):
+        """WorkflowConfig can be constructed with all fields."""
+        wf = WorkflowConfig(
+            name="full-ce",
+            label="workflow:full-ce",
+            default=False,
+            path=["plan", "review", "implement", "done"],
+            terminal_state="terminal",
+            transitions={"plan": {"complete": "review"}},
+            entry_state="plan",
+        )
+        assert wf.name == "full-ce"
+        assert wf.label == "workflow:full-ce"
+        assert wf.default is False
+        assert len(wf.path) == 4
+        assert wf.terminal_state == "terminal"
+        assert wf.transitions["plan"]["complete"] == "review"
+        assert wf.entry_state == "plan"
+
+    def test_triage_workflow_terminal_todo(self):
+        """Triage workflow can set terminal_state to 'todo' for recycling."""
+        wf = WorkflowConfig(
+            name="triage",
+            default=True,
+            terminal_state="todo",
+            path=["classify", "done"],
+        )
+        assert wf.terminal_state == "todo"
+        assert wf.default is True
+        assert wf.label is None
+
+
+# ---------------------------------------------------------------------------
+# Tracking comments — workflow field
+# ---------------------------------------------------------------------------
+
+
+class TestTrackingWorkflowField:
+    def test_state_comment_with_workflow_includes_field(self):
+        comment = make_state_comment("implement", run=1, workflow="quick-fix")
+        assert '"workflow": "quick-fix"' in comment
+
+    def test_state_comment_without_workflow_omits_field(self):
+        comment = make_state_comment("implement", run=1)
+        assert '"workflow"' not in comment
+
+    def test_state_comment_with_workflow_human_text(self):
+        comment = make_state_comment("implement", run=2, workflow="full-ce")
+        assert "(workflow: full-ce, run 2)" in comment
+
+    def test_state_comment_without_workflow_human_text(self):
+        comment = make_state_comment("implement", run=1)
+        assert "(run 1)" in comment
+        assert "workflow" not in comment.split("\n\n")[1]  # human-readable part
+
+    def test_parse_extracts_workflow_from_state_comment(self):
+        comment = make_state_comment("implement", run=1, workflow="quick-fix")
+        result = parse_latest_tracking([{"body": comment}])
+        assert result is not None
+        assert result["workflow"] == "quick-fix"
+        assert result["type"] == "state"
+        assert result["state"] == "implement"
+
+    def test_parse_returns_none_workflow_from_old_format(self):
+        comment = make_state_comment("implement", run=1)
+        result = parse_latest_tracking([{"body": comment}])
+        assert result is not None
+        assert result["workflow"] is None
+        assert result["state"] == "implement"
+
+    def test_gate_comment_with_workflow(self):
+        comment = make_gate_comment(
+            "review-gate", "waiting", prompt="Review the PR",
+            rework_to="implement", run=1, workflow="full-ce",
+        )
+        assert '"workflow": "full-ce"' in comment
+        assert "Awaiting human review" in comment
+
+    def test_gate_comment_without_workflow_omits_field(self):
+        comment = make_gate_comment(
+            "review-gate", "waiting", run=1,
+        )
+        assert '"workflow"' not in comment
+
+    def test_gate_comment_parse_extracts_workflow(self):
+        comment = make_gate_comment(
+            "review-gate", "approved", run=1, workflow="full-ce",
+        )
+        result = parse_latest_tracking([{"body": comment}])
+        assert result is not None
+        assert result["type"] == "gate"
+        assert result["workflow"] == "full-ce"
+
+    def test_gate_comment_parse_old_format(self):
+        comment = make_gate_comment("review-gate", "approved", run=1)
+        result = parse_latest_tracking([{"body": comment}])
+        assert result is not None
+        assert result["type"] == "gate"
+        assert result["workflow"] is None
+
+    def test_round_trip_state_comment(self):
+        """Create a state comment with workflow, parse it back, verify workflow."""
+        comment = make_state_comment("plan", run=3, workflow="quick-fix")
+        result = parse_latest_tracking([{"body": comment}])
+        assert result is not None
+        assert result["workflow"] == "quick-fix"
+        assert result["state"] == "plan"
+        assert result["run"] == 3
+
+    def test_round_trip_gate_comment(self):
+        """Create a gate comment with workflow, parse it back, verify workflow."""
+        comment = make_gate_comment(
+            "review", "rework", rework_to="implement",
+            run=2, workflow="full-ce",
+        )
+        result = parse_latest_tracking([{"body": comment}])
+        assert result is not None
+        assert result["workflow"] == "full-ce"
+        assert result["state"] == "review"
+        assert result["status"] == "rework"
+        assert result["rework_to"] == "implement"
+
+    def test_latest_comment_wins(self):
+        """When multiple tracking comments exist, the latest one wins."""
+        old_comment = make_state_comment("plan", run=1, workflow="triage")
+        new_comment = make_state_comment("implement", run=1, workflow="quick-fix")
+        result = parse_latest_tracking([
+            {"body": old_comment},
+            {"body": new_comment},
+        ])
+        assert result is not None
+        assert result["workflow"] == "quick-fix"
+        assert result["state"] == "implement"

@@ -19,7 +19,7 @@ from .config import (
     ProjectConfig,
     ServiceConfig,
     StateConfig,
-    WorkflowDefinition,
+    ParsedConfig,
     _resolve_linear_state_name,
     merge_state_config,
     parse_workflow_file,
@@ -65,7 +65,7 @@ class Orchestrator:
         legacy behaviour of `agent.max_concurrent_agents - len(running)`.
         """
         self.workflow_path = Path(workflow_path)
-        self.workflow: WorkflowDefinition | None = None
+        self.workflow: ParsedConfig | None = None
         self.project_name = project_name
         self.project: ProjectConfig | None = None
         self.pool = pool
