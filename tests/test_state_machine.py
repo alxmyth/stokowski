@@ -15,14 +15,17 @@ import re
 import pytest
 
 from stokowski.config import (
+    AgentConfig,
     LinearStatesConfig,
     ServiceConfig,
     StateConfig,
+    TrackerConfig,
     WorkflowConfig,
     _coerce_list,
     _parse_state_config,
     derive_workflow_transitions,
     parse_workflow_file,
+    validate_config,
 )
 from stokowski.models import Issue, RunAttempt
 from stokowski.prompt import build_lifecycle_section
@@ -1011,3 +1014,431 @@ workflows:
         cfg = parse_workflow_file(path).config
         assert "_default" in cfg.workflows
         assert cfg.workflows["_default"].default is True
+
+
+# ---------------------------------------------------------------------------
+# Workflow validation (Unit 3)
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowValidation:
+    """Tests for validate_config() workflow validation in both legacy and multi-workflow modes."""
+
+    @staticmethod
+    def _base_tracker() -> TrackerConfig:
+        """Return a valid TrackerConfig to pass basic validation."""
+        return TrackerConfig(
+            kind="linear",
+            api_key="test-key",
+            project_slug="abc123",
+        )
+
+    def _make_legacy_cfg(self, states: dict[str, StateConfig]) -> ServiceConfig:
+        """Build a legacy ServiceConfig (synthesized _default workflow)."""
+        path = list(states.keys())
+        transitions = {name: dict(sc.transitions) for name, sc in states.items()}
+        entry = ""
+        for name, sc in states.items():
+            if sc.type == "agent":
+                entry = name
+                break
+        workflows = {
+            "_default": WorkflowConfig(
+                name="_default",
+                label=None,
+                default=True,
+                path=path,
+                terminal_state="terminal",
+                transitions=transitions,
+                entry_state=entry,
+            )
+        }
+        return ServiceConfig(
+            tracker=self._base_tracker(),
+            states=states,
+            workflows=workflows,
+        )
+
+    def _make_multi_cfg(
+        self,
+        states: dict[str, StateConfig],
+        workflows: dict[str, WorkflowConfig],
+    ) -> ServiceConfig:
+        """Build a multi-workflow ServiceConfig."""
+        return ServiceConfig(
+            tracker=self._base_tracker(),
+            states=states,
+            workflows=workflows,
+        )
+
+    # --- Path references non-existent state ---
+
+    def test_path_references_nonexistent_state(self):
+        states = {
+            "plan": StateConfig(name="plan", type="agent", prompt="prompts/plan.md"),
+            "done": StateConfig(name="done", type="terminal", linear_state="terminal"),
+        }
+        wf = WorkflowConfig(
+            name="bad",
+            default=True,
+            path=["plan", "nonexistent", "done"],
+            transitions=derive_workflow_transitions(["plan", "nonexistent", "done"], states),
+            entry_state="plan",
+        )
+        cfg = self._make_multi_cfg(states, {"bad": wf})
+        errors = validate_config(cfg)
+        assert any("non-existent state 'nonexistent'" in e for e in errors)
+
+    # --- No default workflow ---
+
+    def test_no_default_workflow(self):
+        states = {
+            "plan": StateConfig(name="plan", type="agent", prompt="prompts/plan.md"),
+            "done": StateConfig(name="done", type="terminal", linear_state="terminal"),
+        }
+        wf = WorkflowConfig(
+            name="no-default",
+            label="something",
+            default=False,
+            path=["plan", "done"],
+            transitions=derive_workflow_transitions(["plan", "done"], states),
+            entry_state="plan",
+        )
+        cfg = self._make_multi_cfg(states, {"no-default": wf})
+        errors = validate_config(cfg)
+        assert any("No default workflow" in e for e in errors)
+
+    # --- Duplicate labels across workflows ---
+
+    def test_duplicate_labels_across_workflows(self):
+        states = {
+            "plan": StateConfig(name="plan", type="agent", prompt="prompts/plan.md"),
+            "done": StateConfig(name="done", type="terminal", linear_state="terminal"),
+        }
+        wf1 = WorkflowConfig(
+            name="wf1",
+            label="workflow:fix",
+            default=True,
+            path=["plan", "done"],
+            transitions=derive_workflow_transitions(["plan", "done"], states),
+            entry_state="plan",
+        )
+        wf2 = WorkflowConfig(
+            name="wf2",
+            label="workflow:fix",
+            default=False,
+            path=["plan", "done"],
+            transitions=derive_workflow_transitions(["plan", "done"], states),
+            entry_state="plan",
+        )
+        cfg = self._make_multi_cfg(states, {"wf1": wf1, "wf2": wf2})
+        errors = validate_config(cfg)
+        assert any("Duplicate label" in e for e in errors)
+
+    # --- Workflow path with no agent state ---
+
+    def test_workflow_path_no_agent_state(self):
+        states = {
+            "gate": StateConfig(name="gate", type="gate", linear_state="review"),
+            "done": StateConfig(name="done", type="terminal", linear_state="terminal"),
+        }
+        wf = WorkflowConfig(
+            name="no-agent",
+            default=True,
+            path=["gate", "done"],
+            transitions=derive_workflow_transitions(["gate", "done"], states),
+            entry_state="",
+        )
+        cfg = self._make_multi_cfg(states, {"no-agent": wf})
+        errors = validate_config(cfg)
+        assert any("no agent states" in e.lower() for e in errors)
+
+    # --- Workflow path not ending in terminal ---
+
+    def test_workflow_path_not_ending_in_terminal(self):
+        states = {
+            "plan": StateConfig(name="plan", type="agent", prompt="prompts/plan.md"),
+            "implement": StateConfig(name="implement", type="agent", prompt="prompts/impl.md"),
+            "done": StateConfig(name="done", type="terminal", linear_state="terminal"),
+        }
+        wf = WorkflowConfig(
+            name="bad-end",
+            default=True,
+            path=["plan", "implement"],  # no terminal at end
+            transitions=derive_workflow_transitions(["plan", "implement"], states),
+            entry_state="plan",
+        )
+        cfg = self._make_multi_cfg(states, {"bad-end": wf})
+        errors = validate_config(cfg)
+        assert any("must end with a terminal state" in e for e in errors)
+
+    # --- Gate without resolvable rework_to in path context ---
+
+    def test_gate_without_resolvable_rework_to(self):
+        states = {
+            "gate": StateConfig(name="gate", type="gate", linear_state="review"),
+            "implement": StateConfig(name="implement", type="agent", prompt="prompts/impl.md"),
+            "done": StateConfig(name="done", type="terminal", linear_state="terminal"),
+        }
+        # Gate is first in path — no prior agent, no explicit rework_to
+        path = ["gate", "implement", "done"]
+        transitions = derive_workflow_transitions(path, states)
+        # Verify derive didn't find a rework_to (no prior agent)
+        assert "rework_to" not in transitions.get("gate", {})
+        wf = WorkflowConfig(
+            name="no-rework",
+            default=True,
+            path=path,
+            transitions=transitions,
+            entry_state="implement",
+        )
+        cfg = self._make_multi_cfg(states, {"no-rework": wf})
+        errors = validate_config(cfg)
+        assert any("no resolvable rework_to" in e.lower() for e in errors)
+
+    # --- Multi-workflow mode + state has explicit transitions → hard error ---
+
+    def test_multi_workflow_state_has_explicit_transitions(self):
+        states = {
+            "plan": StateConfig(
+                name="plan", type="agent", prompt="prompts/plan.md",
+                transitions={"complete": "done"},  # explicit — not allowed in multi-workflow
+            ),
+            "done": StateConfig(name="done", type="terminal", linear_state="terminal"),
+        }
+        wf = WorkflowConfig(
+            name="test",
+            default=True,
+            path=["plan", "done"],
+            transitions=derive_workflow_transitions(["plan", "done"], states),
+            entry_state="plan",
+        )
+        cfg = self._make_multi_cfg(states, {"test": wf})
+        errors = validate_config(cfg)
+        assert any("explicit transitions in multi-workflow mode" in e for e in errors)
+
+    # --- Valid multi-workflow config → no errors ---
+
+    def test_valid_multi_workflow_config(self):
+        states = {
+            "plan": StateConfig(name="plan", type="agent", prompt="prompts/plan.md"),
+            "review-gate": StateConfig(
+                name="review-gate", type="gate", linear_state="review",
+                rework_to="plan",
+            ),
+            "implement": StateConfig(name="implement", type="agent", prompt="prompts/impl.md"),
+            "done": StateConfig(name="done", type="terminal", linear_state="terminal"),
+        }
+        qf_path = ["plan", "implement", "done"]
+        fc_path = ["plan", "review-gate", "implement", "done"]
+        wf_quick = WorkflowConfig(
+            name="quick-fix",
+            label="workflow:quick-fix",
+            default=False,
+            path=qf_path,
+            transitions=derive_workflow_transitions(qf_path, states),
+            entry_state="plan",
+        )
+        wf_full = WorkflowConfig(
+            name="full-ce",
+            label="workflow:full-ce",
+            default=True,
+            path=fc_path,
+            transitions=derive_workflow_transitions(fc_path, states),
+            entry_state="plan",
+        )
+        cfg = self._make_multi_cfg(states, {"quick-fix": wf_quick, "full-ce": wf_full})
+        errors = validate_config(cfg)
+        assert errors == []
+
+    # --- Legacy config → existing validation unchanged ---
+
+    def test_legacy_config_no_new_errors(self):
+        """Legacy config with valid gates still passes, gate checks still work."""
+        states = {
+            "plan": StateConfig(
+                name="plan", type="agent", prompt="prompts/plan.md",
+                transitions={"complete": "review"},
+            ),
+            "review": StateConfig(
+                name="review", type="gate", linear_state="review",
+                rework_to="plan",
+                transitions={"approve": "implement"},
+            ),
+            "implement": StateConfig(
+                name="implement", type="agent", prompt="prompts/impl.md",
+                transitions={"complete": "done"},
+            ),
+            "done": StateConfig(name="done", type="terminal", linear_state="terminal"),
+        }
+        cfg = self._make_legacy_cfg(states)
+        errors = validate_config(cfg)
+        assert errors == []
+
+    def test_legacy_gate_missing_rework_to_errors(self):
+        """In legacy mode, gate missing rework_to still produces an error."""
+        states = {
+            "plan": StateConfig(
+                name="plan", type="agent", prompt="prompts/plan.md",
+                transitions={"complete": "review"},
+            ),
+            "review": StateConfig(
+                name="review", type="gate", linear_state="review",
+                # rework_to intentionally omitted
+                transitions={"approve": "implement"},
+            ),
+            "implement": StateConfig(
+                name="implement", type="agent", prompt="prompts/impl.md",
+                transitions={"complete": "done"},
+            ),
+            "done": StateConfig(name="done", type="terminal", linear_state="terminal"),
+        }
+        cfg = self._make_legacy_cfg(states)
+        errors = validate_config(cfg)
+        assert any("missing 'rework_to'" in e for e in errors)
+
+    def test_legacy_gate_missing_approve_transition_errors(self):
+        """In legacy mode, gate missing approve transition still produces an error."""
+        states = {
+            "plan": StateConfig(
+                name="plan", type="agent", prompt="prompts/plan.md",
+                transitions={"complete": "review"},
+            ),
+            "review": StateConfig(
+                name="review", type="gate", linear_state="review",
+                rework_to="plan",
+                transitions={},  # approve intentionally omitted
+            ),
+            "implement": StateConfig(
+                name="implement", type="agent", prompt="prompts/impl.md",
+                transitions={"complete": "done"},
+            ),
+            "done": StateConfig(name="done", type="terminal", linear_state="terminal"),
+        }
+        cfg = self._make_legacy_cfg(states)
+        errors = validate_config(cfg)
+        assert any("missing 'approve' transition" in e for e in errors)
+
+    def test_legacy_explicit_transitions_allowed(self):
+        """In legacy mode, states with explicit transitions do NOT error."""
+        states = {
+            "plan": StateConfig(
+                name="plan", type="agent", prompt="prompts/plan.md",
+                transitions={"complete": "done"},
+            ),
+            "done": StateConfig(name="done", type="terminal", linear_state="terminal"),
+        }
+        cfg = self._make_legacy_cfg(states)
+        errors = validate_config(cfg)
+        assert not any("explicit transitions" in e for e in errors)
+
+    def test_multi_workflow_duplicate_labels_case_insensitive(self):
+        """Duplicate labels are detected case-insensitively."""
+        states = {
+            "plan": StateConfig(name="plan", type="agent", prompt="prompts/plan.md"),
+            "done": StateConfig(name="done", type="terminal", linear_state="terminal"),
+        }
+        wf1 = WorkflowConfig(
+            name="wf1",
+            label="Workflow:Fix",
+            default=True,
+            path=["plan", "done"],
+            transitions=derive_workflow_transitions(["plan", "done"], states),
+            entry_state="plan",
+        )
+        wf2 = WorkflowConfig(
+            name="wf2",
+            label="workflow:fix",  # same label, different case
+            default=False,
+            path=["plan", "done"],
+            transitions=derive_workflow_transitions(["plan", "done"], states),
+            entry_state="plan",
+        )
+        cfg = self._make_multi_cfg(states, {"wf1": wf1, "wf2": wf2})
+        errors = validate_config(cfg)
+        assert any("Duplicate label" in e for e in errors)
+
+    def test_workflow_empty_path(self):
+        """Workflow with empty path produces an error."""
+        states = {
+            "plan": StateConfig(name="plan", type="agent", prompt="prompts/plan.md"),
+            "done": StateConfig(name="done", type="terminal", linear_state="terminal"),
+        }
+        wf = WorkflowConfig(
+            name="empty",
+            default=True,
+            path=[],
+            transitions={},
+            entry_state="",
+        )
+        cfg = self._make_multi_cfg(states, {"empty": wf})
+        errors = validate_config(cfg)
+        assert any("empty path" in e for e in errors)
+
+    def test_unreferenced_state_warning(self, caplog):
+        """State in pool but not in any workflow path produces a warning."""
+        import logging
+        states = {
+            "plan": StateConfig(name="plan", type="agent", prompt="prompts/plan.md"),
+            "orphan": StateConfig(name="orphan", type="agent", prompt="prompts/orphan.md"),
+            "done": StateConfig(name="done", type="terminal", linear_state="terminal"),
+        }
+        wf = WorkflowConfig(
+            name="main",
+            default=True,
+            path=["plan", "done"],
+            transitions=derive_workflow_transitions(["plan", "done"], states),
+            entry_state="plan",
+        )
+        cfg = self._make_multi_cfg(states, {"main": wf})
+        with caplog.at_level(logging.WARNING):
+            validate_config(cfg)
+        assert any("orphan" in r.message and "not referenced" in r.message for r in caplog.records)
+
+    def test_gate_approve_no_next_state_in_path(self):
+        """Gate at end of path (before no next state) produces approve error."""
+        states = {
+            "plan": StateConfig(name="plan", type="agent", prompt="prompts/plan.md"),
+            "gate": StateConfig(
+                name="gate", type="gate", linear_state="review",
+                rework_to="plan",
+            ),
+            "done": StateConfig(name="done", type="terminal", linear_state="terminal"),
+        }
+        # Gate is the last in path (no terminal after) — derive gives no approve
+        path = ["plan", "gate"]
+        transitions = derive_workflow_transitions(path, states)
+        wf = WorkflowConfig(
+            name="bad-gate",
+            default=True,
+            path=path,
+            transitions=transitions,
+            entry_state="plan",
+        )
+        cfg = self._make_multi_cfg(states, {"bad-gate": wf})
+        errors = validate_config(cfg)
+        # Should error on: path not ending in terminal AND gate has no approve
+        assert any("no resolvable approve" in e.lower() for e in errors)
+        assert any("must end with a terminal" in e for e in errors)
+
+    def test_multiple_default_workflows_error(self):
+        """Multiple workflows with default=True produces an error."""
+        states = {
+            "plan": StateConfig(name="plan", type="agent", prompt="prompts/plan.md"),
+            "done": StateConfig(name="done", type="terminal", linear_state="terminal"),
+        }
+        wf1 = WorkflowConfig(
+            name="wf1", default=True,
+            path=["plan", "done"],
+            transitions=derive_workflow_transitions(["plan", "done"], states),
+            entry_state="plan",
+        )
+        wf2 = WorkflowConfig(
+            name="wf2", default=True,
+            path=["plan", "done"],
+            transitions=derive_workflow_transitions(["plan", "done"], states),
+            entry_state="plan",
+        )
+        cfg = self._make_multi_cfg(states, {"wf1": wf1, "wf2": wf2})
+        errors = validate_config(cfg)
+        assert any("Multiple default workflows" in e for e in errors)

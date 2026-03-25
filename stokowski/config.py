@@ -1025,6 +1025,9 @@ def _validate_project(project: ProjectConfig, errors: list[str]) -> None:
     """Validate a single project's state machine and tracker."""
     prefix = f"project '{project.name}'"
 
+    # Detect legacy vs multi-workflow mode
+    is_legacy = len(cfg.workflows) == 1 and "_default" in cfg.workflows
+
     if project.tracker.kind != "linear":
         errors.append(f"{prefix}: unsupported tracker kind: {project.tracker.kind}")
     if not project.resolved_api_key():
@@ -1117,15 +1120,19 @@ def _validate_states(
                 )
 
         elif sc.type == "gate":
-            if not sc.rework_to:
-                errors.append(f"{prefix} state '{name}': gate missing 'rework_to' field")
-            elif sc.rework_to not in all_state_names:
-                errors.append(
-                    f"{prefix} state '{name}': rework_to target '{sc.rework_to}' "
-                    f"is not a defined state"
-                )
-            if "approve" not in sc.transitions:
-                errors.append(f"{prefix} state '{name}': gate missing 'approve' transition")
+            if is_legacy:
+                # Gates must have rework_to
+                if not sc.rework_to:
+                    errors.append(f"Gate state '{name}' is missing 'rework_to' field")
+                elif sc.rework_to not in all_state_names:
+                    errors.append(
+                        f"Gate state '{name}' rework_to target '{sc.rework_to}' "
+                        f"is not a defined state"
+                    )
+                # Gates must have approve transition
+                if "approve" not in sc.transitions:
+                    errors.append(f"Gate state '{name}' is missing 'approve' transition")
+            # (in multi-workflow mode, gate rework_to and approve are validated per-workflow below)
 
         elif sc.type == "terminal":
             has_terminal = True
@@ -1148,19 +1155,139 @@ def _validate_states(
     if not has_terminal:
         errors.append(f"{prefix}: no terminal states defined")
 
-    # Warn about unreachable states
-    entry = next((n for n, sc in states.items() if sc.type == "agent"), None)
-    reachable: set[str] = set()
-    if entry:
-        reachable.add(entry)
-    for sc in states.values():
-        for target in sc.transitions.values():
-            reachable.add(target)
-        if sc.rework_to:
-            reachable.add(sc.rework_to)
-    for name in all_state_names - reachable:
-        log.warning("project '%s' state '%s' is unreachable", project.name, name)
+    # In multi-workflow mode, error if any StateConfig has explicit transitions
+    if not is_legacy:
+        for name, sc in cfg.states.items():
+            if sc.transitions:
+                errors.append(
+                    f"State '{name}' has explicit transitions in multi-workflow mode; "
+                    f"transitions are derived from workflow paths"
+                )
 
+    # --- Workflow validation ---
+    # Exactly one default workflow
+    default_count = sum(1 for wf in cfg.workflows.values() if wf.default)
+    if default_count == 0:
+        errors.append("No default workflow defined (exactly one workflow must have default: true)")
+    elif default_count > 1:
+        errors.append(
+            f"Multiple default workflows defined ({default_count}); "
+            f"exactly one workflow must have default: true"
+        )
+
+    # No duplicate labels across workflows
+    seen_labels: dict[str, str] = {}  # label -> workflow name
+    for wf in cfg.workflows.values():
+        if wf.label is not None:
+            label_lower = wf.label.lower()
+            if label_lower in seen_labels:
+                errors.append(
+                    f"Duplicate label '{wf.label}' on workflows "
+                    f"'{seen_labels[label_lower]}' and '{wf.name}'"
+                )
+            else:
+                seen_labels[label_lower] = wf.name
+
+    # Per-workflow validation
+    all_referenced_states: set[str] = set()
+    for wf in cfg.workflows.values():
+        # Every path entry must reference an existing state
+        for state_name in wf.path:
+            if state_name not in all_state_names:
+                errors.append(
+                    f"Workflow '{wf.name}' path references non-existent state '{state_name}'"
+                )
+
+        all_referenced_states.update(wf.path)
+
+        # Each workflow path must contain at least one agent state
+        has_path_agent = any(
+            cfg.states.get(s) and cfg.states[s].type == "agent"
+            for s in wf.path
+        )
+        if not has_path_agent:
+            errors.append(
+                f"Workflow '{wf.name}' path contains no agent states "
+                f"(need at least one state with type 'agent')"
+            )
+
+        # Each workflow path must end with a terminal state
+        if wf.path:
+            last_state = wf.path[-1]
+            last_sc = cfg.states.get(last_state)
+            if last_sc and last_sc.type != "terminal":
+                errors.append(
+                    f"Workflow '{wf.name}' path must end with a terminal state "
+                    f"('{last_state}' has type '{last_sc.type}')"
+                )
+        else:
+            errors.append(f"Workflow '{wf.name}' has an empty path")
+
+        # Gate validation within path context
+        for i, state_name in enumerate(wf.path):
+            sc = cfg.states.get(state_name)
+            if not sc or sc.type != "gate":
+                continue
+
+            # Gate must have resolvable approve (next state in path)
+            wf_transitions = wf.transitions.get(state_name, {})
+            if "approve" not in wf_transitions:
+                errors.append(
+                    f"Gate '{state_name}' in workflow '{wf.name}' has no resolvable "
+                    f"approve transition (no next state in path)"
+                )
+
+            # Gate must have resolvable rework_to
+            if "rework_to" not in wf_transitions:
+                # Check if the gate's StateConfig.rework_to is set
+                if not sc.rework_to:
+                    errors.append(
+                        f"Gate '{state_name}' in workflow '{wf.name}' has no resolvable "
+                        f"rework_to (no explicit rework_to and no prior agent state in path)"
+                    )
+
+        # Per-workflow reachability: walk this workflow's transition graph
+        wf_entry = wf.entry_state
+        wf_reachable: set[str] = set()
+        if wf_entry:
+            wf_reachable.add(wf_entry)
+        for state_name, state_transitions in wf.transitions.items():
+            for target in state_transitions.values():
+                wf_reachable.add(target)
+        wf_path_set = set(wf.path)
+        wf_unreachable = wf_path_set - wf_reachable
+        for name in wf_unreachable:
+            log.warning(
+                "State '%s' is unreachable in workflow '%s' "
+                "(no transitions lead to it)",
+                name, wf.name,
+            )
+
+    # Warn if a state in the pool is not referenced by any workflow path
+    unreferenced = all_state_names - all_referenced_states
+    for name in unreferenced:
+        log.warning(
+            "State '%s' is defined but not referenced by any workflow path", name
+        )
+
+    # Legacy mode: also run the original unreachable-states check using
+    # StateConfig.transitions (the synthesized _default workflow copies them
+    # verbatim, so the per-workflow check above covers this — but we keep
+    # the original check for backward compatibility in case the logic diverges)
+    if is_legacy:
+        entry = cfg.entry_state
+        reachable: set[str] = set()
+        if entry:
+            reachable.add(entry)
+        for sc in cfg.states.values():
+            for target in sc.transitions.values():
+                reachable.add(target)
+            if sc.rework_to:
+                reachable.add(sc.rework_to)
+
+        unreachable = all_state_names - reachable
+        for name in unreachable:
+            log.warning("State '%s' is unreachable (no transitions lead to it)", name)
 
 def validate_config(cfg: ServiceConfig) -> list[str]:
     """Validate state machine config for dispatch readiness. Returns list of errors."""
