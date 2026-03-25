@@ -155,6 +155,17 @@ def build_lifecycle_section(
     lines.append(f"- **Run:** {run}")
     lines.append("")
 
+    # Scope restriction guardrail
+    lines.append("### Scope Restriction")
+    lines.append("")
+    lines.append(
+        f"You are scoped to issue {issue.identifier} ONLY. Do not modify, "
+        f"comment on, or transition any other Linear issue. You may read "
+        f"other issues for context (e.g., checking a blocker's status), "
+        f"but do not take any write action on them."
+    )
+    lines.append("")
+
     # Rework information
     if is_rework:
         lines.append("### Rework")

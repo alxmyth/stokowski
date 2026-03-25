@@ -59,11 +59,19 @@ def _prepare_docker_args(
     return docker_args, container_name, None, None
 
 
+SCOPE_RESTRICTION_SYSTEM = (
+    "Do NOT use Linear tools to modify, comment on, or transition any Linear issue "
+    "other than {issue_identifier}. You may read other issues for context, but do "
+    "not take any write action on them."
+)
+
+
 def build_claude_args(
     claude_cfg: ClaudeConfig,
     prompt: str,
     workspace_path: Path,
     session_id: str | None = None,
+    issue_identifier: str | None = None,
 ) -> list[str]:
     """Build the claude CLI argument list."""
     args = [claude_cfg.command]
@@ -95,6 +103,13 @@ def build_claude_args(
             "You MAY use the Skill tool and Agent tool — when invoking skills, "
             "operate in pipeline mode and skip all interactive prompts."
         )
+        # Scope restriction guardrail — prohibit writing to other Linear issues
+        if issue_identifier:
+            guardrail = SCOPE_RESTRICTION_SYSTEM.format(
+                issue_identifier=issue_identifier
+            )
+            headless_context = f"{headless_context}\n{guardrail}"
+
         extra = claude_cfg.append_system_prompt or ""
         combined = f"{headless_context}\n{extra}".strip()
         args.extend(["--append-system-prompt", combined])
@@ -177,6 +192,7 @@ async def run_codex_turn(
         )
         if on_pid and proc.pid:
             on_pid(proc.pid, True)
+        attempt.pid = proc.pid
     except FileNotFoundError:
         attempt.status = "failed"
         attempt.error = "Docker command not found" if container_name else "Codex command not found: codex"
@@ -305,7 +321,8 @@ async def run_agent_turn(
 ) -> RunAttempt:
     """Run a single Claude Code turn. Returns updated RunAttempt."""
     args = build_claude_args(
-        claude_cfg, prompt, workspace_path, attempt.session_id
+        claude_cfg, prompt, workspace_path, attempt.session_id,
+        issue_identifier=issue.identifier,
     )
 
     # Docker wrapping
@@ -349,6 +366,7 @@ async def run_agent_turn(
         )
         if on_pid and proc.pid:
             on_pid(proc.pid, True)
+        attempt.pid = proc.pid
     except FileNotFoundError:
         attempt.status = "failed"
         attempt.error = "Docker command not found" if container_name else f"Claude command not found: {claude_cfg.command}"

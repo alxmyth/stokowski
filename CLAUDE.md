@@ -135,17 +135,28 @@ while running:
 3. Per-state concurrency limits checked against `max_concurrent_agents_by_state`
 4. `_dispatch()` creates a `RunAttempt`, adds to `self.running`, spawns `_run_worker` task
 
-**Reconciliation:** on each tick, fetches current states for all running issue IDs. If an issue moved to terminal state → cancel worker + clean workspace. If moved out of active states → cancel worker, release claim.
+**Reconciliation:** on each tick, fetches current states for all running AND gated issue IDs (`self.running | self._pending_gates`). If an issue moved to terminal state → `_kill_worker()` (kills PID + container + task) + `_cleanup_issue_state()` + remove workspace. If moved to review → `_kill_worker()`. If moved out of active states → `_kill_worker()` + `_cleanup_issue_state()`. If a gated issue is not found in Linear (deleted/archived) → `_cleanup_issue_state()`.
+
+**Cancellation infrastructure:**
+- `_kill_pid(pid)` — static method, sends SIGKILL to process group with individual kill fallback
+- `_kill_worker(issue_id, reason)` — kills subprocess PID → Docker container → async task (order matters: CancelledError does not propagate to child processes)
+- `_cleanup_issue_state(issue_id)` — removes all 11 per-issue tracking dict entries. Idempotent. Also used by `_transition()` terminal branch.
+- `_force_cancelled` set — populated by `_reconcile()` before calling `_kill_worker()`. Checked at the top of `_on_worker_exit()` to prevent double-processing (token aggregation is not idempotent, and `_safe_transition()` could re-populate tracking dicts after cleanup).
+- `_fire_and_forget(coro)` — schedules a coroutine without awaiting it, with `_background_tasks` set to prevent GC.
+
+**Agent self-cancellation:** agents can emit `<!-- transition:cancel -->` to cleanly exit without entering a retry loop.
 
 **Retry logic:**
 - `succeeded` → schedule continuation retry in 1s (checks if more work needed)
 - `failed/timed_out/stalled` → exponential backoff: `min(10000 * 2^(attempt-1), max_retry_backoff_ms)`
 - `canceled` → release claim immediately
 
-**Shutdown:** `stop()` sets `_stop_event`, kills all child PIDs via `os.killpg`, cancels async tasks.
+**Shutdown:** `stop()` sets `_stop_event`, kills all child PIDs via `_kill_pid()`, calls `cleanup_orphaned_containers()`, cancels async tasks. Uses bulk operations (not per-issue `_kill_worker()`) for speed.
 
 ### runner.py
-`run_agent_turn()` builds CLI args, launches subprocess, streams NDJSON output.
+`run_agent_turn()` builds CLI args, launches subprocess, streams NDJSON output. Sets `attempt.pid` after subprocess creation for targeted kill.
+
+**Scope restriction guardrail:** `build_claude_args()` accepts `issue_identifier` and interpolates a prohibition into the headless system prompt on first turns. The text uses a read/write split: agents MAY read other issues for context but MUST NOT write to them. The `SCOPE_RESTRICTION_SYSTEM` constant uses `str.format()` (not Jinja2 — `_SilentUndefined` would silently drop the identifier, removing the guardrail).
 
 **PID tracking:** `on_pid` callback registers/unregisters child PIDs with the orchestrator for clean shutdown.
 
@@ -198,7 +209,7 @@ Three-layer prompt assembly for state machine workflows. Main entry point is `as
 
 **`build_template_context(issue, state_name, run, attempt, last_run_at)`** builds the flat dict used for Jinja2 rendering. Includes: `issue_id`, `issue_identifier`, `issue_title`, `issue_description`, `issue_url`, `issue_priority`, `issue_state`, `issue_branch`, `issue_labels`, `state_name`, `run`, `attempt`, `last_run_at`.
 
-**`build_lifecycle_section()`** generates the auto-injected lifecycle section appended to every prompt. Includes issue metadata, rework context with review comments, recent activity, available transitions, and completion instructions. Clearly demarcated with HTML comments.
+**`build_lifecycle_section()`** generates the auto-injected lifecycle section appended to every prompt. Includes issue metadata, **scope restriction guardrail** (read/write split — agents may read other issues but must not write to them), rework context with review comments, recent activity, available transitions, and completion instructions. Clearly demarcated with HTML comments.
 
 **`assemble_prompt()`** orchestrates the three layers: loads and renders global prompt, loads and renders stage prompt, generates lifecycle section, joins with double newlines.
 
@@ -300,3 +311,6 @@ There are no automated tests beyond `--dry-run`. The system is best verified by 
 - **Docker mode: `~/.claude.json` must also be mounted**: Claude Code stores its main config at `~/.claude.json` (a file in the home directory), separate from the `~/.claude/` directory. Both must be mounted for auth to work with `inherit_claude_config: true`.
 - **Docker mode: uvicorn binds `0.0.0.0` in containers**: On macOS Docker Desktop, `127.0.0.1` inside a container isn't reachable from the host. The web dashboard auto-detects non-TTY mode and binds to `0.0.0.0`.
 - **Docker mode: plugin paths must be rewritten**: `installed_plugins.json` stores absolute host paths (e.g. `/Users/foo/.claude/plugins/cache/...`). When `~/.claude/` is mounted into a container at `/home/agent/.claude/`, these paths don't resolve. `build_docker_run_args` wraps the agent command in a `sed` fixup that rewrites host paths to container paths using the `STOKOWSKI_HOST_CLAUDE_DIR` env var. Without this, Claude Code plugins (skills, agents, MCP servers) fail to load inside containers.
+- **Agent scope guardrails**: Agents receive a scope restriction in both the system prompt (first turn) and lifecycle section (every turn) prohibiting writes to other Linear issues. This is a probabilistic guardrail, not hard enforcement. For hard enforcement, operators can use `permission_mode: allowedTools` to exclude Linear MCP tools — but this also blocks agents from managing their own ticket (posting comments, moving state).
+- **`STOKOWSKI_ISSUE_IDENTIFIER` env var**: Set per-dispatch in `_run_worker()`, not in `ServiceConfig`. Informational only — useful for hooks that need to know which issue they service. Not a security boundary.
+- **`_cleanup_issue_state()` must stay in sync with `__init__`**: Any new per-issue tracking dict added to `Orchestrator.__init__` must also be added to `_cleanup_issue_state()`. Failure to do so causes memory leaks and stale state on cancellation.
