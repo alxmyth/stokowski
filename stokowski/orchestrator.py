@@ -41,7 +41,7 @@ from . import artifacts as artifacts_mod
 from . import report as report_mod
 from .events import summarise_tool_input
 from .ledger import Ledger
-from .workspace import ensure_workspace, remove_workspace
+from .workspace import ensure_workspace, remove_workspace, sanitize_key
 
 logger = logging.getLogger("stokowski")
 
@@ -515,8 +515,6 @@ class Orchestrator:
                     ws_root, issue.identifier, self.cfg.hooks,
                     docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
                 )
-            if terminal:
-                logger.info(f"Cleaned {len(terminal)} terminal workspaces")
         except Exception as e:
             logger.warning(f"Startup cleanup failed (continuing): {e}")
 

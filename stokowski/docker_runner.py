@@ -52,8 +52,8 @@ async def create_workspace_volume(
 
 async def remove_workspace_volume(
     docker_cfg: DockerConfig, workspace_key: str
-) -> None:
-    """Remove a per-issue Docker volume. Best-effort."""
+) -> bool:
+    """Remove a per-issue Docker volume. Best-effort. Returns True if removed."""
     vol = workspace_volume_name(docker_cfg, workspace_key)
     proc = await asyncio.create_subprocess_exec(
         "docker", "volume", "rm", vol,
@@ -62,9 +62,11 @@ async def remove_workspace_volume(
     )
     try:
         await asyncio.wait_for(proc.wait(), timeout=_DOCKER_CLI_TIMEOUT)
+        return proc.returncode == 0
     except asyncio.TimeoutError:
         logger.warning(f"Timed out removing volume {vol}, killing docker CLI process")
         proc.kill()
+        return False
 
 
 async def cleanup_orphaned_volumes(
