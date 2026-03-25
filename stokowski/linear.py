@@ -83,6 +83,7 @@ query($projectSlug: String!, $states: [String!]!, $after: String) {
       id
       identifier
       state { name }
+      labels { nodes { name } }
     }
   }
 }
@@ -281,12 +282,18 @@ class LinearClient:
             issues_data = data.get("issues", {})
             for node in issues_data.get("nodes", []):
                 if node and node.get("id"):
+                    labels = [
+                        label["name"].lower()
+                        for label in (node.get("labels", {}) or {}).get("nodes", [])
+                        if label.get("name")
+                    ]
                     issues.append(
                         Issue(
                             id=node["id"],
                             identifier=node.get("identifier", ""),
                             title="",
                             state=(node.get("state") or {}).get("name", ""),
+                            labels=labels,
                         )
                     )
 

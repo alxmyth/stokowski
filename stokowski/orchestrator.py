@@ -780,36 +780,54 @@ class Orchestrator:
                     gate_state = tracking.get("state", "")
 
             if gate_state:
-                # Resolve workflow (cold-start recovery if needed)
-                workflow = self._resolve_gate_workflow(issue, tracking)
+                try:
+                    # Resolve workflow (cold-start recovery if needed)
+                    workflow = self._resolve_gate_workflow(issue, tracking)
 
-                run = self._issue_state_runs.get(issue.id, 1)
-                comment = make_gate_comment(
-                    state=gate_state, status="approved", run=run,
-                    workflow=workflow.name,
-                )
-                await client.post_comment(issue.id, comment)
+                    run = self._issue_state_runs.get(issue.id, 1)
+                    comment = make_gate_comment(
+                        state=gate_state, status="approved", run=run,
+                        workflow=workflow.name,
+                    )
+                    await client.post_comment(issue.id, comment)
 
-                # Follow approve transition from workflow
-                self._issue_current_state[issue.id] = gate_state
-                wf_transitions = workflow.transitions.get(gate_state, {})
-                target = wf_transitions.get("approve")
-                if not target:
-                    # Fallback to StateConfig transitions for backward compat
-                    gate_cfg = self.cfg.states.get(gate_state)
-                    if gate_cfg and "approve" in gate_cfg.transitions:
-                        target = gate_cfg.transitions["approve"]
-                if target:
+                    # Follow approve transition from workflow
+                    self._issue_current_state[issue.id] = gate_state
+                    wf_transitions = workflow.transitions.get(gate_state, {})
+                    target = wf_transitions.get("approve")
+                    if not target:
+                        # Fallback to StateConfig transitions for backward compat
+                        gate_cfg = self.cfg.states.get(gate_state)
+                        if gate_cfg and "approve" in gate_cfg.transitions:
+                            target = gate_cfg.transitions["approve"]
+                    if not target:
+                        logger.warning(
+                            f"Gate '{gate_state}' has no approve target for "
+                            f"{issue.identifier}, skipping"
+                        )
+                        continue
                     self._issue_current_state[issue.id] = target
+                    self._issue_state_runs[issue.id] = 1
 
-                active_state = self.cfg.linear_states.active
-                moved = await client.update_issue_state(issue.id, active_state)
-                if moved:
-                    issue.state = active_state
-                else:
-                    logger.warning(f"Failed to move {issue.identifier} to active after gate approval")
-                self._last_issues[issue.id] = issue
-                logger.info(f"Gate approved issue={issue.identifier} gate={gate_state}")
+                    # Post state-entry comment for the approve target
+                    state_comment = make_state_comment(
+                        state=target, run=1, workflow=workflow.name,
+                    )
+                    await client.post_comment(issue.id, state_comment)
+
+                    active_state = self.cfg.linear_states.active
+                    moved = await client.update_issue_state(issue.id, active_state)
+                    if moved:
+                        issue.state = active_state
+                    else:
+                        logger.warning(f"Failed to move {issue.identifier} to active after gate approval")
+                    self._last_issues[issue.id] = issue
+                    logger.info(f"Gate approved issue={issue.identifier} gate={gate_state}")
+                except Exception as e:
+                    logger.error(
+                        f"Gate approval handling failed for {issue.identifier}: {e}",
+                        exc_info=True,
+                    )
 
         # Fetch rework issues
         try:
@@ -835,66 +853,72 @@ class Orchestrator:
                     gate_state = tracking.get("state", "")
 
             if gate_state:
-                # Resolve workflow (cold-start recovery if needed)
-                workflow = self._resolve_gate_workflow(issue, tracking)
+                try:
+                    # Resolve workflow (cold-start recovery if needed)
+                    workflow = self._resolve_gate_workflow(issue, tracking)
 
-                gate_cfg = self.cfg.states.get(gate_state)
+                    gate_cfg = self.cfg.states.get(gate_state)
 
-                # Resolve rework_to from workflow transitions, then StateConfig fallback
-                wf_transitions = workflow.transitions.get(gate_state, {})
-                rework_to = wf_transitions.get("rework_to", "")
-                if not rework_to:
-                    rework_to = gate_cfg.rework_to if gate_cfg else ""
-                if not rework_to:
-                    logger.warning(f"Gate {gate_state} has no rework_to target, skipping")
-                    continue
+                    # Resolve rework_to from workflow transitions, then StateConfig fallback
+                    wf_transitions = workflow.transitions.get(gate_state, {})
+                    rework_to = wf_transitions.get("rework_to", "")
+                    if not rework_to:
+                        rework_to = gate_cfg.rework_to if gate_cfg else ""
+                    if not rework_to:
+                        logger.warning(f"Gate {gate_state} has no rework_to target, skipping")
+                        continue
 
-                # Check max_rework
-                run = self._issue_state_runs.get(issue.id, 1)
-                max_rework = gate_cfg.max_rework if gate_cfg else None
-                if max_rework is not None and run >= max_rework:
-                    # Exceeded max rework — post escalated comment, don't transition
+                    # Check max_rework
+                    run = self._issue_state_runs.get(issue.id, 1)
+                    max_rework = gate_cfg.max_rework if gate_cfg else None
+                    if max_rework is not None and run >= max_rework:
+                        # Exceeded max rework — post escalated comment, don't transition
+                        comment = make_gate_comment(
+                            state=gate_state, status="escalated", run=run,
+                            workflow=workflow.name,
+                        )
+                        await client.post_comment(issue.id, comment)
+                        logger.warning(
+                            f"Max rework exceeded issue={issue.identifier} "
+                            f"gate={gate_state} run={run} max={max_rework}"
+                        )
+                        continue
+
+                    new_run = run + 1
+                    self._issue_state_runs[issue.id] = new_run
+
                     comment = make_gate_comment(
-                        state=gate_state, status="escalated", run=run,
+                        state=gate_state, status="rework",
+                        rework_to=rework_to, run=new_run,
                         workflow=workflow.name,
                     )
                     await client.post_comment(issue.id, comment)
-                    logger.warning(
-                        f"Max rework exceeded issue={issue.identifier} "
-                        f"gate={gate_state} run={run} max={max_rework}"
+
+                    # Post state-entry comment for rework target
+                    state_comment = make_state_comment(
+                        state=rework_to, run=new_run,
+                        workflow=workflow.name,
                     )
-                    continue
+                    await client.post_comment(issue.id, state_comment)
 
-                new_run = run + 1
-                self._issue_state_runs[issue.id] = new_run
+                    self._issue_current_state[issue.id] = rework_to
 
-                comment = make_gate_comment(
-                    state=gate_state, status="rework",
-                    rework_to=rework_to, run=new_run,
-                    workflow=workflow.name,
-                )
-                await client.post_comment(issue.id, comment)
-
-                # Post state-entry comment for rework target
-                state_comment = make_state_comment(
-                    state=rework_to, run=new_run,
-                    workflow=workflow.name,
-                )
-                await client.post_comment(issue.id, state_comment)
-
-                self._issue_current_state[issue.id] = rework_to
-
-                active_state = self.cfg.linear_states.active
-                moved = await client.update_issue_state(issue.id, active_state)
-                if moved:
-                    issue.state = active_state
-                else:
-                    logger.warning(f"Failed to move {issue.identifier} to active after rework")
-                self._last_issues[issue.id] = issue
-                logger.info(
-                    f"Rework issue={issue.identifier} gate={gate_state} "
-                    f"rework_to={rework_to} run={new_run}"
-                )
+                    active_state = self.cfg.linear_states.active
+                    moved = await client.update_issue_state(issue.id, active_state)
+                    if moved:
+                        issue.state = active_state
+                    else:
+                        logger.warning(f"Failed to move {issue.identifier} to active after rework")
+                    self._last_issues[issue.id] = issue
+                    logger.info(
+                        f"Rework issue={issue.identifier} gate={gate_state} "
+                        f"rework_to={rework_to} run={new_run}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Gate rework handling failed for {issue.identifier}: {e}",
+                        exc_info=True,
+                    )
 
     async def _tick(self):
         """Single poll tick: reconcile, validate, fetch, dispatch."""
@@ -1109,10 +1133,12 @@ class Orchestrator:
             if state_name:
                 run = self._issue_state_runs.get(issue.id, 1)
                 if run == 1 and (attempt.attempt is None or attempt.attempt == 0):
+                    wf = self._get_issue_workflow_config(issue.id)
                     client = self._ensure_linear_client()
                     comment = make_state_comment(
                         state=state_name,
                         run=run,
+                        workflow=wf.name,
                     )
                     await client.post_comment(issue.id, comment)
 

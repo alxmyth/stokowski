@@ -787,6 +787,20 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
         else:
             errors.append(f"Workflow '{wf.name}' has an empty path")
 
+        # Validate terminal_state key
+        valid_terminal_keys = {"terminal", "todo", "active", "review", "gate_approved", "rework"}
+        if wf.terminal_state not in valid_terminal_keys:
+            errors.append(
+                f"Workflow '{wf.name}' has invalid terminal_state: '{wf.terminal_state}' "
+                f"(must be a valid LinearStatesConfig key)"
+            )
+        if wf.terminal_state in ("active",):
+            log.warning(
+                "Workflow '%s' terminal_state resolves to an active state "
+                "('%s') — this could cause dispatch loops",
+                wf.name, wf.terminal_state,
+            )
+
         # Gate validation within path context
         for i, state_name in enumerate(wf.path):
             sc = cfg.states.get(state_name)
