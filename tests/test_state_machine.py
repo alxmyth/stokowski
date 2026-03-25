@@ -1747,3 +1747,72 @@ workflows:
         assert running_entry["workflow"] == "quick-fix"
         gate_entry = snapshot["gates"][0]
         assert gate_entry["workflow"] == "full-ce"
+
+    # --- _resolve_gate_workflow (cold-start gate recovery) ---
+
+    def test_resolve_gate_workflow_cached(self, tmp_path):
+        """When workflow is already cached, returns it directly."""
+        orch = self._make_orch(tmp_path)
+        issue = self._make_issue(labels=["workflow:quick-fix"])
+        orch._issue_workflow[issue.id] = "quick-fix"
+
+        wf = orch._resolve_gate_workflow(issue, tracking=None)
+        assert wf.name == "quick-fix"
+
+    def test_resolve_gate_workflow_from_tracking(self, tmp_path):
+        """Cold start: resolves workflow from tracking comment's workflow field."""
+        orch = self._make_orch(tmp_path)
+        issue = self._make_issue(labels=[])
+        # Not cached — simulate cold start
+        assert issue.id not in orch._issue_workflow
+
+        tracking = {
+            "type": "gate",
+            "state": "review-gate",
+            "status": "waiting",
+            "workflow": "quick-fix",
+        }
+        wf = orch._resolve_gate_workflow(issue, tracking)
+        assert wf.name == "quick-fix"
+        # Should also cache it
+        assert orch._issue_workflow[issue.id] == "quick-fix"
+
+    def test_resolve_gate_workflow_tracking_unknown_workflow_falls_back(self, tmp_path):
+        """Cold start: tracking has unknown workflow name, falls back to label resolution."""
+        orch = self._make_orch(tmp_path)
+        issue = self._make_issue(labels=["workflow:quick-fix"])
+
+        tracking = {
+            "type": "gate",
+            "state": "review-gate",
+            "workflow": "removed-workflow",
+        }
+        wf = orch._resolve_gate_workflow(issue, tracking)
+        # Should resolve from labels since "removed-workflow" doesn't exist
+        assert wf.name == "quick-fix"
+        assert orch._issue_workflow[issue.id] == "quick-fix"
+
+    def test_resolve_gate_workflow_no_tracking_resolves_from_labels(self, tmp_path):
+        """Cold start with no tracking data: resolves from issue labels."""
+        orch = self._make_orch(tmp_path)
+        issue = self._make_issue(labels=["workflow:quick-fix"])
+
+        wf = orch._resolve_gate_workflow(issue, tracking=None)
+        assert wf.name == "quick-fix"
+        assert orch._issue_workflow[issue.id] == "quick-fix"
+
+    def test_resolve_gate_workflow_legacy_no_workflow_field(self, tmp_path):
+        """Cold start with legacy tracking (no workflow field): resolves from labels."""
+        orch = self._make_orch(tmp_path)
+        issue = self._make_issue(labels=[])
+
+        tracking = {
+            "type": "gate",
+            "state": "review-gate",
+            "status": "waiting",
+            "workflow": None,  # legacy comment has no workflow field
+        }
+        wf = orch._resolve_gate_workflow(issue, tracking)
+        # No label match and no workflow field → default workflow
+        assert wf.name == "triage"
+        assert wf.default is True
