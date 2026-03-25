@@ -89,6 +89,20 @@ class ServerConfig:
 
 
 @dataclass
+class LoggingConfig:
+    """Agent run log retention configuration."""
+    enabled: bool = False
+    log_dir: str = ""
+    max_age_days: int = 14
+    max_total_size_mb: int = 500
+
+    def resolved_log_dir(self) -> Path:
+        """Resolve ~ and $VAR in log_dir."""
+        expanded = os.path.expanduser(os.path.expandvars(self.log_dir))
+        return Path(expanded)
+
+
+@dataclass
 class LinearStatesConfig:
     """Maps logical state names to actual Linear state names."""
     todo: str = "Todo"
@@ -143,6 +157,7 @@ class ServiceConfig:
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
     linear_states: LinearStatesConfig = field(default_factory=LinearStatesConfig)
     prompts: PromptsConfig = field(default_factory=PromptsConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
@@ -412,6 +427,15 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
     s = config_raw.get("server", {}) or {}
     server = ServerConfig(port=s.get("port"))
 
+    # Parse logging
+    lg = config_raw.get("logging", {}) or {}
+    logging_cfg = LoggingConfig(
+        enabled=bool(lg.get("enabled", False)),
+        log_dir=str(lg.get("log_dir", "")),
+        max_age_days=_coerce_int(lg.get("max_age_days"), 14),
+        max_total_size_mb=_coerce_int(lg.get("max_total_size_mb"), 500),
+    )
+
     # Parse linear_states
     ls_raw = config_raw.get("linear_states", {}) or {}
     linear_states = LinearStatesConfig(
@@ -458,6 +482,7 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
         claude=claude,
         agent=agent,
         server=server,
+        logging=logging_cfg,
         linear_states=linear_states,
         prompts=prompts,
         docker=docker,
@@ -585,5 +610,9 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
                 "max_concurrent_agents_by_state key '%s' does not match any defined state",
                 state_key,
             )
+
+    # Validate logging
+    if cfg.logging.enabled and not cfg.logging.log_dir:
+        log.warning("logging.enabled is true but log_dir is not set")
 
     return errors

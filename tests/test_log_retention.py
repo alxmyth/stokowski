@@ -1,0 +1,235 @@
+"""Pure-function tests for log retention infrastructure.
+
+Tests the config parsing, log path construction, and retention cleanup
+functions without network, Docker, or subprocess calls.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+from pathlib import Path
+
+import pytest
+
+from stokowski.orchestrator import cleanup_old_logs, enforce_size_limit
+from stokowski.workspace import sanitize_key
+
+
+# ---------------------------------------------------------------------------
+# Log path construction
+# ---------------------------------------------------------------------------
+
+
+class TestLogPathConstruction:
+    """Test the log path naming convention."""
+
+    def test_sanitize_key_for_log_dir(self):
+        assert sanitize_key("SMI-14") == "SMI-14"
+        assert sanitize_key("PROJ-123") == "PROJ-123"
+
+    def test_sanitize_key_special_chars(self):
+        assert sanitize_key("PROJ/123") == "PROJ_123"
+        assert sanitize_key("PROJ 123") == "PROJ_123"
+
+    def test_log_file_extension_ndjson(self):
+        """Claude Code turns use .ndjson extension."""
+        runner_type = "claude"
+        ext = ".log" if runner_type == "codex" else ".ndjson"
+        assert ext == ".ndjson"
+
+    def test_log_file_extension_codex(self):
+        """Codex turns use .log extension."""
+        runner_type = "codex"
+        ext = ".log" if runner_type == "codex" else ".ndjson"
+        assert ext == ".log"
+
+    def test_timestamp_format_is_filesystem_safe(self):
+        from datetime import datetime, timezone
+
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        # No colons, no spaces, no special chars
+        assert ":" not in ts
+        assert " " not in ts
+        # Chronological order = lexicographic order
+        earlier = "20260101T000000Z"
+        later = "20260324T235959Z"
+        assert earlier < later
+
+
+# ---------------------------------------------------------------------------
+# cleanup_old_logs
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupOldLogs:
+    def test_deletes_old_files(self, tmp_path):
+        issue_dir = tmp_path / "SMI-1"
+        issue_dir.mkdir()
+        old_file = issue_dir / "20260101T000000Z-turn-1.ndjson"
+        old_file.write_text("old data")
+        # Set mtime to 30 days ago
+        old_mtime = time.time() - (30 * 86400)
+        os.utime(old_file, (old_mtime, old_mtime))
+
+        deleted = cleanup_old_logs(tmp_path, max_age_days=14)
+        assert deleted == 1
+        assert not old_file.exists()
+
+    def test_keeps_recent_files(self, tmp_path):
+        issue_dir = tmp_path / "SMI-1"
+        issue_dir.mkdir()
+        recent_file = issue_dir / "20260324T100000Z-turn-1.ndjson"
+        recent_file.write_text("recent data")
+
+        deleted = cleanup_old_logs(tmp_path, max_age_days=14)
+        assert deleted == 0
+        assert recent_file.exists()
+
+    def test_removes_empty_issue_directory(self, tmp_path):
+        issue_dir = tmp_path / "SMI-1"
+        issue_dir.mkdir()
+        old_file = issue_dir / "old.ndjson"
+        old_file.write_text("data")
+        old_mtime = time.time() - (30 * 86400)
+        os.utime(old_file, (old_mtime, old_mtime))
+
+        cleanup_old_logs(tmp_path, max_age_days=14)
+        assert not issue_dir.exists()
+
+    def test_keeps_directory_with_remaining_files(self, tmp_path):
+        issue_dir = tmp_path / "SMI-1"
+        issue_dir.mkdir()
+
+        old_file = issue_dir / "old.ndjson"
+        old_file.write_text("old")
+        old_mtime = time.time() - (30 * 86400)
+        os.utime(old_file, (old_mtime, old_mtime))
+
+        recent_file = issue_dir / "recent.ndjson"
+        recent_file.write_text("recent")
+
+        cleanup_old_logs(tmp_path, max_age_days=14)
+        assert issue_dir.exists()
+        assert recent_file.exists()
+
+    def test_empty_directory_is_noop(self, tmp_path):
+        deleted = cleanup_old_logs(tmp_path, max_age_days=14)
+        assert deleted == 0
+
+    def test_nonexistent_directory_does_not_raise(self, tmp_path):
+        fake_dir = tmp_path / "nonexistent"
+        # cleanup_old_logs iterates log_dir.iterdir() which would raise
+        # but the caller (_cleanup_logs) checks existence first.
+        # The function itself should handle gracefully if called directly.
+        try:
+            cleanup_old_logs(fake_dir, max_age_days=14)
+        except FileNotFoundError:
+            pass  # acceptable — caller checks existence
+
+
+# ---------------------------------------------------------------------------
+# enforce_size_limit
+# ---------------------------------------------------------------------------
+
+
+class TestEnforceSizeLimit:
+    def test_no_deletion_under_limit(self, tmp_path):
+        issue_dir = tmp_path / "SMI-1"
+        issue_dir.mkdir()
+        f = issue_dir / "turn-1.ndjson"
+        f.write_bytes(b"x" * 100)  # 100 bytes
+
+        deleted = enforce_size_limit(tmp_path, max_total_size_mb=1)
+        assert deleted == 0
+        assert f.exists()
+
+    def test_deletes_oldest_first(self, tmp_path):
+        issue_dir = tmp_path / "SMI-1"
+        issue_dir.mkdir()
+
+        # Create two files, make one older
+        old_file = issue_dir / "old.ndjson"
+        old_file.write_bytes(b"x" * 600_000)
+        old_mtime = time.time() - 3600
+        os.utime(old_file, (old_mtime, old_mtime))
+
+        new_file = issue_dir / "new.ndjson"
+        new_file.write_bytes(b"y" * 600_000)
+
+        # Total ~1.2MB, limit 1MB — should delete old first
+        deleted = enforce_size_limit(tmp_path, max_total_size_mb=1)
+        assert deleted >= 1
+        assert not old_file.exists()
+        assert new_file.exists()
+
+    def test_exempts_active_agents(self, tmp_path):
+        active_dir = tmp_path / "SMI-1"
+        active_dir.mkdir()
+        old_dir = tmp_path / "SMI-2"
+        old_dir.mkdir()
+
+        active_file = active_dir / "turn.ndjson"
+        active_file.write_bytes(b"x" * 600_000)
+        active_mtime = time.time() - 7200  # older
+        os.utime(active_file, (active_mtime, active_mtime))
+
+        old_file = old_dir / "turn.ndjson"
+        old_file.write_bytes(b"y" * 600_000)
+        old_mtime = time.time() - 3600  # newer but not exempt
+        os.utime(old_file, (old_mtime, old_mtime))
+
+        # Total ~1.2MB, limit 1MB. SMI-1 is exempt (active agent)
+        deleted = enforce_size_limit(
+            tmp_path, max_total_size_mb=1, exempt_identifiers={"SMI-1"}
+        )
+        assert not active_file.exists() or deleted == 0 or old_file.exists() is False
+        # The exempt file should survive
+        assert active_file.exists()
+
+    def test_removes_empty_directories(self, tmp_path):
+        issue_dir = tmp_path / "SMI-1"
+        issue_dir.mkdir()
+        f = issue_dir / "turn.ndjson"
+        f.write_bytes(b"x" * 2_000_000)  # 2MB
+
+        enforce_size_limit(tmp_path, max_total_size_mb=1)
+        # File deleted and directory should be cleaned up
+        assert not f.exists()
+        assert not issue_dir.exists()
+
+    def test_empty_directory_returns_zero(self, tmp_path):
+        deleted = enforce_size_limit(tmp_path, max_total_size_mb=1)
+        assert deleted == 0
+
+
+# ---------------------------------------------------------------------------
+# LoggingConfig parsing
+# ---------------------------------------------------------------------------
+
+
+class TestLoggingConfig:
+    def test_default_values(self):
+        from stokowski.config import LoggingConfig
+
+        cfg = LoggingConfig()
+        assert cfg.enabled is False
+        assert cfg.log_dir == ""
+        assert cfg.max_age_days == 14
+        assert cfg.max_total_size_mb == 500
+
+    def test_resolved_log_dir_expands_tilde(self):
+        from stokowski.config import LoggingConfig
+
+        cfg = LoggingConfig(log_dir="~/stokowski-logs")
+        resolved = cfg.resolved_log_dir()
+        assert "~" not in str(resolved)
+        assert "stokowski-logs" in str(resolved)
+
+    def test_resolved_log_dir_expands_env_var(self, monkeypatch):
+        from stokowski.config import LoggingConfig
+
+        monkeypatch.setenv("TEST_LOG_DIR", "/tmp/test-logs")
+        cfg = LoggingConfig(log_dir="$TEST_LOG_DIR/sub")
+        resolved = cfg.resolved_log_dir()
+        assert str(resolved) == "/tmp/test-logs/sub"

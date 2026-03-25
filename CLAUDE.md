@@ -89,6 +89,7 @@ Parses `workflow.yaml` (or legacy `.md` with front matter) into typed dataclasse
 - `ClaudeConfig` — command, permission mode, model, timeouts, system prompt
 - `AgentConfig` — concurrency limits (global + per-state)
 - `ServerConfig` — optional web dashboard port
+- `LoggingConfig` — agent run log retention: `enabled` (default false), `log_dir` (supports `~` and `$VAR`), `max_age_days` (default 14), `max_total_size_mb` (default 500). `resolved_log_dir()` expands path variables.
 - `LinearStatesConfig` — maps logical state names (`todo`, `active`, `review`, `gate_approved`, `rework`, `terminal`) to actual Linear state names. Issues in the `todo` state are picked up and automatically moved to `active` on dispatch.
 - `PromptsConfig` — global prompt file reference
 - `StateConfig` — a single state in the state machine: type, prompt path, linear_state key, runner, session mode, transitions, per-state overrides (model, max_turns, timeouts, hooks), gate-specific fields (rework_to, max_rework)
@@ -157,6 +158,8 @@ while running:
 `run_agent_turn()` builds CLI args, launches subprocess, streams NDJSON output. Sets `attempt.pid` after subprocess creation for targeted kill.
 
 **Scope restriction guardrail:** `build_claude_args()` accepts `issue_identifier` and interpolates a prohibition into the headless system prompt on first turns. The text uses a read/write split: agents MAY read other issues for context but MUST NOT write to them. The `SCOPE_RESTRICTION_SYSTEM` constant uses `str.format()` (not Jinja2 — `_SilentUndefined` would silently drop the identifier, removing the guardrail).
+
+**Agent run log capture:** When `log_path` is provided, raw stdout bytes are written to a file during `read_stream()`. The file handle is opened before the `asyncio.wait()` block and closed in a `finally` — this ensures cleanup on all exit paths including `CancelledError`. Write failures are silently swallowed (best-effort). Both `run_agent_turn()` (NDJSON) and `run_codex_turn()` (plain text) support log capture via the same `log_path` parameter.
 
 **PID tracking:** `on_pid` callback registers/unregisters child PIDs with the orchestrator for clean shutdown.
 
@@ -314,3 +317,4 @@ There are no automated tests beyond `--dry-run`. The system is best verified by 
 - **Agent scope guardrails**: Agents receive a scope restriction in both the system prompt (first turn) and lifecycle section (every turn) prohibiting writes to other Linear issues. This is a probabilistic guardrail, not hard enforcement. For hard enforcement, operators can use `permission_mode: allowedTools` to exclude Linear MCP tools — but this also blocks agents from managing their own ticket (posting comments, moving state).
 - **`STOKOWSKI_ISSUE_IDENTIFIER` env var**: Set per-dispatch in `_run_worker()`, not in `ServiceConfig`. Informational only — useful for hooks that need to know which issue they service. Not a security boundary.
 - **`_cleanup_issue_state()` must stay in sync with `__init__`**: Any new per-issue tracking dict added to `Orchestrator.__init__` must also be added to `_cleanup_issue_state()`. Failure to do so causes memory leaks and stale state on cancellation.
+- **Agent run logs**: When `logging.enabled` is true, raw agent stdout is captured to `{log_dir}/{issue_identifier}/` as `.ndjson` (Claude Code) or `.log` (Codex) files. To debug an agent run: `cat {log_dir}/SMI-14/20260324T041500Z-turn-1.ndjson | jq .` Logs survive workspace cleanup — their lifetime is controlled by `max_age_days` and `max_total_size_mb`. Retention cleanup runs at startup and after each worker exit. Log writes are best-effort — failures do not affect agent execution.

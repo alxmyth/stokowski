@@ -144,6 +144,7 @@ async def run_codex_turn(
     docker_cfg: DockerConfig | None = None,
     workspace_key: str = "",
     docker_image: str = "",
+    log_path: Path | None = None,
 ) -> RunAttempt:
     """Run a single Codex turn. Returns updated RunAttempt.
 
@@ -204,6 +205,15 @@ async def run_codex_turn(
     stall_timeout_s = stall_timeout_ms / 1000
     turn_timeout_s = turn_timeout_ms / 1000
 
+    # Open log file for raw stdout capture (best-effort)
+    log_file = None
+    if log_path:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_file = open(log_path, "wb")
+        except OSError as e:
+            logger.warning(f"Failed to open log file {log_path}: {e}")
+
     async def read_stream():
         nonlocal last_activity
         output_lines = []
@@ -211,6 +221,13 @@ async def run_codex_turn(
             line = await proc.stdout.readline()
             if not line:
                 break
+            # Write raw bytes to log file before any processing
+            if log_file:
+                try:
+                    log_file.write(line)
+                    log_file.flush()
+                except OSError:
+                    pass
             last_activity = loop.time()
             attempt.last_event_at = datetime.now(timezone.utc)
             line_str = line.decode().strip()
@@ -268,6 +285,13 @@ async def run_codex_turn(
         attempt.status = "failed"
         attempt.error = str(e)
         # Still need to run after_run hook and unregister PID below
+    finally:
+        # Close log file on all exit paths
+        if log_file:
+            try:
+                log_file.close()
+            except OSError:
+                pass
 
     # Determine final status from exit code if not already set
     if attempt.status == "streaming":
@@ -318,6 +342,7 @@ async def run_agent_turn(
     docker_cfg: DockerConfig | None = None,
     workspace_key: str = "",
     docker_image: str = "",
+    log_path: Path | None = None,
 ) -> RunAttempt:
     """Run a single Claude Code turn. Returns updated RunAttempt."""
     args = build_claude_args(
@@ -379,12 +404,28 @@ async def run_agent_turn(
     stall_timeout_s = claude_cfg.stall_timeout_ms / 1000
     turn_timeout_s = claude_cfg.turn_timeout_ms / 1000
 
+    # Open log file for raw stdout capture (best-effort)
+    log_file = None
+    if log_path:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_file = open(log_path, "wb")
+        except OSError as e:
+            logger.warning(f"Failed to open log file {log_path}: {e}")
+
     async def read_stream():
         nonlocal last_activity
         while True:
             line = await proc.stdout.readline()
             if not line:
                 break
+            # Write raw bytes to log file before any processing
+            if log_file:
+                try:
+                    log_file.write(line)
+                    log_file.flush()
+                except OSError:
+                    pass
             last_activity = loop.time()
             attempt.last_event_at = datetime.now(timezone.utc)
 
@@ -451,6 +492,13 @@ async def run_agent_turn(
         attempt.status = "failed"
         attempt.error = str(e)
         return attempt
+    finally:
+        # Close log file on all exit paths (normal, stall, timeout, CancelledError)
+        if log_file:
+            try:
+                log_file.close()
+            except OSError:
+                pass
 
     # Determine final status from exit code if not already set by stall/timeout
     if attempt.status == "streaming":
@@ -562,6 +610,7 @@ async def run_turn(
     docker_cfg: DockerConfig | None = None,
     workspace_key: str = "",
     docker_image: str = "",
+    log_path: Path | None = None,
 ) -> RunAttempt:
     """Route to the correct runner based on runner_type."""
     if runner_type == "codex":
@@ -579,6 +628,7 @@ async def run_turn(
             docker_cfg=docker_cfg,
             workspace_key=workspace_key,
             docker_image=docker_image,
+            log_path=log_path,
         )
     elif runner_type == "claude":
         return await run_agent_turn(
@@ -594,6 +644,7 @@ async def run_turn(
             docker_cfg=docker_cfg,
             workspace_key=workspace_key,
             docker_image=docker_image,
+            log_path=log_path,
         )
     else:
         raise ValueError(f"Unknown runner type: {runner_type}")

@@ -189,6 +189,30 @@ class Orchestrator:
         except Exception as e:
             logger.debug(f"Failed to post cancellation comment for {issue_id}: {e}")
 
+    async def _cleanup_logs(self) -> None:
+        """Run log retention cleanup. Best-effort — errors logged and swallowed."""
+        if not self.cfg.logging.enabled or not self.cfg.logging.log_dir:
+            return
+        try:
+            log_dir = self.cfg.logging.resolved_log_dir()
+            if not log_dir.exists():
+                return
+
+            exempt = {
+                self.running[iid].issue_identifier
+                for iid in self.running
+                if self.running[iid].issue_identifier
+            }
+
+            if self.cfg.logging.max_age_days > 0:
+                cleanup_old_logs(log_dir, self.cfg.logging.max_age_days)
+            if self.cfg.logging.max_total_size_mb > 0:
+                enforce_size_limit(
+                    log_dir, self.cfg.logging.max_total_size_mb, exempt
+                )
+        except Exception as e:
+            logger.warning(f"Log retention cleanup failed: {e}")
+
     async def start(self):
         """Start the orchestration loop."""
         errors = self._load_workflow()
@@ -298,6 +322,8 @@ class Orchestrator:
                 )
         except Exception as e:
             logger.warning(f"Startup cleanup failed (continuing): {e}")
+
+        await self._cleanup_logs()
 
     async def _resolve_current_state(self, issue: Issue) -> tuple[str, int]:
         """Resolve current state machine state for an issue.
@@ -940,6 +966,15 @@ class Orchestrator:
                 agent_env = self.cfg.agent_env()
             agent_env["STOKOWSKI_ISSUE_IDENTIFIER"] = issue.identifier
 
+            # Build log path if logging enabled
+            log_path = None
+            if self.cfg.logging.enabled and self.cfg.logging.log_dir:
+                log_dir = self.cfg.logging.resolved_log_dir()
+                issue_log_dir = log_dir / sanitize_key(issue.identifier)
+                timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                ext = ".log" if runner_type == "codex" else ".ndjson"
+                log_path = issue_log_dir / f"{timestamp}-turn-{attempt.turn_count + 1}{ext}"
+
             # State machine mode: single turn per dispatch. The state
             # machine handles continuation via _transition after each
             # turn completes — multi-turn loops would bypass gate
@@ -960,6 +995,7 @@ class Orchestrator:
                     docker_cfg=self.cfg.docker,
                     workspace_key=ws.workspace_key,
                     docker_image=docker_image,
+                    log_path=log_path,
                 )
             else:
                 # Legacy mode: multi-turn loop
@@ -990,6 +1026,15 @@ class Orchestrator:
                             f"Check your progress and continue the task."
                         )
 
+                    # Recalculate log path per turn in legacy mode
+                    turn_log_path = None
+                    if self.cfg.logging.enabled and self.cfg.logging.log_dir:
+                        log_dir = self.cfg.logging.resolved_log_dir()
+                        issue_log_dir = log_dir / sanitize_key(issue.identifier)
+                        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                        ext = ".log" if runner_type == "codex" else ".ndjson"
+                        turn_log_path = issue_log_dir / f"{timestamp}-turn-{attempt.turn_count + 1}{ext}"
+
                     attempt = await run_turn(
                         runner_type=runner_type,
                         claude_cfg=claude_cfg,
@@ -1004,6 +1049,7 @@ class Orchestrator:
                         docker_cfg=self.cfg.docker,
                         workspace_key=ws.workspace_key,
                         docker_image=docker_image,
+                        log_path=turn_log_path,
                     )
 
                     if attempt.status != "succeeded":
@@ -1228,6 +1274,9 @@ class Orchestrator:
             )
         else:
             self.claimed.discard(issue.id)
+
+        # Best-effort log retention cleanup after worker completes
+        self._fire_and_forget(self._cleanup_logs())
 
     def _schedule_retry(
         self,
@@ -1471,3 +1520,100 @@ class Orchestrator:
                 ),
             },
         }
+
+
+# ---------------------------------------------------------------------------
+# Log retention helpers (module-level pure functions for testability)
+# ---------------------------------------------------------------------------
+
+
+def cleanup_old_logs(log_dir: Path, max_age_days: int) -> int:
+    """Delete log files older than max_age_days. Returns count of deleted files."""
+    import time
+
+    cutoff = time.time() - (max_age_days * 86400)
+    deleted = 0
+    for issue_dir in log_dir.iterdir():
+        if not issue_dir.is_dir():
+            continue
+        for log_file in issue_dir.iterdir():
+            if not log_file.is_file():
+                continue
+            try:
+                if log_file.stat().st_mtime < cutoff:
+                    log_file.unlink()
+                    deleted += 1
+            except OSError:
+                pass
+        # Remove empty issue directory
+        try:
+            if issue_dir.is_dir() and not any(issue_dir.iterdir()):
+                issue_dir.rmdir()
+        except OSError:
+            pass
+    if deleted:
+        logger.info(f"Log retention: deleted {deleted} old log files")
+    return deleted
+
+
+def enforce_size_limit(
+    log_dir: Path,
+    max_total_size_mb: int,
+    exempt_identifiers: set[str] | None = None,
+) -> int:
+    """Delete oldest log files when total size exceeds limit. Returns count deleted.
+
+    Files in directories matching exempt_identifiers are skipped (active agents).
+    """
+    exempt = exempt_identifiers or set()
+    max_bytes = max_total_size_mb * 1024 * 1024
+
+    # Collect all log files with their sizes and mtimes
+    files: list[tuple[Path, float, int]] = []  # (path, mtime, size)
+    total_size = 0
+    for issue_dir in log_dir.iterdir():
+        if not issue_dir.is_dir():
+            continue
+        for log_file in issue_dir.iterdir():
+            if not log_file.is_file():
+                continue
+            try:
+                stat = log_file.stat()
+                files.append((log_file, stat.st_mtime, stat.st_size))
+                total_size += stat.st_size
+            except OSError:
+                pass
+
+    if total_size <= max_bytes:
+        return 0
+
+    # Sort oldest first
+    files.sort(key=lambda x: x[1])
+
+    deleted = 0
+    for path, mtime, size in files:
+        if total_size <= max_bytes:
+            break
+        # Skip files for actively running agents
+        if path.parent.name in exempt:
+            continue
+        try:
+            path.unlink()
+            total_size -= size
+            deleted += 1
+        except OSError:
+            pass
+
+    # Clean up empty directories
+    for issue_dir in log_dir.iterdir():
+        if not issue_dir.is_dir():
+            continue
+        try:
+            if not any(issue_dir.iterdir()):
+                issue_dir.rmdir()
+        except OSError:
+            pass
+
+    if deleted:
+        logger.info(f"Log retention: deleted {deleted} files to enforce size limit")
+    return deleted
