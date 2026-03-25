@@ -66,6 +66,7 @@ class RunAttempt:
     status: str = "pending"
     session_id: str | None = None
     container_name: str | None = None
+    pid: int | None = None
     error: str | None = None
     input_tokens: int = 0
     output_tokens: int = 0

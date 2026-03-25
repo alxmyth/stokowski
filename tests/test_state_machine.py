@@ -232,3 +232,104 @@ class TestConfigParsing:
             "transitions": {"complete": "merge-review", "rework": "implement"},
         })
         assert state.max_rework == 3
+
+
+# ---------------------------------------------------------------------------
+# Guardrail text in prompts
+# ---------------------------------------------------------------------------
+
+
+class TestGuardrailPromptText:
+    def _make_issue(self, identifier="FOO-123"):
+        from stokowski.models import Issue
+        return Issue(id="test-id", identifier=identifier, title="Test issue")
+
+    def test_lifecycle_section_contains_scope_restriction(self):
+        state = StateConfig(
+            name="implement",
+            transitions={"complete": "review"},
+        )
+        section = build_lifecycle_section(
+            issue=self._make_issue("FOO-123"),
+            state_name="implement",
+            state_cfg=state,
+            linear_states=LinearStatesConfig(),
+        )
+        assert "Scope Restriction" in section
+        assert "FOO-123" in section
+        assert "Do not modify" in section
+
+    def test_lifecycle_guardrail_allows_reads(self):
+        state = StateConfig(
+            name="implement",
+            transitions={"complete": "review"},
+        )
+        section = build_lifecycle_section(
+            issue=self._make_issue(),
+            state_name="implement",
+            state_cfg=state,
+            linear_states=LinearStatesConfig(),
+        )
+        assert "may read" in section.lower()
+
+    def test_lifecycle_guardrail_present_on_every_turn(self):
+        """Scope restriction must appear regardless of run number or rework status."""
+        state = StateConfig(
+            name="implement",
+            transitions={"complete": "review"},
+        )
+        for run, is_rework in [(1, False), (3, True)]:
+            section = build_lifecycle_section(
+                issue=self._make_issue(),
+                state_name="implement",
+                state_cfg=state,
+                linear_states=LinearStatesConfig(),
+                run=run,
+                is_rework=is_rework,
+            )
+            assert "Scope Restriction" in section
+
+    def test_system_prompt_guardrail_interpolation(self):
+        from pathlib import Path
+        from stokowski.config import ClaudeConfig
+        from stokowski.runner import build_claude_args
+
+        cfg = ClaudeConfig(command="claude")
+        args = build_claude_args(
+            cfg, "test prompt", Path("/tmp"),
+            session_id=None, issue_identifier="BAR-456",
+        )
+        # Find the --append-system-prompt value
+        idx = args.index("--append-system-prompt")
+        system_prompt = args[idx + 1]
+        assert "BAR-456" in system_prompt
+        assert "Do NOT" in system_prompt
+        assert "modify" in system_prompt
+
+    def test_system_prompt_no_guardrail_without_identifier(self):
+        from pathlib import Path
+        from stokowski.config import ClaudeConfig
+        from stokowski.runner import build_claude_args
+
+        cfg = ClaudeConfig(command="claude")
+        args = build_claude_args(
+            cfg, "test prompt", Path("/tmp"),
+            session_id=None, issue_identifier=None,
+        )
+        idx = args.index("--append-system-prompt")
+        system_prompt = args[idx + 1]
+        # Guardrail should NOT be present without identifier
+        assert "Do NOT use Linear" not in system_prompt
+
+    def test_system_prompt_not_on_continuation(self):
+        from pathlib import Path
+        from stokowski.config import ClaudeConfig
+        from stokowski.runner import build_claude_args
+
+        cfg = ClaudeConfig(command="claude")
+        args = build_claude_args(
+            cfg, "test prompt", Path("/tmp"),
+            session_id="existing-session", issue_identifier="FOO-123",
+        )
+        # No --append-system-prompt on continuation turns
+        assert "--append-system-prompt" not in args

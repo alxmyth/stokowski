@@ -28,6 +28,7 @@ from .config import (
 from .docker_runner import (
     check_docker_available,
     cleanup_orphaned_containers,
+    kill_container,
     pull_image,
 )
 from .linear import LinearClient
@@ -128,6 +129,10 @@ class Orchestrator:
         # try_claim has exactly one matching release, even when the
         # worker is cancelled mid-flight from multiple paths.
         self._slot_held: set[str] = set()
+
+        # Cancellation tracking
+        self._force_cancelled: set[str] = set()  # issue_ids cancelled by reconciliation
+        self._background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
 
     @property
     def cfg(self) -> ServiceConfig:
@@ -305,6 +310,98 @@ class Orchestrator:
                 api_key=self.cfg.resolved_api_key(),
             )
         return self._linear
+
+    # -- Kill / cleanup helpers --
+
+    @staticmethod
+    def _kill_pid(pid: int) -> None:
+        """Kill a process by PID. Send SIGKILL to process group, fall back to individual kill.
+
+        os.killpg(SIGKILL) is atomic for the process group. Claude Code runs
+        with start_new_session=True (its own pgrp), so this kills the agent
+        and any direct children.
+        """
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+    async def _kill_worker(self, issue_id: str, reason: str) -> None:
+        """Kill a running worker: subprocess, container, then async task.
+
+        Order matters: the subprocess must be killed BEFORE the task is
+        cancelled, because CancelledError does not propagate to child processes.
+        Handles missing RunAttempt gracefully (e.g., for gated issues).
+        """
+        attempt = self.running.get(issue_id)
+
+        # 1. Kill subprocess PID (must happen first)
+        if attempt and attempt.pid:
+            self._kill_pid(attempt.pid)
+            self._child_pids.discard(attempt.pid)
+
+        # 2. Kill Docker container
+        if attempt and attempt.container_name:
+            try:
+                await kill_container(attempt.container_name)
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to kill container {attempt.container_name}: {exc}"
+                )
+
+        # 3. Cancel async task last
+        task = self._tasks.get(issue_id)
+        if task and not task.done():
+            task.cancel()
+
+        logger.info(f"Killed worker issue={issue_id} reason={reason}")
+
+    def _cleanup_issue_state(self, issue_id: str) -> None:
+        """Remove all per-issue tracking state. Idempotent — safe to call multiple times.
+
+        Any new per-issue state dict added to Orchestrator.__init__ must also
+        be added here.
+        """
+        # -- Core state machine --
+        self._issue_current_state.pop(issue_id, None)
+        self._issue_state_runs.pop(issue_id, None)
+        self._pending_gates.pop(issue_id, None)
+        # -- Session/timing --
+        self._last_session_ids.pop(issue_id, None)
+        self._last_completed_at.pop(issue_id, None)
+        # -- Issue cache --
+        self._last_issues.pop(issue_id, None)
+        # -- Retry --
+        timer = self._retry_timers.pop(issue_id, None)
+        if timer is not None:
+            timer.cancel()
+        self.retry_attempts.pop(issue_id, None)
+        # -- Dispatch --
+        self.running.pop(issue_id, None)
+        self._tasks.pop(issue_id, None)
+        self.claimed.discard(issue_id)
+
+    def _fire_and_forget(self, coro) -> None:
+        """Schedule a coroutine without awaiting it. Prevents GC of the task."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _post_cancellation_comment(
+        self, issue_id: str, state_name: str
+    ) -> None:
+        """Post a best-effort tracking comment when an issue is cancelled."""
+        try:
+            client = self._ensure_linear_client()
+            await client.post_comment(
+                issue_id,
+                f"[Stokowski] Agent terminated — issue moved to {state_name}.",
+            )
+        except Exception as e:
+            logger.debug(f"Failed to post cancellation comment for {issue_id}: {e}")
 
     async def start(self):
         """Start the orchestration loop."""
@@ -1317,6 +1414,7 @@ class Orchestrator:
             agent_env["STOKOWSKI_ISSUE"] = issue.identifier
             if state_name:
                 agent_env["STOKOWSKI_STATE"] = state_name
+            agent_env["STOKOWSKI_ISSUE_IDENTIFIER"] = issue.identifier
 
             # State machine mode: single turn per dispatch. The state
             # machine handles continuation via _transition after each
@@ -1732,7 +1830,19 @@ class Orchestrator:
                 logger.info(f"[{identifier}] result: {result_text[:160]}", extra=extra)
 
     def _on_worker_exit(self, issue: Issue, attempt: RunAttempt):
-        """Handle worker completion."""
+        """Handle worker completion.
+
+        _reconcile() owns cleanup for externally-cancelled workers (via
+        _kill_worker + _cleanup_issue_state). This method owns cleanup for
+        naturally-completed workers. The _force_cancelled guard prevents
+        double-processing (token aggregation is not idempotent).
+        """
+        # If reconciliation already killed and cleaned up this worker, skip
+        # all post-exit logic — no transitions, retries, or token aggregation.
+        if issue.id in self._force_cancelled:
+            self._force_cancelled.discard(issue.id)
+            return
+
         self.total_input_tokens += attempt.input_tokens
         self.total_output_tokens += attempt.output_tokens
         self.total_cache_creation_tokens += attempt.cache_creation_tokens
@@ -1773,6 +1883,15 @@ class Orchestrator:
                         f"No transition directive, defaulting to complete "
                         f"for {issue.identifier}"
                     )
+
+                # Agent self-cancellation via reserved "cancel" transition
+                if transition_name == "cancel":
+                    logger.info(
+                        f"Agent self-cancelled {issue.identifier}: "
+                        f"{attempt.last_message[:200]}"
+                    )
+                    self._cleanup_issue_state(issue.id)
+                    return
 
                 # Safety cap: enforce max_rework for agent-initiated rework
                 if transition_name != "complete":
@@ -1897,15 +2016,14 @@ class Orchestrator:
         self._dispatch(issue, attempt_num=entry.attempt)
 
     async def _reconcile(self):
-        """Reconcile running issues against current Linear state."""
-        if not self.running:
+        """Reconcile running and gated issues against current Linear state."""
+        ids_to_check = set(self.running) | set(self._pending_gates)
+        if not ids_to_check:
             return
-
-        running_ids = list(self.running.keys())
 
         try:
             client = self._ensure_linear_client()
-            states = await client.fetch_issue_states_by_ids(running_ids)
+            states = await client.fetch_issue_states_by_ids(list(ids_to_check))
         except Exception as e:
             logger.warning(f"Reconciliation state fetch failed: {e}")
             return
@@ -1918,35 +2036,62 @@ class Orchestrator:
         ]
         review_lower = self.cfg.linear_states.review.strip().lower()
 
-        for issue_id in running_ids:
+        for issue_id in list(ids_to_check):
             current_state = states.get(issue_id)
+
             if current_state is None:
+                # Issue not found in Linear — may be deleted/archived.
+                # Clean up gated issues that have no running worker.
+                if issue_id in self._pending_gates and issue_id not in self.running:
+                    logger.info(
+                        f"Reconciliation: gated issue {issue_id} not found in Linear, cleaning up"
+                    )
+                    # Try to remove workspace using cached identifier
+                    cached = self._last_issues.get(issue_id)
+                    if cached:
+                        ws_root = self.cfg.workspace.resolved_root()
+                        await remove_workspace(
+                            ws_root, cached.identifier, self.cfg.hooks,
+                            docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
+                        )
+                    self._cleanup_issue_state(issue_id)
                 continue
 
             state_lower = current_state.strip().lower()
 
             if state_lower in terminal_lower:
-                # Terminal - stop worker and clean workspace
+                # Terminal - kill worker, clean workspace, clean all state
                 _ident = self.running[issue_id].issue_identifier if issue_id in self.running else issue_id
                 logger.info(
                     f"Reconciliation: {_ident} is terminal ({current_state}), stopping",
                     extra={"linked_to": _ident},
                 )
-                task = self._tasks.get(issue_id)
-                if task:
-                    task.cancel()
+                self._force_cancelled.add(issue_id)
 
-                attempt = self.running.get(issue_id)
-                if attempt:
-                    ws_root = self.cfg.workspace.resolved_root()
-                    await remove_workspace(
-                        ws_root, attempt.issue_identifier, self.cfg.hooks,
-                        docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
-                    )
+                if issue_id in self.running:
+                    await self._kill_worker(issue_id, reason=f"terminal state {current_state}")
 
-                self.running.pop(issue_id, None)
-                self._tasks.pop(issue_id, None)
-                self.claimed.discard(issue_id)
+                    attempt = self.running.get(issue_id)
+                    if attempt:
+                        ws_root = self.cfg.workspace.resolved_root()
+                        await remove_workspace(
+                            ws_root, attempt.issue_identifier, self.cfg.hooks,
+                            docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
+                        )
+                else:
+                    # Gated issue — no process to kill, just clean up state
+                    cached = self._last_issues.get(issue_id)
+                    if cached:
+                        ws_root = self.cfg.workspace.resolved_root()
+                        await remove_workspace(
+                            ws_root, cached.identifier, self.cfg.hooks,
+                            docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
+                        )
+
+                self._cleanup_issue_state(issue_id)
+                self._fire_and_forget(
+                    self._post_cancellation_comment(issue_id, current_state)
+                )
                 self._release_slot(issue_id)
                 # Clean up state caches so stale entries don't accumulate
                 self._issue_current_state.pop(issue_id, None)
@@ -1956,28 +2101,23 @@ class Orchestrator:
                 self._last_session_ids.pop(issue_id, None)
 
             elif state_lower == review_lower:
-                # In review/gate state — stop worker but keep gate tracking
-                task = self._tasks.get(issue_id)
-                if task:
-                    task.cancel()
-                self.running.pop(issue_id, None)
-                self._tasks.pop(issue_id, None)
+                # In review/gate state — kill worker subprocess but keep gate tracking
+                if issue_id in self.running:
+                    self._force_cancelled.add(issue_id)
+                    await self._kill_worker(issue_id, reason=f"review state {current_state}")
+                    self.running.pop(issue_id, None)
+                    self._tasks.pop(issue_id, None)
                 self._release_slot(issue_id)
 
             elif state_lower not in active_lower:
-                # Neither active nor terminal nor review - stop without cleanup
-                _ident = self.running[issue_id].issue_identifier if issue_id in self.running else issue_id
-                logger.info(
-                    f"Reconciliation: {_ident} not active ({current_state}), stopping",
-                    extra={"linked_to": _ident},
-                )
-                task = self._tasks.get(issue_id)
-                if task:
-                    task.cancel()
-                self.running.pop(issue_id, None)
-                self._tasks.pop(issue_id, None)
-                self.claimed.discard(issue_id)
-                self._release_slot(issue_id)
+                # Neither active nor terminal nor review - kill and clean up
+                if issue_id in self.running:
+                    logger.info(
+                        f"Reconciliation: {issue_id} not active ({current_state}), stopping"
+                    )
+                    self._force_cancelled.add(issue_id)
+                    await self._kill_worker(issue_id, reason=f"non-active state {current_state}")
+                    self._cleanup_issue_state(issue_id)
 
     def get_state_snapshot(self) -> dict[str, Any]:
         """Get current runtime state for observability."""
