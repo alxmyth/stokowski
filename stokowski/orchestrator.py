@@ -369,6 +369,37 @@ class Orchestrator:
             return next(iter(self.cfg.workflows.values()))
         raise RuntimeError("No workflows defined in config")
 
+    def _resolve_gate_workflow(
+        self, issue: Issue, tracking: dict | None
+    ) -> WorkflowConfig:
+        """Resolve workflow for a gated issue, handling cold-start recovery.
+
+        Resolution order:
+        1. Cached in ``_issue_workflow`` → use cached workflow
+        2. Not cached (cold start after restart):
+           a. If ``tracking`` has a ``workflow`` field and it exists in config
+              → cache it and use it
+           b. Otherwise → resolve from issue labels via ``_resolve_workflow()``
+
+        This must be called before looking up transitions in gate handling,
+        so that ``_issue_workflow`` is populated for downstream use.
+        """
+        # 1. Already cached — use it
+        if issue.id in self._issue_workflow:
+            return self._get_issue_workflow_config(issue.id)
+
+        # 2. Cold start — try tracking comment's workflow field
+        if tracking is not None:
+            tracked_wf_name = tracking.get("workflow")
+            if tracked_wf_name is not None:
+                wf = self.cfg.get_workflow(tracked_wf_name)
+                if wf is not None:
+                    self._issue_workflow[issue.id] = wf.name
+                    return wf
+
+        # 3. Resolve from issue labels (default fallback)
+        return self._resolve_workflow(issue)
+
     async def _resolve_current_state(self, issue: Issue) -> tuple[str, int]:
         """Resolve current state machine state for an issue.
         Returns (state_name, run).
@@ -510,6 +541,7 @@ class Orchestrator:
     async def _enter_gate(self, issue: Issue, state_name: str):
         """Move issue to gate state and post tracking comment."""
         state_cfg = self.cfg.states.get(state_name)
+        workflow = self._get_issue_workflow_config(issue.id)
 
         # Check for skip labels — auto-approve if any match
         if state_cfg and state_cfg.skip_labels:
@@ -517,13 +549,18 @@ class Orchestrator:
             skip_labels_lower = [s.lower() for s in state_cfg.skip_labels]
             should_skip = any(sl in issue_labels_lower for sl in skip_labels_lower)
 
-            if should_skip and "approve" in (state_cfg.transitions or {}):
-                target = state_cfg.transitions["approve"]
+            # Resolve approve target from workflow transitions
+            state_transitions = workflow.transitions.get(state_name, {})
+            approve_target = state_transitions.get("approve")
+
+            if should_skip and approve_target:
+                target = approve_target
                 run = self._issue_state_runs.get(issue.id, 1)
 
                 client = self._ensure_linear_client()
                 comment = make_gate_comment(
                     state=state_name, status="approved", run=run,
+                    workflow=workflow.name,
                 )
                 await client.post_comment(issue.id, comment)
 
@@ -535,7 +572,9 @@ class Orchestrator:
                 self._pending_gates.pop(issue.id, None)
 
                 # Post state-entry comment for audit trail
-                state_comment = make_state_comment(state=target, run=1)
+                state_comment = make_state_comment(
+                    state=target, run=1, workflow=workflow.name,
+                )
                 await client.post_comment(issue.id, state_comment)
 
                 logger.info(
@@ -555,6 +594,7 @@ class Orchestrator:
             status="waiting",
             prompt=prompt or "",
             run=run,
+            workflow=workflow.name,
         )
         await client.post_comment(issue.id, comment)
 
@@ -731,24 +771,35 @@ class Orchestrator:
                 continue
 
             gate_state = self._pending_gates.pop(issue.id, None)
+            tracking = None
             if not gate_state:
+                # Cold-start fallback: fetch comments to find gate state
                 comments = await client.fetch_comments(issue.id)
                 tracking = parse_latest_tracking(comments)
                 if tracking and tracking.get("type") == "gate" and tracking.get("status") == "waiting":
                     gate_state = tracking.get("state", "")
 
             if gate_state:
+                # Resolve workflow (cold-start recovery if needed)
+                workflow = self._resolve_gate_workflow(issue, tracking)
+
                 run = self._issue_state_runs.get(issue.id, 1)
                 comment = make_gate_comment(
                     state=gate_state, status="approved", run=run,
+                    workflow=workflow.name,
                 )
                 await client.post_comment(issue.id, comment)
 
-                # Follow approve transition
+                # Follow approve transition from workflow
                 self._issue_current_state[issue.id] = gate_state
-                gate_cfg = self.cfg.states.get(gate_state)
-                if gate_cfg and "approve" in gate_cfg.transitions:
-                    target = gate_cfg.transitions["approve"]
+                wf_transitions = workflow.transitions.get(gate_state, {})
+                target = wf_transitions.get("approve")
+                if not target:
+                    # Fallback to StateConfig transitions for backward compat
+                    gate_cfg = self.cfg.states.get(gate_state)
+                    if gate_cfg and "approve" in gate_cfg.transitions:
+                        target = gate_cfg.transitions["approve"]
+                if target:
                     self._issue_current_state[issue.id] = target
 
                 active_state = self.cfg.linear_states.active
@@ -775,15 +826,25 @@ class Orchestrator:
                 continue
 
             gate_state = self._pending_gates.pop(issue.id, None)
+            tracking = None
             if not gate_state:
+                # Cold-start fallback: fetch comments to find gate state
                 comments = await client.fetch_comments(issue.id)
                 tracking = parse_latest_tracking(comments)
                 if tracking and tracking.get("type") == "gate" and tracking.get("status") == "waiting":
                     gate_state = tracking.get("state", "")
 
             if gate_state:
+                # Resolve workflow (cold-start recovery if needed)
+                workflow = self._resolve_gate_workflow(issue, tracking)
+
                 gate_cfg = self.cfg.states.get(gate_state)
-                rework_to = gate_cfg.rework_to if gate_cfg else ""
+
+                # Resolve rework_to from workflow transitions, then StateConfig fallback
+                wf_transitions = workflow.transitions.get(gate_state, {})
+                rework_to = wf_transitions.get("rework_to", "")
+                if not rework_to:
+                    rework_to = gate_cfg.rework_to if gate_cfg else ""
                 if not rework_to:
                     logger.warning(f"Gate {gate_state} has no rework_to target, skipping")
                     continue
@@ -795,6 +856,7 @@ class Orchestrator:
                     # Exceeded max rework — post escalated comment, don't transition
                     comment = make_gate_comment(
                         state=gate_state, status="escalated", run=run,
+                        workflow=workflow.name,
                     )
                     await client.post_comment(issue.id, comment)
                     logger.warning(
@@ -809,8 +871,16 @@ class Orchestrator:
                 comment = make_gate_comment(
                     state=gate_state, status="rework",
                     rework_to=rework_to, run=new_run,
+                    workflow=workflow.name,
                 )
                 await client.post_comment(issue.id, comment)
+
+                # Post state-entry comment for rework target
+                state_comment = make_state_comment(
+                    state=rework_to, run=new_run,
+                    workflow=workflow.name,
+                )
+                await client.post_comment(issue.id, state_comment)
 
                 self._issue_current_state[issue.id] = rework_to
 
