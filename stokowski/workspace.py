@@ -185,8 +185,9 @@ async def remove_workspace(
         # before_remove runs locally (R20)
         if hooks.before_remove:
             await run_hook(hooks.before_remove, ws_path, hooks.timeout_ms, "before_remove", force_local=True)
-        logger.info(f"Removing workspace volume issue={issue_identifier} key={key}")
-        await remove_workspace_volume(docker_cfg, key)
+        removed = await remove_workspace_volume(docker_cfg, key)
+        if removed:
+            logger.info(f"Removing workspace volume issue={issue_identifier} key={key}")
         # Also clean up the local tracking directory if it exists
         if ws_path.exists():
             shutil.rmtree(ws_path, ignore_errors=True)

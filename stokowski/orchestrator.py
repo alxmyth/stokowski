@@ -34,7 +34,7 @@ from .models import Issue, RetryEntry, RunAttempt
 from .prompt import assemble_prompt, build_lifecycle_section
 from .runner import run_agent_turn, run_turn
 from .tracking import make_gate_comment, make_state_comment, parse_latest_tracking
-from .workspace import ensure_workspace, remove_workspace
+from .workspace import ensure_workspace, remove_workspace, sanitize_key
 
 logger = logging.getLogger("stokowski")
 
@@ -296,8 +296,6 @@ class Orchestrator:
                     ws_root, issue.identifier, self.cfg.hooks,
                     docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
                 )
-            if terminal:
-                logger.info(f"Cleaned {len(terminal)} terminal workspaces")
         except Exception as e:
             logger.warning(f"Startup cleanup failed (continuing): {e}")
 
