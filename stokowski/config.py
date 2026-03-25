@@ -8,7 +8,10 @@ import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from stokowski.models import Issue
 
 import yaml
 
@@ -252,6 +255,7 @@ class ProjectConfig:
     workflow_dir: Path = field(default_factory=lambda: Path("."))
     # Per-project cap (overrides AgentConfig.max_concurrent_per_project[name]).
     max_concurrent: int | None = None
+    workflows: dict[str, WorkflowConfig] = field(default_factory=dict)
 
     def resolved_api_key(self) -> str:
         key = self.tracker.api_key
@@ -301,10 +305,42 @@ class ProjectConfig:
 
     @property
     def entry_state(self) -> str | None:
+        """Return the first agent state.
+
+        If workflows are defined, delegates to the default workflow's
+        entry_state. Otherwise falls back to scanning the states dict.
+        """
+        if self.workflows:
+            for wf in self.workflows.values():
+                if wf.default:
+                    return wf.entry_state or None
+            # No default workflow — fall through to legacy scan
         for name, sc in self.states.items():
             if sc.type == "agent":
                 return name
         return None
+
+    def resolve_workflow(self, issue: Issue) -> WorkflowConfig:
+        """Resolve which workflow applies to an issue based on its labels.
+
+        Iterates workflows and checks if the workflow's label matches any
+        of the issue's labels (case-insensitive). First match wins.
+        Falls back to the workflow marked ``default=True``.
+        Raises ValueError if no default workflow is configured.
+        """
+        issue_labels_lower = [l.lower() for l in issue.labels]
+        for wf in self.workflows.values():
+            if wf.label is not None and wf.label.lower() in issue_labels_lower:
+                return wf
+        # No label match — return default
+        for wf in self.workflows.values():
+            if wf.default:
+                return wf
+        raise ValueError("No default workflow configured")
+
+    def get_workflow(self, name: str) -> WorkflowConfig | None:
+        """Look up a workflow by name. Returns None if not found."""
+        return self.workflows.get(name)
 
     def all_states(self) -> dict[str, StateConfig]:
         """Every state across every workflow.
@@ -903,6 +939,55 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
 
     # Populate top-level fields from projects[0] for backward compat.
     p0 = projects[0]
+    # Parse workflows
+    workflows_raw = config_raw.get("workflows", {}) or {}
+    workflows: dict[str, WorkflowConfig] = {}
+
+    if workflows_raw:
+        # Multi-workflow mode: parse each workflow entry
+        for wf_name, wf_data in workflows_raw.items():
+            wd = wf_data or {}
+            label = wd.get("label")
+            default = bool(wd.get("default", False))
+            path = _coerce_list(wd.get("path"))
+            terminal_state = str(wd.get("terminal_state", "terminal"))
+            transitions = derive_workflow_transitions(path, states)
+            # Find entry_state: first agent state in path
+            entry = ""
+            for name in path:
+                sc = states.get(name)
+                if sc and sc.type == "agent":
+                    entry = name
+                    break
+            workflows[wf_name] = WorkflowConfig(
+                name=wf_name,
+                label=label,
+                default=default,
+                path=path,
+                terminal_state=terminal_state,
+                transitions=transitions,
+                entry_state=entry,
+            )
+    else:
+        # Legacy/backward compat: synthesize a single _default workflow
+        # using StateConfig.transitions verbatim (do NOT call derive_workflow_transitions)
+        path = list(states.keys())
+        transitions = {name: dict(sc.transitions) for name, sc in states.items()}
+        entry = ""
+        for name, sc in states.items():
+            if sc.type == "agent":
+                entry = name
+                break
+        workflows["_default"] = WorkflowConfig(
+            name="_default",
+            label=None,
+            default=True,
+            path=path,
+            terminal_state="terminal",
+            transitions=transitions,
+            entry_state=entry,
+        )
+
     cfg = ServiceConfig(
         tracker=p0.tracker,
         polling=polling,
@@ -913,6 +998,7 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
         server=server,
         logging=logging_cfg,
         docker=docker,
+        workflows=workflows,
         linear_states=p0.linear_states,
         prompts=p0.prompts,
         states=p0.states,
