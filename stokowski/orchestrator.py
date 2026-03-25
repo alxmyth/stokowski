@@ -18,7 +18,7 @@ from .config import (
     HooksConfig,
     ServiceConfig,
     StateConfig,
-    WorkflowDefinition,
+    ParsedConfig,
     merge_state_config,
     parse_workflow_file,
     validate_config,
@@ -42,7 +42,7 @@ logger = logging.getLogger("stokowski")
 class Orchestrator:
     def __init__(self, workflow_path: str | Path):
         self.workflow_path = Path(workflow_path)
-        self.workflow: WorkflowDefinition | None = None
+        self.workflow: ParsedConfig | None = None
 
         # Runtime state
         self.running: dict[str, RunAttempt] = {}  # issue_id -> RunAttempt

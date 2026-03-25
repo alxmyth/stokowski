@@ -143,7 +143,71 @@ class StateConfig:
 
 
 @dataclass
-class WorkflowDefinition:
+class WorkflowConfig:
+    """A single named workflow — an ordered path through shared stages."""
+    name: str = ""
+    label: str | None = None          # Linear label for workflow selection; None = triage/default
+    default: bool = False
+    path: list[str] = field(default_factory=list)
+    terminal_state: str = "terminal"  # key into LinearStatesConfig
+    transitions: dict[str, dict[str, str]] = field(default_factory=dict)
+    entry_state: str = ""             # first agent state in path (derived)
+
+
+def derive_workflow_transitions(
+    path: list[str], states: dict[str, StateConfig]
+) -> dict[str, dict[str, str]]:
+    """Derive per-state transitions from an ordered workflow path.
+
+    For each adjacent pair (current, next) in the path:
+    - Agent states get ``{current: {"complete": next}}``
+    - Gate states get ``{current: {"approve": next, "rework_to": ...}}``
+      where ``rework_to`` is the gate's explicit ``StateConfig.rework_to``
+      or the nearest prior agent state in the path.
+    - Terminal states get ``{current: {}}`` (empty transitions).
+
+    Returns the full transitions dict keyed by state name.
+    """
+    transitions: dict[str, dict[str, str]] = {}
+    for i, current in enumerate(path):
+        sc = states.get(current)
+        if sc is None:
+            continue  # unknown state — validation will catch this later
+
+        if sc.type == "terminal":
+            transitions[current] = {}
+            continue
+
+        has_next = i + 1 < len(path)
+        next_state = path[i + 1] if has_next else None
+
+        if sc.type == "agent":
+            if next_state is not None:
+                transitions[current] = {"complete": next_state}
+            else:
+                transitions[current] = {}
+
+        elif sc.type == "gate":
+            gate_transitions: dict[str, str] = {}
+            if next_state is not None:
+                gate_transitions["approve"] = next_state
+            # Resolve rework_to: explicit on StateConfig wins, else scan backward
+            if sc.rework_to:
+                gate_transitions["rework_to"] = sc.rework_to
+            else:
+                # Scan backward for nearest prior agent state
+                for j in range(i - 1, -1, -1):
+                    prev_sc = states.get(path[j])
+                    if prev_sc and prev_sc.type == "agent":
+                        gate_transitions["rework_to"] = path[j]
+                        break
+            transitions[current] = gate_transitions
+
+    return transitions
+
+
+@dataclass
+class ParsedConfig:
     config: ServiceConfig
     prompt_template: str
 
@@ -346,7 +410,7 @@ def merge_state_config(
     return claude, hooks
 
 
-def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
+def parse_workflow_file(path: str | Path) -> ParsedConfig:
     """Parse a workflow file (.yaml/.yml or .md with front matter) into config."""
     path = Path(path)
     if not path.exists():
@@ -489,7 +553,7 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
         states=states,
     )
 
-    return WorkflowDefinition(config=cfg, prompt_template=prompt_template)
+    return ParsedConfig(config=cfg, prompt_template=prompt_template)
 
 
 def validate_config(cfg: ServiceConfig) -> list[str]:
