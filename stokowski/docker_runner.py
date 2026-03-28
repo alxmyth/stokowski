@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import tempfile
 
 from .config import DockerConfig
 from .workspace import sanitize_key
@@ -22,7 +23,92 @@ def resolve_host_path(path: str) -> str:
     inside a container where host paths don't exist on the local
     filesystem.  The Docker daemon resolves the path on the host.
     """
-    return os.path.expandvars(os.path.expanduser(path))
+    expanded = os.path.expandvars(os.path.expanduser(path))
+    # Warn if variable expansion left unexpanded references
+    if "$" in expanded or "${" in expanded:
+        logger.warning(
+            "host path %r still contains unexpanded variables after expansion: %r "
+            "(is the env var set?)",
+            path,
+            expanded,
+        )
+    return expanded
+
+
+_plugin_file_cache: dict[tuple[str, str, str], tuple[str, float]] = {}
+"""Cache of (host_dir, container_home, relative_path) → (temp_file_path, mtime).
+Avoids creating a new temp file per container launch. Invalidated when source mtime changes."""
+
+# Plugin config files that need host→container path rewriting.
+# Claude Code discovers plugins primarily through known_marketplaces.json
+# (installLocation fields), with installed_plugins.json as secondary metadata.
+_PLUGIN_FILES_TO_REWRITE = (
+    os.path.join("plugins", "installed_plugins.json"),
+    os.path.join("plugins", "known_marketplaces.json"),
+)
+
+
+def _prepare_plugin_file(
+    host_claude_dir: str, container_home: str, relative_path: str
+) -> str | None:
+    """Create a temp copy of a plugin config file with paths rewritten for the container.
+
+    Reads the host file at ``{host_claude_dir}/{relative_path}``, replaces all
+    occurrences of ``host_claude_dir`` with the container equivalent, writes a
+    ``0644`` temp file, and returns its path for bind-mounting into the container.
+
+    Returns ``None`` if the source file doesn't exist or isn't readable (e.g. in
+    DooD mode where host paths aren't accessible from the orchestrator container).
+    Results are cached per ``(host_claude_dir, container_home, relative_path)``
+    and invalidated when the source file's mtime changes.
+    """
+    host_file = os.path.join(host_claude_dir, relative_path)
+    if not os.path.isfile(host_file):
+        return None
+
+    cache_key = (host_claude_dir, container_home, relative_path)
+    try:
+        current_mtime = os.path.getmtime(host_file)
+    except OSError:
+        current_mtime = 0.0
+
+    # Return cached temp file if source hasn't changed
+    cached = _plugin_file_cache.get(cache_key)
+    if cached:
+        cached_path, cached_mtime = cached
+        if current_mtime == cached_mtime and os.path.isfile(cached_path):
+            return cached_path
+
+    try:
+        with open(host_file, "r") as f:
+            content = f.read()
+    except PermissionError:
+        logger.warning("Cannot read %s — skipping path rewrite for container", host_file)
+        return None
+
+    # Rewrite host paths to container paths
+    container_claude_dir = f"{container_home}/.claude"
+    rewritten = content.replace(host_claude_dir, container_claude_dir)
+
+    # Write to a temp file that persists until the source changes or process exits
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", prefix="stokowski-plugin-", suffix=".json", delete=False
+    )
+    tmp.write(rewritten)
+    tmp.close()
+    os.chmod(tmp.name, 0o644)  # Ensure container agent user can read it
+
+    # Clean up previous temp file if any
+    if cached:
+        old_path = cached[0]
+        if old_path != tmp.name:
+            try:
+                os.unlink(old_path)
+            except OSError:
+                pass
+
+    _plugin_file_cache[cache_key] = (tmp.name, current_mtime)
+    return tmp.name
 
 
 def workspace_volume_name(docker_cfg: DockerConfig, workspace_key: str) -> str:
@@ -125,6 +211,7 @@ def build_docker_run_args(
     args.extend(["-v", f"{vol}:/workspace", "-w", "/workspace"])
 
     # Claude config — either inherit from host or use sessions volume
+    plugins_prepared = False
     if docker_cfg.inherit_claude_config:
         # Read-write mount: agents can write session data for --resume support.
         # This means agents can also modify host Claude config — accepted tradeoff
@@ -138,6 +225,21 @@ def build_docker_run_args(
         args.extend(["-v", f"{host_json}:{home}/.claude.json"])
         # Pass host claude dir so entrypoint can rewrite plugin paths
         args.extend(["-e", f"STOKOWSKI_HOST_CLAUDE_DIR={host_dir}"])
+        # Prepare rewritten, readable copies of plugin config files.
+        # These files are often mode 0600 (owner-only) which the container's
+        # non-root agent user cannot read, and they contain host-absolute paths
+        # that don't resolve inside the container. _prepare_plugin_file() reads
+        # each file host-side, rewrites paths, writes a 0644 temp copy, and we
+        # bind-mount it read-only over the original.
+        # In DooD mode (orchestrator in a container), host paths aren't
+        # accessible — _prepare_plugin_file returns None and we fall back to
+        # an in-container fixup below.
+        for rel_path in _PLUGIN_FILES_TO_REWRITE:
+            tmp = _prepare_plugin_file(host_dir, home, rel_path)
+            if tmp:
+                target = f"{home}/.claude/{rel_path}"
+                args.extend(["-v", f"{tmp}:{target}:ro"])
+                plugins_prepared = True
     else:
         args.extend(["-v", f"{docker_cfg.sessions_volume}:/home/agent/.claude"])
 
@@ -157,15 +259,28 @@ def build_docker_run_args(
     # Image
     args.append(image)
 
-    # Wrap command: rewrite plugin paths then exec the original command.
-    # installed_plugins.json stores absolute host paths (e.g. /Users/foo/.claude/...)
-    # which don't exist inside the container. Rewrite them to /home/agent/.claude/...
-    if docker_cfg.inherit_claude_config:
+    # Plugin path rewriting: prefer host-side (temp files mounted over originals).
+    # In DooD mode the orchestrator can't read host files, so fall back to an
+    # in-container fixup that COPIES each file to /tmp before rewriting — never
+    # destructively modifying the host's originals via the bind mount.
+    if docker_cfg.inherit_claude_config and not plugins_prepared:
         escaped_cmd = " ".join(_shell_escape(c) for c in command)
+        # For each plugin config file: copy to /tmp, rewrite host paths to
+        # container paths, copy back. On Docker Desktop for Mac/Windows,
+        # bind-mounted files appear as owned by the container user so cp works.
+        # Also fix marketplaces/ directory permissions for Linux Docker where
+        # UID mapping doesn't apply and 0700 blocks the agent user.
         fixup_script = (
-            'PLUGINS="$HOME/.claude/plugins/installed_plugins.json"; '
-            'if [ -n "$STOKOWSKI_HOST_CLAUDE_DIR" ] && [ -f "$PLUGINS" ]; then '
-            'sed -i "s|$STOKOWSKI_HOST_CLAUDE_DIR|$HOME/.claude|g" "$PLUGINS" 2>/dev/null; '
+            '_rewrite() { '
+            'SRC="$HOME/.claude/$1"; TMP="/tmp/stokowski-$(basename $1)"; '
+            'if [ -f "$SRC" ]; then '
+            'cp "$SRC" "$TMP" 2>/dev/null && '
+            'sed -i "s|$STOKOWSKI_HOST_CLAUDE_DIR|$HOME/.claude|g" "$TMP" && '
+            'cp "$TMP" "$SRC" 2>/dev/null; fi; }; '
+            'if [ -n "$STOKOWSKI_HOST_CLAUDE_DIR" ]; then '
+            '_rewrite plugins/installed_plugins.json; '
+            '_rewrite plugins/known_marketplaces.json; '
+            'chmod a+rx "$HOME/.claude/plugins/marketplaces" 2>/dev/null; '
             "fi; "
             f"exec {escaped_cmd}"
         )
@@ -180,11 +295,9 @@ def _shell_escape(s: str) -> str:
     """Escape a string for safe inclusion in a shell command."""
     if not s:
         return "''"
-    # If the string is safe as-is (no special chars), return it unquoted
     import re as _re
     if _re.match(r"^[A-Za-z0-9_./:=@-]+$", s):
         return s
-    # Otherwise, single-quote it (escaping any embedded single quotes)
     return "'" + s.replace("'", "'\\''") + "'"
 
 
