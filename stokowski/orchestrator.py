@@ -109,6 +109,17 @@ def _render_hooks_best_effort(
         return hooks
 
 
+def _select_evaluator_transition(tier: str, auto_approve: bool) -> str:
+    """Choose transition name based on evaluation tier and gate config.
+
+    Returns "approve" only when tier is "approve" AND auto_approve is True.
+    All other cases return "complete" (enters the gate for human review).
+    """
+    if tier == "approve" and auto_approve:
+        return "approve"
+    return "complete"
+
+
 class Orchestrator:
     def __init__(self, workflow_paths):
         """
@@ -1237,6 +1248,9 @@ class Orchestrator:
             await self._enter_gate(issue, target_name)
 
         else:
+            # Agent or evaluator state — post state comment, ensure active
+            # Linear state, schedule retry. Evaluator states dispatch through
+            # this same path since they behave like agents at the dispatch level.
             self._issue_current_state[issue.id] = target_name
 
             if transition_name != "complete":
@@ -2386,6 +2400,52 @@ class Orchestrator:
         """Callback for agent events."""
         logger.debug(f"Agent event issue={identifier} type={event_type}")
 
+    async def _handle_evaluator_exit(
+        self, issue: Issue, attempt: RunAttempt, state_cfg: StateConfig
+    ) -> str:
+        """Handle evaluator completion: parse tier, post comment, return transition name.
+
+        Evaluation comment is posted synchronously (awaited) before returning,
+        to ensure the verdict is persisted for crash recovery and audit.
+        """
+        from .tracking import make_evaluation_comment, parse_evaluation_tier
+
+        tier, summary, findings = parse_evaluation_tier(
+            attempt.result_text or attempt.last_message or ""
+        )
+
+        transition_name = _select_evaluator_transition(
+            tier=tier, auto_approve=state_cfg.auto_approve,
+        )
+
+        # Post evaluation comment — awaited (not fire-and-forget) because
+        # auto-approve decisions bypass human review and the comment is
+        # needed for crash recovery and audit.
+        wf = self._get_issue_workflow_config(issue.id)
+        run = self._issue_state_runs.get(issue.id, 1)
+        comment = make_evaluation_comment(
+            state=attempt.state_name,
+            tier=tier,
+            summary=summary,
+            findings=findings,
+            run=run,
+            workflow=wf.name,
+        )
+        try:
+            client = self._ensure_linear_client()
+            await client.post_comment(issue.id, comment)
+        except Exception as e:
+            logger.warning(
+                f"Failed to post evaluation comment for {issue.identifier}: {e}"
+            )
+
+        logger.info(
+            f"Evaluator result issue={issue.identifier} "
+            f"state={attempt.state_name} tier={tier} "
+            f"transition={transition_name}"
+        )
+        return transition_name
+
     def _on_worker_exit(self, issue: Issue, attempt: RunAttempt):
         """Handle worker completion.
 
@@ -2429,7 +2489,19 @@ class Orchestrator:
 
         if attempt.status == "succeeded":
             if attempt.state_name and attempt.state_name in issue_cfg.states:
-                # State machine mode: use agent-requested transition or default
+                state_cfg = issue_cfg.states[attempt.state_name]
+
+                # Evaluator states: parse output, post comment, select transition
+                if state_cfg.type == "evaluator":
+                    async def _eval_then_transition():
+                        transition = await self._handle_evaluator_exit(
+                            issue, attempt, state_cfg
+                        )
+                        await self._safe_transition(issue, transition)
+                    asyncio.create_task(_eval_then_transition())
+                    return  # evaluator handles its own transition
+
+                # Non-evaluator: use agent-requested transition or default
                 transition_name = attempt.requested_transition or "complete"
                 if not attempt.requested_transition:
                     logger.info(

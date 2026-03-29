@@ -48,6 +48,7 @@ class RunAttempt:
     last_event_at: datetime | None = None
     last_event: str | None = None
     last_message: str = ""
+    result_text: str = ""  # full result text, capped at 10K (used by evaluator parsing)
     completed_at: datetime | None = None
     state_name: str | None = None       # current internal state machine state
     requested_transition: str | None = None  # agent-requested transition name
