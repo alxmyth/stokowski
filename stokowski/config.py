@@ -222,7 +222,26 @@ def derive_workflow_transitions(
         has_next = i + 1 < len(path)
         next_state = path[i + 1] if has_next else None
 
-        if sc.type in ("agent", "evaluator"):
+        if sc.type == "evaluator":
+            eval_transitions: dict[str, str] = {}
+            if next_state is not None:
+                eval_transitions["complete"] = next_state
+                # If next state is a gate, derive approve transition
+                # that skips the gate to its approve target.
+                # We use path[i+2] (the state after the gate) because
+                # the gate's approve transition hasn't been computed yet
+                # in this single-pass loop. This is safe because
+                # derive_workflow_transitions always derives gate.approve
+                # from path adjacency — so path[i+2] IS the gate's
+                # approve target.
+                next_sc = states.get(next_state)
+                if next_sc and next_sc.type == "gate":
+                    gate_idx = i + 1
+                    if gate_idx + 1 < len(path):
+                        eval_transitions["approve"] = path[gate_idx + 1]
+            transitions[current] = eval_transitions
+
+        elif sc.type == "agent":
             if next_state is not None:
                 transitions[current] = {"complete": next_state}
             else:
