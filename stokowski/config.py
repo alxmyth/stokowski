@@ -220,6 +220,7 @@ class LinearStatesConfig:
 @dataclass
 class PromptsConfig:
     """Prompt file references."""
+    evaluator_prompt: str | None = None
     global_prompt: str | list[str] | None = None
 
 
@@ -243,6 +244,7 @@ class StateConfig:
     rework_to: str | None = None     # gate only
     max_rework: int | None = None    # gate only; also used for agent-initiated rework cap
     skip_labels: list[str] = field(default_factory=list)  # labels that auto-approve this gate
+    auto_approve: bool = False
     transitions: dict[str, str] = field(default_factory=dict)
     hooks: HooksConfig | None = None
     docker_image: str | None = None           # Override default_image for this state
@@ -344,7 +346,7 @@ class ProjectConfig:
                     return wf.entry_state or None
             # No default workflow — fall through to legacy scan
         for name, sc in self.states.items():
-            if sc.type == "agent":
+            if sc.type in ("agent", "evaluator"):
                 return name
         return None
 
@@ -413,7 +415,7 @@ class ProjectConfig:
         if ls.todo and ls.todo not in seen:
             seen.append(ls.todo)
         for sc in self.all_states().values():
-            if sc.type == "agent":
+            if sc.type in ("agent", "evaluator"):
                 linear_name = _resolve_linear_state_name(sc.linear_state, ls)
                 if linear_name and linear_name not in seen:
                     seen.append(linear_name)
@@ -626,12 +628,13 @@ def _parse_state_config(name: str, raw: dict[str, Any]) -> StateConfig:
         fallback_model=raw.get("fallback_model"),
         turn_timeout_ms=raw.get("turn_timeout_ms"),
         stall_timeout_ms=raw.get("stall_timeout_ms"),
-        session=str(raw.get("session", "inherit")),
+        session=str(raw.get("session", "fresh" if raw.get("type") == "evaluator" else "inherit")),
         permission_mode=raw.get("permission_mode"),
         allowed_tools=_coerce_list(allowed) if allowed is not None else None,
         rework_to=raw.get("rework_to"),
         max_rework=raw.get("max_rework"),
         skip_labels=_coerce_list(raw.get("skip_labels")),
+        auto_approve=bool(raw.get("auto_approve", False)),
         transitions=raw.get("transitions") or {},
         hooks=_parse_hooks(hooks_raw) if hooks_raw else None,
         docker_image=raw.get("docker_image") or (raw.get("docker", {}) or {}).get("image"),
@@ -1002,11 +1005,11 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
             path = _coerce_list(wd.get("path"))
             terminal_state = str(wd.get("terminal_state", "terminal"))
             transitions = derive_workflow_transitions(path, states)
-            # Find entry_state: first agent state in path
+            # Find entry_state: first agent/evaluator state in path
             entry = ""
             for name in path:
                 sc = states.get(name)
-                if sc and sc.type == "agent":
+                if sc and sc.type in ("agent", "evaluator"):
                     entry = name
                     break
             workflows[wf_name] = WorkflowConfig(
@@ -1026,7 +1029,7 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
         transitions = {name: dict(sc.transitions) for name, sc in states.items()}
         entry = ""
         for name, sc in states.items():
-            if sc.type == "agent":
+            if sc.type in ("agent", "evaluator"):
                 entry = name
                 break
         workflows["_default"] = WorkflowConfig(
@@ -1196,7 +1199,7 @@ def _validate_states(
     all_state_names = set(states.keys())
 
     for name, sc in states.items():
-        if sc.type not in ("agent", "gate", "terminal"):
+        if sc.type not in ("agent", "gate", "terminal", "evaluator"):
             errors.append(f"{prefix} state '{name}': invalid type: {sc.type}")
             continue
 
@@ -1226,6 +1229,20 @@ def _validate_states(
                 if "approve" not in sc.transitions:
                     errors.append(f"Gate state '{name}' is missing 'approve' transition")
             # (in multi-workflow mode, gate rework_to and approve are validated per-workflow below)
+
+        elif sc.type == "evaluator":
+            has_agent = True
+            if not sc.prompt and not cfg.prompts.evaluator_prompt:
+                errors.append(
+                    f"Evaluator state '{name}' has no prompt and no "
+                    f"prompts.evaluator_prompt default"
+                )
+            if sc.session != "fresh":
+                log.warning(
+                    "Evaluator state '%s' has session='%s' — "
+                    "evaluators should use session='fresh' for independent review",
+                    name, sc.session,
+                )
 
         elif sc.type == "terminal":
             has_terminal = True
@@ -1295,7 +1312,7 @@ def _validate_states(
 
         # Each workflow path must contain at least one agent state
         has_path_agent = any(
-            cfg.states.get(s) and cfg.states[s].type == "agent"
+            cfg.states.get(s) and cfg.states[s].type in ("agent", "evaluator")
             for s in wf.path
         )
         if not has_path_agent:
@@ -1352,6 +1369,20 @@ def _validate_states(
                         f"Gate '{state_name}' in workflow '{wf.name}' has no resolvable "
                         f"rework_to (no explicit rework_to and no prior agent state in path)"
                     )
+
+        # Evaluator validation within path context
+        for i, state_name in enumerate(wf.path):
+            sc = cfg.states.get(state_name)
+            if not sc or sc.type != "evaluator":
+                continue
+
+            next_in_path = wf.path[i + 1] if i + 1 < len(wf.path) else None
+            next_sc_in_path = cfg.states.get(next_in_path) if next_in_path else None
+            if not next_sc_in_path or next_sc_in_path.type != "gate":
+                errors.append(
+                    f"Evaluator state '{state_name}' in workflow '{wf.name}' "
+                    f"must be immediately followed by a gate state in the path"
+                )
 
         # Per-workflow reachability: walk this workflow's transition graph
         wf_entry = wf.entry_state
@@ -1453,6 +1484,11 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
         if sc.skip_labels and sc.type != "gate":
             log.warning(
                 "State '%s' has skip_labels but is not a gate — labels will be ignored",
+                name,
+            )
+        if sc.auto_approve and sc.type != "evaluator":
+            log.warning(
+                "State '%s' has auto_approve but is not an evaluator — flag will be ignored",
                 name,
             )
 
