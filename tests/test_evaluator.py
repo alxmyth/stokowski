@@ -147,3 +147,54 @@ class TestEvaluatorValidation:
         cfg = make_test_cfg(states, prompts=PromptsConfig(evaluator_prompt="prompts/eval.md"))
         errors = validate_config(cfg)
         assert not any("no prompt" in e for e in errors)
+
+
+class TestEvaluatorTransitionDerivation:
+    def test_evaluator_derives_complete_to_gate(self):
+        """Evaluator's complete transition points to the next state (gate)."""
+        states = {
+            "implement": StateConfig(name="implement", type="agent"),
+            "eval-merge": StateConfig(name="eval-merge", type="evaluator"),
+            "merge-review": StateConfig(name="merge-review", type="gate", rework_to="implement"),
+            "merge": StateConfig(name="merge", type="agent"),
+            "done": StateConfig(name="done", type="terminal"),
+        }
+        path = ["implement", "eval-merge", "merge-review", "merge", "done"]
+        transitions = derive_workflow_transitions(path, states)
+        assert transitions["eval-merge"]["complete"] == "merge-review"
+
+    def test_evaluator_derives_approve_past_gate(self):
+        """Evaluator's approve transition skips the gate to its approve target."""
+        states = {
+            "implement": StateConfig(name="implement", type="agent"),
+            "eval-merge": StateConfig(name="eval-merge", type="evaluator"),
+            "merge-review": StateConfig(name="merge-review", type="gate", rework_to="implement"),
+            "merge": StateConfig(name="merge", type="agent"),
+            "done": StateConfig(name="done", type="terminal"),
+        }
+        path = ["implement", "eval-merge", "merge-review", "merge", "done"]
+        transitions = derive_workflow_transitions(path, states)
+        # approve should skip merge-review and go directly to merge
+        assert transitions["eval-merge"]["approve"] == "merge"
+
+    def test_evaluator_approve_points_to_state_after_gate(self):
+        """When gate is second-to-last, approve points to the terminal state."""
+        states = {
+            "implement": StateConfig(name="implement", type="agent"),
+            "eval-final": StateConfig(name="eval-final", type="evaluator"),
+            "final-review": StateConfig(name="final-review", type="gate", rework_to="implement"),
+            "done": StateConfig(name="done", type="terminal"),
+        }
+        path = ["implement", "eval-final", "final-review", "done"]
+        transitions = derive_workflow_transitions(path, states)
+        assert transitions["eval-final"]["approve"] == "done"
+
+    def test_evaluator_at_end_of_path_no_transitions(self):
+        """Evaluator at end of path (misconfigured) gets empty transitions."""
+        states = {
+            "implement": StateConfig(name="implement", type="agent"),
+            "eval-orphan": StateConfig(name="eval-orphan", type="evaluator"),
+        }
+        path = ["implement", "eval-orphan"]
+        transitions = derive_workflow_transitions(path, states)
+        assert transitions["eval-orphan"] == {}
