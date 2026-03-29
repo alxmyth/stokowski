@@ -221,7 +221,35 @@ def build_lifecycle_section(
     # Instructions for completion
     lines.append("### When Done")
     lines.append("")
-    if len(effective_transitions) > 1:
+    if state_cfg.type == "evaluator":
+        lines.append(
+            "You are an **evaluator**. Your job is to independently review "
+            "the work done in the prior stage and produce a structured verdict."
+        )
+        lines.append("")
+        lines.append("**Output your evaluation as a structured comment:**")
+        lines.append("")
+        lines.append("```")
+        lines.append(
+            '<!-- stokowski:evaluation {"tier": "approve|review-required", '
+            '"summary": "one-line summary", "findings": ["finding 1", ...]} -->'
+        )
+        lines.append("```")
+        lines.append("")
+        lines.append("**Tiers:**")
+        lines.append(
+            "- `approve` — the work is correct, complete, and safe to proceed"
+        )
+        lines.append(
+            "- `review-required` — you have concerns that need human attention"
+        )
+        lines.append("")
+        lines.append(
+            "Be specific in findings. If you approve, briefly state why. "
+            "If you flag for review, list every concern."
+        )
+        lines.append("")
+    elif len(effective_transitions) > 1:
         lines.append(
             "When you have completed your work, include a transition "
             "directive in your final message to indicate the next step:"
@@ -308,17 +336,21 @@ def assemble_prompt(
                 "Global prompt file not found: %s", cfg.prompts.global_prompt
             )
 
-    # Layer 2: Stage prompt
-    if state_cfg.prompt:
+    # Layer 2: Stage prompt (evaluators fall back to global evaluator_prompt)
+    stage_prompt_path = state_cfg.prompt
+    if not stage_prompt_path and state_cfg.type == "evaluator":
+        stage_prompt_path = cfg.prompts.evaluator_prompt
+
+    if stage_prompt_path:
         try:
-            raw = load_prompt_file(state_cfg.prompt, workflow_dir)
+            raw = load_prompt_file(stage_prompt_path, workflow_dir)
             rendered = render_template(raw, context)
             parts.append(rendered)
         except FileNotFoundError:
             log.warning(
                 "Stage prompt file not found for state '%s': %s",
                 state_name,
-                state_cfg.prompt,
+                stage_prompt_path,
             )
 
     # Layer 3: Lifecycle injection

@@ -16,6 +16,7 @@ from stokowski.config import (
     validate_config,
 )
 from stokowski.models import Issue
+from stokowski.prompt import build_lifecycle_section
 from stokowski.tracking import (
     make_evaluation_comment,
     parse_evaluation_tier,
@@ -289,3 +290,45 @@ class TestEvaluationTracking:
         tier, summary, findings = parse_evaluation_tier(comment)
         assert tier == "review-required"
         assert len(findings) == 20
+
+
+class TestEvaluatorLifecycleSection:
+    def _make_issue(self) -> Issue:
+        return Issue(
+            id="id1", identifier="SMI-42", title="Fix auth bug",
+            description="Auth is broken", url="https://linear.app/issue/SMI-42",
+        )
+
+    def test_evaluator_lifecycle_includes_evaluation_instructions(self):
+        """Evaluator lifecycle section includes structured output instructions."""
+        issue = self._make_issue()
+        sc = StateConfig(
+            name="eval-merge", type="evaluator",
+            linear_state="active", session="fresh",
+        )
+        section = build_lifecycle_section(
+            issue=issue,
+            state_name="eval-merge",
+            state_cfg=sc,
+            linear_states=LinearStatesConfig(),
+            transitions={"complete": "merge-review", "approve": "merge"},
+        )
+        assert "stokowski:evaluation" in section
+        assert "approve" in section
+        assert "review-required" in section
+
+    def test_evaluator_lifecycle_no_transition_directive(self):
+        """Evaluator lifecycle does NOT tell agent to emit transition directives."""
+        issue = self._make_issue()
+        sc = StateConfig(
+            name="eval-merge", type="evaluator",
+            linear_state="active", session="fresh",
+        )
+        section = build_lifecycle_section(
+            issue=issue,
+            state_name="eval-merge",
+            state_cfg=sc,
+            linear_states=LinearStatesConfig(),
+            transitions={"complete": "merge-review", "approve": "merge"},
+        )
+        assert "<!-- transition:" not in section
