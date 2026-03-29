@@ -118,6 +118,7 @@ agent:
 # ---------------------------------------------------------------------------
 prompts:
   global_prompt: prompts/global.example.md
+  evaluator_prompt: prompts/evaluator.example.md
 
 # ---------------------------------------------------------------------------
 # Server (optional web dashboard)
@@ -233,7 +234,23 @@ states:
     max_turns: 10
     session: fresh              # no prior context — adversarial review
     transitions:
+      complete: eval-merge
+
+  # ── 5b. Merge Evaluation (evaluator) ────────────────────────────────────
+  # Automated evaluation: fresh session reviews the diff and produces
+  # a structured verdict. If auto_approve is true and the evaluator
+  # approves, the merge-review gate is skipped.
+  eval-merge:
+    type: evaluator
+    prompt: prompts/evaluator.example.md
+    linear_state: active
+    model: claude-sonnet-4-6
+    max_turns: 5
+    session: fresh
+    auto_approve: false             # set true once you trust the evaluator
+    transitions:
       complete: merge-review
+      approve: merge
 
   # ── 6. Merge Review (gate) ──────────────────────────────────────────────
   # Human reviews the code review findings and decides to merge or rework.
