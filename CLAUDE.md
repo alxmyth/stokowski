@@ -59,7 +59,7 @@ All state lives in memory. The orchestrator recovers from restart by re-polling 
 The operator's `workflow.yaml` defines the runtime config and state machine. Stokowski re-parses it on every poll tick — config changes take effect without restart. Both `.yaml` and legacy `.md` (YAML front matter + Jinja2 body) formats are supported. Prompt templates are now separate `.md` files referenced by path from the config.
 
 ### State machine workflow
-Each workflow defines a set of internal states that map to Linear states. States have types: `agent` (runs Claude Code), `gate` (waits for human review), or `terminal` (issue complete). Transitions between states are declared explicitly in config.
+Each workflow defines a set of internal states that map to Linear states. States have types: `agent` (runs Claude Code), `evaluator` (agent-evaluates-agent), `gate` (waits for human review), or `terminal` (issue complete). Transitions between states are declared explicitly in config.
 
 **Three-layer prompt assembly:** Every agent turn's prompt is built from three layers concatenated together:
 1. **Global prompt** — shared context loaded from a `.md` file (referenced by `prompts.global_prompt`)
@@ -69,6 +69,13 @@ Each workflow defines a set of internal states that map to Linear states. States
 **Gate protocol:** When an agent completes a state that transitions to a gate, Stokowski moves the issue to the gate's Linear state and posts a structured tracking comment. Humans approve or request rework via Linear state changes. On approval, Stokowski advances to the gate's `approve` transition target. On rework, it returns to the gate's `rework_to` state.
 
 **Structured comment tracking:** State transitions and gate decisions are persisted as HTML comments on Linear issues (`<!-- stokowski:state {...} -->` and `<!-- stokowski:gate {...} -->`). These enable crash recovery and provide context for rework runs.
+
+### Evaluator state type (agent-evaluates-agent)
+Evaluators are first-class states (`type: evaluator`) that sit in the workflow path before gates. They run like agents (subprocess, prompt, concurrency tracking) but parse their output for a tier verdict (`approve` or `review-required`). On `approve` + `auto_approve: true`, the evaluator transitions past the gate directly to the gate's approve target. Otherwise, it enters the gate for human review. This is the Compound Engineering pattern — staged AI pipelines where each stage validates the previous one.
+
+**Evaluation output contract:** The evaluator must emit `<!-- stokowski:evaluation {"tier": "...", "summary": "...", "findings": [...]} -->` in its result text. Stokowski parses this using last-match semantics (same as `TRANSITION_PATTERN`). Fallback keyword search always returns `review-required`. Parse failure defaults to `review-required` (fail-safe).
+
+**Known limitation:** Fresh session prevents anchoring to the agent's conversational reasoning, but the evaluator still reads the agent's artifacts (code, comments, commit messages). This is a "second pass" not an "independent audit."
 
 ### Workspace isolation
 Each issue gets its own directory under `workspace.root`. Agents run with `cwd` set to that directory. Workspaces persist across turns for the same session; they're deleted when the issue reaches a terminal state.
@@ -91,8 +98,8 @@ Parses `workflow.yaml` (or legacy `.md` with front matter) into typed dataclasse
 - `ServerConfig` — optional web dashboard port
 - `LoggingConfig` — agent run log retention: `enabled` (default false), `log_dir` (supports `~` and `$VAR`), `max_age_days` (default 14), `max_total_size_mb` (default 500). `resolved_log_dir()` expands path variables.
 - `LinearStatesConfig` — maps logical state names (`todo`, `active`, `review`, `gate_approved`, `rework`, `terminal`) to actual Linear state names. Issues in the `todo` state are picked up and automatically moved to `active` on dispatch.
-- `PromptsConfig` — global prompt file reference
-- `StateConfig` — a single state in the state machine: type, prompt path, linear_state key, runner, session mode, transitions, per-state overrides (model, max_turns, timeouts, hooks), gate-specific fields (rework_to, max_rework)
+- `PromptsConfig` — global prompt file reference; `evaluator_prompt` is the default prompt file for evaluator states (used when state has no `prompt` set)
+- `StateConfig` — a single state in the state machine: type (`agent`, `evaluator`, `gate`, `terminal`), prompt path, linear_state key, runner, session mode, transitions, per-state overrides (model, max_turns, timeouts, hooks), gate-specific fields (rework_to, max_rework), evaluator-specific fields (`auto_approve` — whether "approve" tier skips the gate, default false)
 
 `ServiceConfig` provides helper methods: `entry_state` (first agent state), `active_linear_states()`, `gate_linear_states()`, `terminal_linear_states()`.
 
@@ -118,7 +125,7 @@ Note: the reconciliation query uses `issues(filter: { id: { in: $ids } })` — n
 ### models.py
 Three dataclasses:
 - `Issue` — normalized Linear issue. `title` is required even for minimal fetches (use `title=""`).
-- `RunAttempt` — per-issue runtime state: session_id, turn count, token usage, status, last message
+- `RunAttempt` — per-issue runtime state: session_id, turn count, token usage, status, last message, result_text (full result text from the NDJSON result event, capped at 10K chars — used by evaluator tier parsing)
 - `RetryEntry` — retry queue entry with due time and error
 
 ### orchestrator.py
@@ -223,6 +230,8 @@ State machine tracking via structured Linear comments:
 - `parse_latest_tracking(comments)` — scans comments (oldest-first) to find latest state or gate tracking entry for crash recovery
 - `get_last_tracking_timestamp(comments)` — finds the timestamp of the latest tracking comment
 - `get_comments_since(comments, since_timestamp)` — filters to non-tracking comments after a given timestamp (used to gather review feedback for rework runs)
+- `make_evaluation_comment(state, tier, summary, findings, run, workflow)` — builds evaluation tracking comment with hidden JSON (`<!-- stokowski:evaluation {...} -->`) + human-readable text
+- `parse_evaluation_tier(result_text)` — extracts tier, summary, findings from agent result; uses last-match semantics; fallback always returns review-required
 
 ---
 
@@ -318,3 +327,11 @@ There are no automated tests beyond `--dry-run`. The system is best verified by 
 - **`STOKOWSKI_ISSUE_IDENTIFIER` env var**: Set per-dispatch in `_run_worker()`, not in `ServiceConfig`. Informational only — useful for hooks that need to know which issue they service. Not a security boundary.
 - **`_cleanup_issue_state()` must stay in sync with `__init__`**: Any new per-issue tracking dict added to `Orchestrator.__init__` must also be added to `_cleanup_issue_state()`. Failure to do so causes memory leaks and stale state on cancellation.
 - **Agent run logs**: When `logging.enabled` is true, raw agent stdout is captured to `{log_dir}/{issue_identifier}/` as `.ndjson` (Claude Code) or `.log` (Codex) files. To debug an agent run: `cat {log_dir}/SMI-14/20260324T041500Z-turn-1.ndjson | jq .` Logs survive workspace cleanup — their lifetime is controlled by `max_age_days` and `max_total_size_mb`. Retention cleanup runs at startup and after each worker exit. Log writes are best-effort — failures do not affect agent execution.
+- **Evaluator `session` should be `fresh`**: Using `inherit` lets the evaluator see the prior agent's conversation, which defeats the adversarial review purpose. `validate_config()` warns but does not error. Evaluators default to `session: fresh` when not explicitly set.
+- **Evaluator must be followed by a gate**: An evaluator not followed by a gate in the workflow path is a validation error — the approve transition has no gate to skip.
+- **Evaluation output parsing is best-effort**: If the evaluator doesn't produce a `<!-- stokowski:evaluation {...} -->` comment, the tier defaults to `review-required` (fail-safe). Check agent logs if evaluations always fall to human review.
+- **`result_text` vs `last_message`**: `RunAttempt.last_message` is truncated to 200 chars. Evaluator tier parsing uses `result_text` (full text from the result event, capped at 10K). If you add new fields to RunAttempt that are populated in `_process_event`, they don't need cleanup in `_cleanup_issue_state` — RunAttempt is per-dispatch, not per-issue.
+- **Evaluators consume agent concurrency slots**: Evaluators are real agent subprocesses. Operators with high gate throughput should set per-state limits (e.g., `eval-merge: 1`) to avoid starving implementation agents.
+- **Evaluator findings are not shown during rework**: Evaluation tracking comments are filtered by `get_comments_since()` (it excludes all `<!-- stokowski:` comments). If a gate sends work back, the rework agent sees gate reviewer comments but not evaluator findings. This is a known limitation.
+- **`_transition()` handles evaluators in the `else` branch**: Evaluator states are intentionally handled by the catch-all agent branch in `_transition()`. The comment says "Agent or evaluator state." Do not add a separate `elif` for evaluators unless the behavior needs to diverge.
+- **Evaluation comment posting is synchronous (awaited)**: Unlike regular agent tracking via `_fire_and_forget`, `_handle_evaluator_exit()` awaits the `post_comment` call before transitioning. This prevents a crash-recovery gap where the evaluation verdict is lost.
