@@ -566,6 +566,7 @@ def _process_event(
         result_text = event.get("result", "")
         if isinstance(result_text, str) and result_text:
             attempt.last_message = result_text[:200]
+            attempt.result_text = result_text[:10_000]  # full text for evaluator parsing
 
             # Parse agent-requested transition directive (use LAST match
             # to avoid capturing quoted directives from earlier output)
