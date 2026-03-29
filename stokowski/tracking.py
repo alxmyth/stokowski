@@ -14,6 +14,11 @@ STATE_PATTERN = re.compile(r"<!-- stokowski:state ({.*?}) -->")
 GATE_PATTERN = re.compile(r"<!-- stokowski:gate ({.*?}) -->")
 REJECTED_PATTERN = re.compile(r"<!-- stokowski:rejected ({.*?}) -->")
 MIGRATED_PATTERN = re.compile(r"<!-- stokowski:migrated ({.*?}) -->")
+EVAL_PATTERN = re.compile(r"<!-- stokowski:evaluation ({.*?}) -->")
+
+_TIER_FALLBACK = re.compile(
+    r"\btier[:\s]+[\"']?(approve|review-required)[\"']?", re.IGNORECASE
+)
 
 
 def make_state_comment(
@@ -201,6 +206,88 @@ def make_migrated_comment(repo_name: str) -> str:
         f"different repo is intended."
     )
     return f"{machine}\n\n{human}"
+
+
+def make_evaluation_comment(
+    state: str,
+    tier: str,
+    summary: str = "",
+    findings: list[str] | None = None,
+    run: int = 1,
+    workflow: str | None = None,
+) -> str:
+    """Build a structured evaluation tracking comment."""
+    payload: dict[str, Any] = {
+        "state": state,
+        "tier": tier,
+        "summary": summary,
+        "findings": findings or [],
+        "run": run,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if workflow is not None:
+        payload["workflow"] = workflow
+
+    machine = f"<!-- stokowski:evaluation {json.dumps(payload)} -->"
+
+    if tier == "approve":
+        human = f"**[Stokowski]** Evaluation of **{state}**: **APPROVE**"
+    else:
+        human = f"**[Stokowski]** Evaluation of **{state}**: **REVIEW REQUIRED**"
+
+    if summary:
+        human += f"\n\n{summary}"
+
+    if findings:
+        human += "\n\n**Findings:**\n"
+        for finding in findings:
+            human += f"- {finding}\n"
+
+    return f"{machine}\n\n{human}"
+
+
+def parse_evaluation_tier(
+    result_text: str,
+) -> tuple[str, str, list[str]]:
+    """Parse evaluation tier from agent result text.
+
+    Uses last-match semantics (like TRANSITION_PATTERN) to prevent
+    prompt injection from workspace content. Fallback keyword search
+    always returns review-required (never approve from fallback).
+    Defaults to review-required on any parse failure (fail-safe).
+    """
+    if not result_text:
+        return "review-required", "", []
+
+    # Primary: structured comment (last match wins)
+    matches = EVAL_PATTERN.findall(result_text)
+    if matches:
+        try:
+            data = json.loads(matches[-1])
+            tier = data.get("tier", "review-required")
+            if tier not in ("approve", "review-required"):
+                tier = "review-required"
+            summary = str(data.get("summary", ""))
+            findings = data.get("findings", [])
+            findings = [f for f in findings if isinstance(f, str)]
+            return tier, summary, findings
+        except (json.JSONDecodeError, AttributeError):
+            logger.warning("Malformed evaluation JSON, falling back")
+
+    # Fallback: keyword search — always returns review-required
+    fallback = _TIER_FALLBACK.search(result_text)
+    if fallback:
+        logger.info(
+            "Evaluation tier detected via keyword fallback, "
+            "forcing review-required"
+        )
+        return "review-required", "", []
+
+    # Default: review-required (fail-safe)
+    logger.warning(
+        "Could not parse evaluation tier, defaulting to review-required"
+    )
+    return "review-required", "", []
 
 
 def parse_latest_tracking(comments: list[dict]) -> dict[str, Any] | None:
