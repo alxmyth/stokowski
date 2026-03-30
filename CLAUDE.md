@@ -91,7 +91,7 @@ Every first-turn launch appends a system prompt via `--append-system-prompt` tha
 Parses `workflow.yaml` (or legacy `.md` with front matter) into typed dataclasses:
 - `TrackerConfig` — Linear endpoint, API key, project slug
 - `PollingConfig` — interval
-- `WorkspaceConfig` — root path (supports `~` and `$VAR` expansion)
+- `WorkspaceConfig` — root path (supports `~` and `$VAR` expansion). Relative paths are resolved from the workflow directory via `resolved_root(base)`.
 - `HooksConfig` — shell scripts for lifecycle events + timeout (includes `on_stage_enter`)
 - `ClaudeConfig` — command, permission mode, model, timeouts, system prompt
 - `AgentConfig` — concurrency limits (global + per-state)
@@ -208,7 +208,7 @@ CLI entry point (`cli()`) and keyboard handler.
 
 **`_force_kill_children()`** uses `pgrep -f "claude.*-p.*--output-format.*stream-json"` as a last-resort cleanup on `KeyboardInterrupt`.
 
-**`_load_dotenv()`** reads `.env` from cwd on startup — supports `KEY=value` format, ignores comments and blank lines. The project-local `.env` takes precedence over the shell environment (uses direct assignment, overrides existing env vars).
+**`_load_dotenv(directory)`** reads `.env` from a directory on startup — supports `KEY=value` format, ignores comments and blank lines. Called twice: first from cwd (backward compat), then from the workflow file's directory (project-specific overrides). Later values win via direct assignment. This enables deploying Stokowski to any project: put `.env` next to `workflow.yaml` and run `stokowski /path/to/workflow.yaml` from anywhere.
 
 ### prompt.py
 Three-layer prompt assembly for state machine workflows. Main entry point is `assemble_prompt()`.

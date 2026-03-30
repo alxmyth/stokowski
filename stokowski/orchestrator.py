@@ -329,7 +329,7 @@ class Orchestrator:
                 self.cfg.tracker.project_slug,
                 self.cfg.terminal_linear_states(),
             )
-            ws_root = self.cfg.workspace.resolved_root()
+            ws_root = self.cfg.workspace.resolved_root(self.workflow_path.parent)
             for issue in terminal:
                 await remove_workspace(
                     ws_root, issue.identifier, self.cfg.hooks,
@@ -731,7 +731,7 @@ class Orchestrator:
                 logger.warning(f"Failed to move {issue.identifier} to terminal: {e}")
             # Clean up workspace
             try:
-                ws_root = self.cfg.workspace.resolved_root()
+                ws_root = self.cfg.workspace.resolved_root(self.workflow_path.parent)
                 await remove_workspace(
                     ws_root, issue.identifier, self.cfg.hooks,
                     docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
@@ -1124,7 +1124,7 @@ class Orchestrator:
                 )
                 runner_type = state_cfg.runner
 
-            ws_root = self.cfg.workspace.resolved_root()
+            ws_root = self.cfg.workspace.resolved_root(self.workflow_path.parent)
             docker_image = ""
             if self.cfg.docker.enabled:
                 docker_image = (
@@ -1694,7 +1694,7 @@ class Orchestrator:
                     # Try to remove workspace using cached identifier
                     cached = self._last_issues.get(issue_id)
                     if cached:
-                        ws_root = self.cfg.workspace.resolved_root()
+                        ws_root = self.cfg.workspace.resolved_root(self.workflow_path.parent)
                         await remove_workspace(
                             ws_root, cached.identifier, self.cfg.hooks,
                             docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
@@ -1716,7 +1716,7 @@ class Orchestrator:
 
                     attempt = self.running.get(issue_id)
                     if attempt:
-                        ws_root = self.cfg.workspace.resolved_root()
+                        ws_root = self.cfg.workspace.resolved_root(self.workflow_path.parent)
                         await remove_workspace(
                             ws_root, attempt.issue_identifier, self.cfg.hooks,
                             docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
@@ -1725,7 +1725,7 @@ class Orchestrator:
                     # Gated issue — no process to kill, just clean up state
                     cached = self._last_issues.get(issue_id)
                     if cached:
-                        ws_root = self.cfg.workspace.resolved_root()
+                        ws_root = self.cfg.workspace.resolved_root(self.workflow_path.parent)
                         await remove_workspace(
                             ws_root, cached.identifier, self.cfg.hooks,
                             docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,

@@ -15,9 +15,13 @@ import tty
 from pathlib import Path
 
 
-def _load_dotenv():
-    """Load .env file from cwd if it exists."""
-    env_file = Path(".env")
+def _load_dotenv(directory: Path | None = None):
+    """Load .env file from a directory if it exists.
+
+    Args:
+        directory: Directory to search for .env. Defaults to cwd.
+    """
+    env_file = (directory / ".env") if directory else Path(".env")
     if not env_file.exists():
         return
     for line in env_file.read_text().splitlines():
@@ -339,7 +343,12 @@ def cli():
             )
             sys.exit(1)
 
-    _load_dotenv()
+    # Load .env: cwd first (backward compat), then workflow directory
+    # (project-specific overrides). Later values win via direct assignment.
+    workflow_dir = Path(args.workflow).resolve().parent
+    _load_dotenv()  # cwd .env (backward compat)
+    if workflow_dir != Path.cwd():
+        _load_dotenv(workflow_dir)  # workflow dir .env takes precedence
     setup_logging(args.verbose)
 
     if args.dry_run:
@@ -415,7 +424,7 @@ async def dry_run(workflow_path: str):
     console.print(f"  Max agents: {cfg.agent.max_concurrent_agents}")
     console.print(f"  Claude model: {cfg.claude.model or 'default'}")
     console.print(f"  Permission mode: {cfg.claude.permission_mode}")
-    console.print(f"  Workspace root: {cfg.workspace.resolved_root()}")
+    console.print(f"  Workspace root: {cfg.workspace.resolved_root(Path(workflow_path).parent)}")
 
     if cfg.states:
         console.print(f"\n  [bold]State machine[/bold] ({len(cfg.states)} states):")
