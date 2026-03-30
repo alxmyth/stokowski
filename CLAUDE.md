@@ -113,7 +113,7 @@ Every first-turn launch appends a system prompt via `--append-system-prompt` tha
 Parses `workflow.yaml` (or legacy `.md` with front matter) into typed dataclasses:
 - `TrackerConfig` — Linear endpoint, API key, project slug
 - `PollingConfig` — interval
-- `WorkspaceConfig` — root path (supports `~` and `$VAR` expansion)
+- `WorkspaceConfig` — root path (supports `~` and `$VAR` expansion). Relative paths are resolved from the workflow directory via `resolved_root(base)`.
 - `HooksConfig` — shell scripts for lifecycle events + timeout (includes `on_stage_enter`)
 - `ClaudeConfig` — command, permission mode, model, timeouts, system prompt
 - `AgentConfig` — concurrency limits (global + per-state)
@@ -230,7 +230,7 @@ CLI entry point (`cli()`) and keyboard handler.
 
 **`_force_kill_children()`** uses `pgrep -f "claude.*-p.*--output-format.*stream-json"` as a last-resort cleanup on `KeyboardInterrupt`.
 
-**`_load_dotenv()`** reads `.env` from cwd on startup — supports `KEY=value` format, ignores comments and blank lines. The project-local `.env` takes precedence over the shell environment (uses direct assignment, overrides existing env vars). Runs BEFORE `resolve_workflow_paths` so `STOKOWSKI_WORKFLOW_PATH` from `.env` is visible to path resolution.
+**`_load_dotenv(directory)`** reads `.env` from a directory — supports `KEY=value` format, ignores comments and blank lines. The project-local `.env` takes precedence over the shell environment (uses direct assignment, overrides existing env vars). Called twice: first from cwd BEFORE `resolve_workflow_paths` so `STOKOWSKI_WORKFLOW_PATH` from `.env` is visible to path resolution, then once per unique workflow-file directory AFTER resolution so a `.env` next to `workflow.yaml` is picked up regardless of cwd. Later values win via direct assignment.
 
 **`STOKOWSKI_WORKFLOW_PATH`** env var in `resolve_workflow_paths` (stokowski/main.py): when no CLI args are passed AND the env var is a non-empty string, the env value is routed through the single-arg branch (file / directory / glob all work). Precedence: CLI args > env var > auto-detect. Empty or whitespace-only values fall through to auto-detect.
 

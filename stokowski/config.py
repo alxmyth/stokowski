@@ -35,9 +35,18 @@ class PollingConfig:
 class WorkspaceConfig:
     root: str = ""
 
-    def resolved_root(self) -> Path:
+    def resolved_root(self, base: Path | None = None) -> Path:
+        """Resolve ~ and $VAR in workspace root.
+
+        Args:
+            base: Base directory for resolving relative paths (e.g. workflow dir).
+        """
         if self.root:
-            return Path(os.path.expandvars(os.path.expanduser(self.root)))
+            expanded = os.path.expanduser(os.path.expandvars(self.root))
+            p = Path(expanded)
+            if not p.is_absolute() and base:
+                p = base / p
+            return p
         return Path(tempfile.gettempdir()) / "stokowski_workspaces"
 
 

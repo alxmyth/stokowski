@@ -17,9 +17,13 @@ from pathlib import Path
 from typing import Sequence
 
 
-def _load_dotenv():
-    """Load .env file from cwd if it exists."""
-    env_file = Path(".env")
+def _load_dotenv(directory: Path | None = None):
+    """Load .env file from a directory if it exists.
+
+    Args:
+        directory: Directory to search for .env. Defaults to cwd.
+    """
+    env_file = (directory / ".env") if directory else Path(".env")
     if not env_file.exists():
         return
     for line in env_file.read_text().splitlines():
@@ -442,6 +446,17 @@ def cli():
         console.print(f"[red]{e}[/red]")
         sys.exit(1)
 
+    # Load .env from each workflow file's directory (later wins via direct
+    # assignment). Enables `stokowski /path/to/workflow.yaml` to pick up a
+    # project-local .env regardless of cwd.
+    cwd = Path.cwd().resolve()
+    seen_dirs: set[Path] = set()
+    for wpath in workflow_paths:
+        wdir = wpath.resolve().parent
+        if wdir != cwd and wdir not in seen_dirs:
+            _load_dotenv(wdir)
+            seen_dirs.add(wdir)
+
     setup_logging(args.verbose)
 
     if args.dry_run:
@@ -543,7 +558,7 @@ async def dry_run(workflow_paths: Sequence[Path] | Path | str):
         console.print(f"    Max agents: {cfg.agent.max_concurrent_agents}")
         console.print(f"    Claude model: {cfg.claude.model or 'default'}")
         console.print(f"    Permission mode: {cfg.claude.permission_mode}")
-        console.print(f"    Workspace root: {cfg.workspace.resolved_root()}")
+        console.print(f"    Workspace root: {cfg.workspace.resolved_root(path.parent)}")
 
         if cfg.states:
             console.print(f"    [bold]State machine[/bold] ({len(cfg.states)} states):")
