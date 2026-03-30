@@ -753,7 +753,9 @@ class Orchestrator:
                     pcfg.tracker.project_slug,
                     pcfg.terminal_linear_states(),
                 )
-                ws_root = pcfg.workspace.resolved_root()
+                ws_root = pcfg.workspace.resolved_root(
+                    self._config_paths.get(slug, self.workflow_path).parent
+                )
                 for issue in terminal:
                     for repo in pcfg.repos.values():
                         rendered_hooks = _render_hooks_best_effort(
@@ -1237,7 +1239,9 @@ class Orchestrator:
             )
 
             try:
-                ws_root = issue_cfg.workspace.resolved_root()
+                ws_root = issue_cfg.workspace.resolved_root(
+                    self._workflow_dir_for_issue(issue.id)
+                )
                 repo = self._get_issue_repo_config(issue.id)
                 rendered_hooks = _render_hooks_best_effort(
                     issue_cfg.hooks, repo, issue_cfg.repos_synthesized
@@ -2140,7 +2144,9 @@ class Orchestrator:
                 )
                 runner_type = state_cfg.runner
 
-            ws_root = cfg.workspace.resolved_root()
+            ws_root = cfg.workspace.resolved_root(
+                self._workflow_dir_for_issue(issue.id)
+            )
             # Resolve repo using the pinned cfg snapshot (ADV-005). A
             # concurrent _load_workflow during our await could have swapped
             # self.cfg; resolving via `cfg.resolve_repo` guarantees the
@@ -3052,7 +3058,9 @@ class Orchestrator:
                     )
                     cached = self._last_issues.get(issue_id)
                     if cached:
-                        ws_root = issue_cfg.workspace.resolved_root()
+                        ws_root = issue_cfg.workspace.resolved_root(
+                            self._workflow_dir_for_issue(issue_id)
+                        )
                         repo = self._get_issue_repo_config(issue_id)
                         rendered_hooks = _render_hooks_best_effort(
                             issue_cfg.hooks, repo, issue_cfg.repos_synthesized
@@ -3079,7 +3087,9 @@ class Orchestrator:
 
                     attempt = self.running.get(issue_id)
                     if attempt:
-                        ws_root = issue_cfg.workspace.resolved_root()
+                        ws_root = issue_cfg.workspace.resolved_root(
+                            self._workflow_dir_for_issue(issue_id)
+                        )
                         repo = self._get_issue_repo_config(issue_id)
                         rendered_hooks = _render_hooks_best_effort(
                             issue_cfg.hooks, repo, issue_cfg.repos_synthesized
@@ -3091,7 +3101,9 @@ class Orchestrator:
                 else:
                     cached = self._last_issues.get(issue_id)
                     if cached:
-                        ws_root = issue_cfg.workspace.resolved_root()
+                        ws_root = issue_cfg.workspace.resolved_root(
+                            self._workflow_dir_for_issue(issue_id)
+                        )
                         repo = self._get_issue_repo_config(issue_id)
                         rendered_hooks = _render_hooks_best_effort(
                             issue_cfg.hooks, repo, issue_cfg.repos_synthesized
