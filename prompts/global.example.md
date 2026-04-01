@@ -122,6 +122,14 @@ Write screenshots, recordings and exported data to `$STOKOWSKI_ARTIFACTS`.
 Stokowski uploads that directory to Linear and then empties it. Anything
 written elsewhere in the repo is never seen and risks being committed.
 
+1. **Sync with main.** Check if your branch is behind main: `git log HEAD..origin/main --oneline`.
+   If there are commits, run `git rebase origin/main`. If conflicts arise, resolve them
+   intelligently — read both sides, understand intent, and pick the correct resolution.
+   After resolving, verify the build still passes. Force-push the updated branch.
+   If already up to date, skip this step.
+2. Run the project's type-check command to verify the codebase compiles clean.
+3. Run the project's test command to verify all tests pass.
+4. If any step fails, investigate and fix before starting new work.
 
 ## Linear access
 
