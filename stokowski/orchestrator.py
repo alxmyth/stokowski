@@ -49,11 +49,13 @@ from .prompt import (
 )
 from .runner import run_agent_turn, run_turn
 from .tracking import (
+    build_attachment_metadata,
     has_pending_rejection,
+    make_evaluation_comment,
     make_gate_comment,
     make_migrated_comment,
     make_rejection_comment,
-    make_state_comment,
+    parse_attachment_state,
     parse_latest_tracking,
 )
 from .workspace import ensure_workspace, remove_workspace, sanitize_key
@@ -565,6 +567,26 @@ class Orchestrator:
             return self._linear_client_for(slug)
         return self._ensure_linear_client()
 
+    async def _upsert_state(
+        self,
+        issue: Issue,
+        metadata: dict,
+        comment: str | None = None,
+    ) -> None:
+        """Upsert the Stokowski attachment and optionally post a human comment."""
+        client = self._client_for_issue(issue.id)
+        state = metadata.get("state", "")
+        run = metadata.get("run", 1)
+        subtitle = f"{state} · run {run}"
+        await client.upsert_stokowski_attachment(
+            issue_id=issue.id,
+            identifier=issue.identifier,
+            metadata=metadata,
+            subtitle=subtitle,
+        )
+        if comment:
+            await client.post_comment(issue.id, comment)
+
     async def _post_cancellation_comment(
         self, issue_id: str, state_name: str
     ) -> None:
@@ -954,10 +976,16 @@ class Orchestrator:
             self._issue_state_runs[issue.id] = 1
             return entry, 1
 
-        # Fetch comments via the issue's own project client.
+        # Try attachment-based recovery first, fall back to comments.
+        # Use the issue's own project client (multi-project).
         client = self._client_for_issue(issue.id)
-        comments = await client.fetch_comments(issue.id)
-        tracking = parse_latest_tracking(comments)
+        tracking = None
+        att_meta = await client.fetch_stokowski_attachment(issue.identifier)
+        if att_meta:
+            tracking = parse_attachment_state(att_meta)
+        if not tracking:
+            comments = await client.fetch_comments(issue.id)
+            tracking = parse_latest_tracking(comments)
 
         workflow: WorkflowConfig | None = None
         if issue.id in self._issue_workflow:
@@ -1079,13 +1107,13 @@ class Orchestrator:
                 target = approve_target
                 run = self._issue_state_runs.get(issue.id, 1)
 
-                client = self._client_for_issue(issue.id)
                 repo_name = self._repo_name_for_tracking(issue.id)
-                comment = make_gate_comment(
-                    state=state_name, status="approved", run=run,
+                meta = build_attachment_metadata(
+                    state=state_name, type="gate", run=run,
                     workflow=workflow.name, repo=repo_name,
+                    status="approved",
                 )
-                await client.post_comment(issue.id, comment)
+                await self._upsert_state(issue, meta)
 
                 self._issue_current_state[issue.id] = target
                 self._issue_state_runs[issue.id] = 1  # Reset for new state
@@ -1094,12 +1122,12 @@ class Orchestrator:
                 # Keep claimed — prevents double-dispatch race with concurrent tick
                 self._pending_gates.pop(issue.id, None)
 
-                # Post state-entry comment for audit trail
-                state_comment = make_state_comment(
-                    state=target, run=1, workflow=workflow.name,
-                    repo=repo_name,
+                # Upsert state-entry for audit trail
+                meta = build_attachment_metadata(
+                    state=target, type="state", run=1,
+                    workflow=workflow.name, repo=repo_name,
                 )
-                await client.post_comment(issue.id, state_comment)
+                await self._upsert_state(issue, meta)
 
                 logger.info(
                     f"Gate auto-skipped issue={issue.identifier} "
@@ -1108,21 +1136,18 @@ class Orchestrator:
                 self._schedule_retry(issue, attempt_num=0, delay_ms=1000)
                 return
 
-        prompt = state_cfg.prompt if state_cfg else ""
         run = self._issue_state_runs.get(issue.id, 1)
 
         client = self._client_for_issue(issue.id)
         issue_cfg = self._cfg_for_issue_or_primary(issue.id)
 
-        comment = make_gate_comment(
-            state=state_name,
-            status="waiting",
-            prompt=prompt or "",
-            run=run,
+        meta = build_attachment_metadata(
+            state=state_name, type="gate", run=run,
             workflow=workflow.name,
             repo=self._repo_name_for_tracking(issue.id),
+            status="waiting",
         )
-        await client.post_comment(issue.id, comment)
+        await self._upsert_state(issue, meta)
 
         review_state = issue_cfg.linear_states.review
         moved = await client.update_issue_state(issue.id, review_state)
@@ -1226,6 +1251,13 @@ class Orchestrator:
                     logger.warning(f"Failed to move {issue.identifier} to terminal state '{terminal_state}'")
             except Exception as e:
                 logger.warning(f"Failed to move {issue.identifier} to terminal: {e}")
+            # Delete Stokowski attachment
+            try:
+                client = self._client_for_issue(issue.id)
+                await client.delete_stokowski_attachment(issue.identifier)
+            except Exception:
+                pass
+            # Clean up workspace
             try:
                 ws_root = issue_cfg.workspace.resolved_root(
                     self._workflow_dir_for_issue(issue.id)
@@ -1260,15 +1292,15 @@ class Orchestrator:
                 run = 1
                 self._issue_state_runs[issue.id] = run
 
-            client = self._client_for_issue(issue.id)
-            comment = make_state_comment(
-                state=target_name,
-                run=run,
+            meta = build_attachment_metadata(
+                state=target_name, type="state", run=run,
                 workflow=workflow.name,
                 repo=self._repo_name_for_tracking(issue.id),
             )
-            await client.post_comment(issue.id, comment)
+            await self._upsert_state(issue, meta)
 
+            # Ensure issue is in active Linear state
+            client = self._client_for_issue(issue.id)
             active_state = issue_cfg.linear_states.active
             moved = await client.update_issue_state(issue.id, active_state)
             if not moved:
@@ -1340,8 +1372,13 @@ class Orchestrator:
             tracking: dict | None = None
             comments: list[dict] | None = None
             if not gate_state:
-                comments = await client.fetch_comments(issue.id)
-                tracking = parse_latest_tracking(comments)
+                # Cold-start fallback: attachment first, then comments
+                att_meta = await client.fetch_stokowski_attachment(issue.identifier)
+                if att_meta:
+                    tracking = parse_attachment_state(att_meta)
+                if not tracking or tracking.get("type") != "gate" or tracking.get("status") != "waiting":
+                    comments = await client.fetch_comments(issue.id)
+                    tracking = parse_latest_tracking(comments)
                 if tracking and tracking.get("type") == "gate" and tracking.get("status") == "waiting":
                     gate_state = tracking.get("state", "")
 
@@ -1359,11 +1396,12 @@ class Orchestrator:
 
                     run = self._issue_state_runs.get(issue.id, 1)
                     repo_name = self._repo_name_for_tracking(issue.id)
-                    comment = make_gate_comment(
-                        state=gate_state, status="approved", run=run,
-                        workflow=workflow.name, repo=repo_name,
+                    meta = build_attachment_metadata(
+                        state=gate_state, type="gate", run=run,
+                        workflow=workflow.name, status="approved",
+                        repo=repo_name,
                     )
-                    await client.post_comment(issue.id, comment)
+                    await self._upsert_state(issue, meta)
 
                     self._issue_current_state[issue.id] = gate_state
                     wf_transitions = workflow.transitions.get(gate_state, {})
@@ -1381,11 +1419,13 @@ class Orchestrator:
                     self._issue_current_state[issue.id] = target
                     self._issue_state_runs[issue.id] = 1
 
-                    state_comment = make_state_comment(
-                        state=target, run=1, workflow=workflow.name,
+                    # Upsert state-entry for the approve target
+                    meta = build_attachment_metadata(
+                        state=target, type="state", run=1,
+                        workflow=workflow.name,
                         repo=repo_name,
                     )
-                    await client.post_comment(issue.id, state_comment)
+                    await self._upsert_state(issue, meta)
 
                     active_state = issue_cfg.linear_states.active
                     moved = await client.update_issue_state(issue.id, active_state)
@@ -1413,9 +1453,13 @@ class Orchestrator:
             tracking: dict | None = None
             comments: list[dict] | None = None
             if not gate_state:
-                # Cold-start fallback: fetch comments to find gate state
-                comments = await client.fetch_comments(issue.id)
-                tracking = parse_latest_tracking(comments)
+                # Cold-start fallback: attachment first, then comments
+                att_meta = await client.fetch_stokowski_attachment(issue.identifier)
+                if att_meta:
+                    tracking = parse_attachment_state(att_meta)
+                if not tracking or tracking.get("type") != "gate" or tracking.get("status") != "waiting":
+                    comments = await client.fetch_comments(issue.id)
+                    tracking = parse_latest_tracking(comments)
                 if tracking and tracking.get("type") == "gate" and tracking.get("status") == "waiting":
                     gate_state = tracking.get("state", "")
 
@@ -1451,11 +1495,15 @@ class Orchestrator:
                     repo_name = self._repo_name_for_tracking(issue.id)
                     if max_rework is not None and run >= max_rework:
                         # Exceeded max rework — post escalated comment, don't transition
-                        comment = make_gate_comment(
-                            state=gate_state, status="escalated", run=run,
-                            workflow=workflow.name, repo=repo_name,
+                        meta = build_attachment_metadata(
+                            state=gate_state, type="gate", run=run,
+                            workflow=workflow.name, status="escalated",
+                            repo=repo_name,
                         )
-                        await client.post_comment(issue.id, comment)
+                        human = make_gate_comment(
+                            state=gate_state, status="escalated", run=run,
+                        )
+                        await self._upsert_state(issue, meta, comment=human)
                         logger.warning(
                             f"Max rework exceeded issue={issue.identifier} "
                             f"gate={gate_state} run={run} max={max_rework}"
@@ -1465,19 +1513,24 @@ class Orchestrator:
                     new_run = run + 1
                     self._issue_state_runs[issue.id] = new_run
 
-                    comment = make_gate_comment(
+                    meta = build_attachment_metadata(
+                        state=gate_state, type="gate", run=new_run,
+                        workflow=workflow.name, status="rework",
+                        rework_to=rework_to, repo=repo_name,
+                    )
+                    human = make_gate_comment(
                         state=gate_state, status="rework",
                         rework_to=rework_to, run=new_run,
-                        workflow=workflow.name, repo=repo_name,
+                        workflow=workflow.name,
                     )
-                    await client.post_comment(issue.id, comment)
+                    await self._upsert_state(issue, meta, comment=human)
 
-                    # Post state-entry comment for rework target
-                    state_comment = make_state_comment(
-                        state=rework_to, run=new_run,
+                    # Upsert state-entry for rework target
+                    meta = build_attachment_metadata(
+                        state=rework_to, type="state", run=new_run,
                         workflow=workflow.name, repo=repo_name,
                     )
-                    await client.post_comment(issue.id, state_comment)
+                    await self._upsert_state(issue, meta)
 
                     self._issue_current_state[issue.id] = rework_to
 
@@ -2075,19 +2128,17 @@ class Orchestrator:
                 except Exception as e:
                     logger.warning(f"Failed to move {issue.identifier} to active: {e}")
 
-            # Post state tracking comment (only for first dispatch of a state)
+            # Upsert state tracking (only for first dispatch of a state)
             if state_name:
                 run = self._issue_state_runs.get(issue.id, 1)
                 if run == 1 and (attempt.attempt is None or attempt.attempt == 0):
                     wf = self._get_issue_workflow_config(issue.id)
-                    client = self._client_for_issue(issue.id)
-                    comment = make_state_comment(
-                        state=state_name,
-                        run=run,
+                    meta = build_attachment_metadata(
+                        state=state_name, type="state", run=run,
                         workflow=wf.name,
                         repo=repo.name,
                     )
-                    await client.post_comment(issue.id, comment)
+                    await self._upsert_state(issue, meta)
 
             # Run on_stage_enter hook if defined. Render over repo metadata
             # (same gate as root hooks — only when repos: section is explicit).
@@ -2403,12 +2454,12 @@ class Orchestrator:
     async def _handle_evaluator_exit(
         self, issue: Issue, attempt: RunAttempt, state_cfg: StateConfig
     ) -> str:
-        """Handle evaluator completion: parse tier, post comment, return transition name.
+        """Handle evaluator completion: parse tier, upsert attachment, return transition name.
 
-        Evaluation comment is posted synchronously (awaited) before returning,
+        Evaluation state is upserted synchronously (awaited) before returning,
         to ensure the verdict is persisted for crash recovery and audit.
         """
-        from .tracking import make_evaluation_comment, parse_evaluation_tier
+        from .tracking import parse_evaluation_tier
 
         tier, summary, findings = parse_evaluation_tier(
             attempt.result_text or attempt.last_message or ""
@@ -2418,25 +2469,26 @@ class Orchestrator:
             tier=tier, auto_approve=state_cfg.auto_approve,
         )
 
-        # Post evaluation comment — awaited (not fire-and-forget) because
-        # auto-approve decisions bypass human review and the comment is
+        # Upsert evaluation state — awaited (not fire-and-forget) because
+        # auto-approve decisions bypass human review and the attachment is
         # needed for crash recovery and audit.
         wf = self._get_issue_workflow_config(issue.id)
         run = self._issue_state_runs.get(issue.id, 1)
-        comment = make_evaluation_comment(
-            state=attempt.state_name,
-            tier=tier,
-            summary=summary,
+        meta = build_attachment_metadata(
+            state=attempt.state_name, type="evaluation", run=run,
+            workflow=wf.name, tier=tier, summary=summary,
             findings=findings,
-            run=run,
-            workflow=wf.name,
+            repo=self._repo_name_for_tracking(issue.id),
+        )
+        human = make_evaluation_comment(
+            state=attempt.state_name, tier=tier,
+            summary=summary, findings=findings,
         )
         try:
-            client = self._ensure_linear_client()
-            await client.post_comment(issue.id, comment)
+            await self._upsert_state(issue, meta, comment=human)
         except Exception as e:
             logger.warning(
-                f"Failed to post evaluation comment for {issue.identifier}: {e}"
+                f"Failed to upsert evaluation state for {issue.identifier}: {e}"
             )
 
         logger.info(
