@@ -215,8 +215,7 @@ class TestEvaluationTracking:
             findings=["All tests pass", "No security issues"],
             workflow="default",
         )
-        assert "<!-- stokowski:evaluation" in comment
-        assert '"tier": "approve"' in comment
+        assert comment is None
 
     def test_make_evaluation_comment_review_required(self):
         comment = make_evaluation_comment(
@@ -225,7 +224,8 @@ class TestEvaluationTracking:
             findings=["Missing error handling in API endpoint"],
             workflow="default",
         )
-        assert '"tier": "review-required"' in comment
+        assert comment is not None
+        assert "<!-- stokowski:" not in comment
         assert "Missing error handling" in comment
 
     def test_parse_evaluation_tier_structured(self):
