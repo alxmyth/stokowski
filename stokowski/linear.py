@@ -137,6 +137,39 @@ query($issueId: String!) {
 }
 """
 
+ATTACHMENT_CREATE_MUTATION = """
+mutation AttachmentCreate(
+    $issueId: String!, $url: String!, $title: String!,
+    $subtitle: String, $metadata: JSONObject, $iconUrl: String
+) {
+    attachmentCreate(input: {
+        issueId: $issueId, url: $url, title: $title,
+        subtitle: $subtitle, metadata: $metadata, iconUrl: $iconUrl
+    }) {
+        success
+        attachment { id }
+    }
+}
+"""
+
+ATTACHMENTS_BY_URL_QUERY = """
+query AttachmentsByURL($url: String!) {
+    attachmentsForURL(url: $url) {
+        nodes { id metadata }
+    }
+}
+"""
+
+ATTACHMENT_DELETE_MUTATION = """
+mutation AttachmentDelete($id: String!) {
+    attachmentDelete(id: $id) {
+        success
+    }
+}
+"""
+
+STOKOWSKI_URL_PREFIX = "stokowski://state/"
+
 
 def _parse_datetime(val: str | None) -> datetime | None:
     if not val:
@@ -369,4 +402,62 @@ class LinearClient:
             return success
         except Exception as e:
             logger.error(f"Failed to update state for {issue_id}: {e}")
+            return False
+
+    async def upsert_stokowski_attachment(
+        self, issue_id: str, identifier: str, metadata: dict, subtitle: str
+    ) -> bool:
+        """Create or update the Stokowski state attachment on an issue."""
+        try:
+            data = await self._graphql(
+                ATTACHMENT_CREATE_MUTATION,
+                {
+                    "issueId": issue_id,
+                    "url": f"{STOKOWSKI_URL_PREFIX}{identifier}",
+                    "title": "Stokowski",
+                    "subtitle": subtitle,
+                    "metadata": metadata,
+                },
+            )
+            return data.get("attachmentCreate", {}).get("success", False)
+        except Exception as e:
+            logger.error(f"Failed to upsert attachment for {identifier}: {e}")
+            return False
+
+    async def fetch_stokowski_attachment(
+        self, identifier: str
+    ) -> dict | None:
+        """Fetch the Stokowski state attachment metadata for an issue."""
+        try:
+            data = await self._graphql(
+                ATTACHMENTS_BY_URL_QUERY,
+                {"url": f"{STOKOWSKI_URL_PREFIX}{identifier}"},
+            )
+            nodes = data.get("attachmentsForURL", {}).get("nodes", [])
+            if nodes:
+                return nodes[0].get("metadata")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to fetch attachment for {identifier}: {e}")
+            return None
+
+    async def delete_stokowski_attachment(
+        self, identifier: str
+    ) -> bool:
+        """Delete the Stokowski state attachment for an issue."""
+        try:
+            data = await self._graphql(
+                ATTACHMENTS_BY_URL_QUERY,
+                {"url": f"{STOKOWSKI_URL_PREFIX}{identifier}"},
+            )
+            nodes = data.get("attachmentsForURL", {}).get("nodes", [])
+            if not nodes:
+                return False
+            att_id = nodes[0]["id"]
+            data = await self._graphql(
+                ATTACHMENT_DELETE_MUTATION, {"id": att_id}
+            )
+            return data.get("attachmentDelete", {}).get("success", False)
+        except Exception as e:
+            logger.error(f"Failed to delete attachment for {identifier}: {e}")
             return False
