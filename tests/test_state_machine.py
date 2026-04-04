@@ -598,84 +598,95 @@ class TestWorkflowTransitionDerivation:
 
 
 class TestTrackingWorkflowField:
-    def test_state_comment_with_workflow_includes_field(self):
-        comment = make_state_comment("implement", run=1, workflow="quick-fix")
-        assert '"workflow": "quick-fix"' in comment
+    """Tests for tracking workflow field.
 
-    def test_state_comment_without_workflow_omits_field(self):
-        comment = make_state_comment("implement", run=1)
-        assert '"workflow"' not in comment
+    After the comment refactor, make_state_comment() returns None and
+    make_gate_comment() returns None for waiting/approved. Tests that
+    relied on round-tripping through comments now use raw HTML comments
+    (the legacy format) to test parse_latest_tracking() directly.
+    """
 
-    def test_state_comment_with_workflow_human_text(self):
-        comment = make_state_comment("implement", run=2, workflow="full-ce")
-        assert "(workflow: full-ce, run 2)" in comment
+    def test_state_comment_returns_none(self):
+        assert make_state_comment("implement", run=1, workflow="quick-fix") is None
 
-    def test_state_comment_without_workflow_human_text(self):
-        comment = make_state_comment("implement", run=1)
-        assert "(run 1)" in comment
-        assert "workflow" not in comment.split("\n\n")[1]  # human-readable part
+    def test_state_comment_without_workflow_returns_none(self):
+        assert make_state_comment("implement", run=1) is None
 
-    def test_parse_extracts_workflow_from_state_comment(self):
-        comment = make_state_comment("implement", run=1, workflow="quick-fix")
-        result = parse_latest_tracking([{"body": comment}])
+    def test_parse_extracts_workflow_from_legacy_state_comment(self):
+        """parse_latest_tracking still works with legacy HTML comments."""
+        import json
+        body = '<!-- stokowski:state {"state": "implement", "run": 1, "workflow": "quick-fix"} -->'
+        result = parse_latest_tracking([{"body": body}])
         assert result is not None
         assert result["workflow"] == "quick-fix"
         assert result["type"] == "state"
         assert result["state"] == "implement"
 
     def test_parse_returns_none_workflow_from_old_format(self):
-        comment = make_state_comment("implement", run=1)
-        result = parse_latest_tracking([{"body": comment}])
+        import json
+        body = '<!-- stokowski:state {"state": "implement", "run": 1} -->'
+        result = parse_latest_tracking([{"body": body}])
         assert result is not None
         assert result["workflow"] is None
         assert result["state"] == "implement"
 
-    def test_gate_comment_with_workflow(self):
+    def test_gate_waiting_returns_none(self):
         comment = make_gate_comment(
             "review-gate", "waiting", prompt="Review the PR",
             rework_to="implement", run=1, workflow="full-ce",
         )
-        assert '"workflow": "full-ce"' in comment
-        assert "Awaiting human review" in comment
+        assert comment is None
 
-    def test_gate_comment_without_workflow_omits_field(self):
-        comment = make_gate_comment(
-            "review-gate", "waiting", run=1,
-        )
-        assert '"workflow"' not in comment
-
-    def test_gate_comment_parse_extracts_workflow(self):
+    def test_gate_approved_returns_none(self):
         comment = make_gate_comment(
             "review-gate", "approved", run=1, workflow="full-ce",
         )
-        result = parse_latest_tracking([{"body": comment}])
-        assert result is not None
-        assert result["type"] == "gate"
-        assert result["workflow"] == "full-ce"
+        assert comment is None
 
-    def test_gate_comment_parse_old_format(self):
-        comment = make_gate_comment("review-gate", "approved", run=1)
-        result = parse_latest_tracking([{"body": comment}])
-        assert result is not None
-        assert result["type"] == "gate"
-        assert result["workflow"] is None
-
-    def test_round_trip_state_comment(self):
-        """Create a state comment with workflow, parse it back, verify workflow."""
-        comment = make_state_comment("plan", run=3, workflow="quick-fix")
-        result = parse_latest_tracking([{"body": comment}])
-        assert result is not None
-        assert result["workflow"] == "quick-fix"
-        assert result["state"] == "plan"
-        assert result["run"] == 3
-
-    def test_round_trip_gate_comment(self):
-        """Create a gate comment with workflow, parse it back, verify workflow."""
+    def test_gate_rework_returns_human_text(self):
         comment = make_gate_comment(
             "review", "rework", rework_to="implement",
             run=2, workflow="full-ce",
         )
-        result = parse_latest_tracking([{"body": comment}])
+        assert comment is not None
+        assert "<!-- stokowski:" not in comment
+        assert "Rework" in comment
+        assert "implement" in comment
+
+    def test_gate_escalated_returns_human_text(self):
+        comment = make_gate_comment(
+            "review-gate", "escalated", run=5,
+        )
+        assert comment is not None
+        assert "<!-- stokowski:" not in comment
+        assert "escalat" in comment.lower()
+
+    def test_parse_gate_comment_from_legacy_format(self):
+        """parse_latest_tracking still works with legacy gate HTML comments."""
+        body = '<!-- stokowski:gate {"state": "review-gate", "status": "approved", "run": 1, "workflow": "full-ce"} -->'
+        result = parse_latest_tracking([{"body": body}])
+        assert result is not None
+        assert result["type"] == "gate"
+        assert result["workflow"] == "full-ce"
+
+    def test_parse_gate_comment_old_format_no_workflow(self):
+        body = '<!-- stokowski:gate {"state": "review-gate", "status": "approved", "run": 1} -->'
+        result = parse_latest_tracking([{"body": body}])
+        assert result is not None
+        assert result["type"] == "gate"
+        assert result["workflow"] is None
+
+    def test_round_trip_gate_rework_comment(self):
+        """Gate rework still returns human text; parse_latest_tracking uses legacy format."""
+        comment = make_gate_comment(
+            "review", "rework", rework_to="implement",
+            run=2, workflow="full-ce",
+        )
+        assert comment is not None
+        assert "Rework" in comment
+        # Legacy format still parseable
+        body = '<!-- stokowski:gate {"state": "review", "status": "rework", "rework_to": "implement", "run": 2, "workflow": "full-ce"} -->'
+        result = parse_latest_tracking([{"body": body}])
         assert result is not None
         assert result["workflow"] == "full-ce"
         assert result["state"] == "review"
@@ -683,12 +694,12 @@ class TestTrackingWorkflowField:
         assert result["rework_to"] == "implement"
 
     def test_latest_comment_wins(self):
-        """When multiple tracking comments exist, the latest one wins."""
-        old_comment = make_state_comment("plan", run=1, workflow="triage")
-        new_comment = make_state_comment("implement", run=1, workflow="quick-fix")
+        """When multiple legacy tracking comments exist, the latest one wins."""
+        old_body = '<!-- stokowski:state {"state": "plan", "run": 1, "workflow": "triage"} -->'
+        new_body = '<!-- stokowski:state {"state": "implement", "run": 1, "workflow": "quick-fix"} -->'
         result = parse_latest_tracking([
-            {"body": old_comment},
-            {"body": new_comment},
+            {"body": old_body},
+            {"body": new_body},
         ])
         assert result is not None
         assert result["workflow"] == "quick-fix"

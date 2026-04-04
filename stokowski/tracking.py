@@ -24,13 +24,15 @@ _TIER_FALLBACK = re.compile(
 def make_state_comment(state: str, run: int = 1, workflow: str | None = None) -> str:
     """Build a structured state-tracking comment.
 
-    The workflow name rides along so a restart can recover which pipeline an
-    in-flight issue was running. Without it, `_resolve_current_state` would
-    re-route from labels — and a label edited mid-run would silently move the
-    issue onto a different state machine.
+    The optional ``repo`` field carries the name of the repo resolved
+    at dispatch time. It's used by cold-start recovery to restore the
+    repo assignment after an orchestrator restart. Pre-multi-repo
+    attachments have no ``repo`` field — readers MUST use
+    ``metadata.get("repo")``, never direct subscript.
     """
-    payload: dict[str, Any] = {
+    meta: dict[str, Any] = {
         "state": state,
+        "type": type,
         "run": run,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -38,20 +40,40 @@ def make_state_comment(state: str, run: int = 1, workflow: str | None = None) ->
         payload["workflow"] = workflow
 
     if workflow is not None:
-        payload["workflow"] = workflow
+        meta["workflow"] = workflow
     if repo is not None:
-        payload["repo"] = repo
-    machine = f"<!-- stokowski:state {json.dumps(payload)} -->"
-    if workflow is not None:
-        human = (
-            f"**[Stokowski]** Entering state: **{state}** "
-            f"(workflow: {workflow}, run {run})"
-        )
-    else:
-        human = f"**[Stokowski]** Entering state: **{state}** (run {run})"
-    if workflow:
-        human += f" · workflow `{workflow}`"
-    return f"{machine}\n\n{human}"
+        meta["repo"] = repo
+    if session_id is not None:
+        meta["session_id"] = session_id
+    if status is not None:
+        meta["status"] = status
+    if rework_to is not None:
+        meta["rework_to"] = rework_to
+    if tier is not None:
+        meta["tier"] = tier
+    if summary is not None:
+        meta["summary"] = summary
+    if findings is not None:
+        meta["findings"] = findings
+    return meta
+
+
+def parse_attachment_state(metadata: dict | None) -> dict[str, Any] | None:
+    """Convert attachment metadata to the same format as parse_latest_tracking()."""
+    if not metadata or "state" not in metadata:
+        return None
+    result = dict(metadata)
+    result.setdefault("type", "state")
+    result.setdefault("workflow", None)
+    result.setdefault("repo", None)
+    return result
+
+
+def make_state_comment(
+    state: str, run: int = 1, workflow: str | None = None
+) -> str | None:
+    """State transitions are silent -- conveyed by Linear ticket state change."""
+    return None
 
 
 def make_gate_comment(
@@ -61,49 +83,22 @@ def make_gate_comment(
     rework_to: str | None = None,
     run: int = 1,
     workflow: str | None = None,
-    repo: str | None = None,
-) -> str:
-    """Build a structured gate-tracking comment.
-
-    See ``make_state_comment`` for the ``repo`` field contract.
-    """
-    payload: dict[str, Any] = {
-        "state": state,
-        "status": status,
-        "run": run,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    if rework_to:
-        payload["rework_to"] = rework_to
-    if workflow is not None:
-        payload["workflow"] = workflow
-    if repo is not None:
-        payload["repo"] = repo
-
-    machine = f"<!-- stokowski:gate {json.dumps(payload)} -->"
-
-    if status == "waiting":
-        human = f"**[Stokowski]** Awaiting human review: **{state}**"
-        if prompt:
-            human += f" — {prompt}"
-    elif status == "approved":
-        human = f"**[Stokowski]** Gate **{state}** approved."
-    elif status == "rework":
-        human = (
-            f"**[Stokowski]** Rework requested at **{state}**. "
-            f"Returning to: **{rework_to}**"
+) -> str | None:
+    """Human-readable gate comment for rework/escalation only. None for waiting/approved."""
+    if status == "rework":
+        text = (
+            f"**[Stokowski]** Rework requested at **{state}** "
+            f"— returning to **{rework_to}**"
         )
         if run > 1:
-            human += f" (run {run})"
+            text += f" (run {run})"
+        return text
     elif status == "escalated":
-        human = (
+        return (
             f"**[Stokowski]** Max rework exceeded at **{state}**. "
             f"Escalating for human intervention."
         )
-    else:
-        human = f"**[Stokowski]** Gate **{state}** status: {status}"
-
-    return f"{machine}\n\n{human}"
+    return None
 
 
 def _oldest_first(comments: list[dict]) -> list[dict]:
@@ -219,35 +214,18 @@ def make_evaluation_comment(
     findings: list[str] | None = None,
     run: int = 1,
     workflow: str | None = None,
-) -> str:
-    """Build a structured evaluation tracking comment."""
-    payload: dict[str, Any] = {
-        "state": state,
-        "tier": tier,
-        "summary": summary,
-        "findings": findings or [],
-        "run": run,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    if workflow is not None:
-        payload["workflow"] = workflow
-
-    machine = f"<!-- stokowski:evaluation {json.dumps(payload)} -->"
-
-    if tier == "approve":
-        human = f"**[Stokowski]** Evaluation of **{state}**: **APPROVE**"
-    else:
-        human = f"**[Stokowski]** Evaluation of **{state}**: **REVIEW REQUIRED**"
-
+) -> str | None:
+    """Human-readable evaluation comment for review-required only. None for approve."""
+    if tier != "review-required":
+        return None
+    text = f"**[Stokowski]** Evaluation flagged {len(findings or [])} concern(s)"
     if summary:
-        human += f"\n\n{summary}"
-
+        text += f"\n\n{summary}"
     if findings:
-        human += "\n\n**Findings:**\n"
+        text += "\n\n**Findings:**\n"
         for finding in findings:
-            human += f"- {finding}\n"
-
-    return f"{machine}\n\n{human}"
+            text += f"- {finding}\n"
+    return text
 
 
 def parse_evaluation_tier(
