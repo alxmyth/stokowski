@@ -31,7 +31,7 @@ stokowski/
   orchestrator.py  Main poll loop, dispatch, reconciliation, retry
   prompt.py        Three-layer prompt assembly for state machine workflows
   runner.py        Claude Code CLI integration, stream-json parser
-  tracking.py      State machine tracking via structured Linear comments
+  tracking.py      State machine tracking via Linear attachments + conditional comments
   workspace.py     Per-issue workspace lifecycle and hooks
   web.py           Optional FastAPI dashboard
   main.py          CLI entry point, keyboard handler
@@ -84,14 +84,14 @@ Each workflow defines a set of internal states that map to Linear states. States
 2. **Stage prompt** — state-specific instructions loaded from the state's `prompt` path
 3. **Lifecycle injection** — auto-generated section with issue metadata, transitions, rework context, and recent comments
 
-**Gate protocol:** When an agent completes a state that transitions to a gate, Stokowski moves the issue to the gate's Linear state and posts a structured tracking comment. Humans approve or request rework via Linear state changes. On approval, Stokowski advances to the gate's `approve` transition target. On rework, it returns to the gate's `rework_to` state.
+**Gate protocol:** When an agent completes a state that transitions to a gate, Stokowski moves the issue to the gate's Linear state and upserts the attachment. Humans approve or request rework via Linear state changes. On approval, Stokowski advances to the gate's `approve` transition target. On rework, it returns to the gate's `rework_to` state and posts a human-readable comment noting the rejection.
 
-**Structured comment tracking:** State transitions and gate decisions are persisted as HTML comments on Linear issues (`<!-- stokowski:state {...} -->` and `<!-- stokowski:gate {...} -->`). These enable crash recovery and provide context for rework runs.
+**Attachment-based state tracking:** The state machine position is stored in a Linear Attachment (`stokowski://state/{identifier}`) with a `metadata` JSON field (API-only, invisible in UI). `_upsert_state()` in the orchestrator is the single entry point for state persistence — it upserts the attachment and conditionally posts a human-readable comment. Comments fire only when they carry information the Linear ticket state does not convey: rework requested (which gate rejected, where work returns to), escalation (max rework exceeded), or evaluation findings (review-required tier). State transitions, gate waiting, gate approved, and evaluation approve are all silent. Crash recovery reads the attachment first (`fetch_stokowski_attachment`), falling back to legacy comment scanning (`parse_latest_tracking`) during migration from pre-attachment issues.
 
 ### Evaluator state type (agent-evaluates-agent)
 Evaluators are first-class states (`type: evaluator`) that sit in the workflow path before gates. They run like agents (subprocess, prompt, concurrency tracking) but parse their output for a tier verdict (`approve` or `review-required`). On `approve` + `auto_approve: true`, the evaluator transitions past the gate directly to the gate's approve target. Otherwise, it enters the gate for human review. This is the Compound Engineering pattern — staged AI pipelines where each stage validates the previous one.
 
-**Evaluation output contract:** The evaluator must emit `<!-- stokowski:evaluation {"tier": "...", "summary": "...", "findings": [...]} -->` in its result text. Stokowski parses this using last-match semantics (same as `TRANSITION_PATTERN`). Fallback keyword search always returns `review-required`. Parse failure defaults to `review-required` (fail-safe).
+**Evaluation output contract:** The evaluator must emit `<!-- stokowski:evaluation {"tier": "...", "summary": "...", "findings": [...]} -->` in its result text. Stokowski parses this using last-match semantics (same as `TRANSITION_PATTERN`). Fallback keyword search always returns `review-required`. Parse failure defaults to `review-required` (fail-safe). A human-readable comment with findings is posted only for `review-required` tier; `approve` tier is silent (the attachment records the verdict).
 
 **Known limitation:** Fresh session prevents anchoring to the agent's conversational reasoning, but the evaluator still reads the agent's artifacts (code, comments, commit messages). This is a "second pass" not an "independent audit."
 
@@ -255,13 +255,15 @@ Three-layer prompt assembly for state machine workflows. Main entry point is `as
 **`assemble_prompt()`** orchestrates the three layers: loads and renders global prompt, loads and renders stage prompt, generates lifecycle section, joins with double newlines.
 
 ### tracking.py
-State machine tracking via structured Linear comments:
-- `make_state_comment(state, run)` — builds state entry comment with hidden JSON (`<!-- stokowski:state {...} -->`) + human-readable text
-- `make_gate_comment(state, status, prompt, rework_to, run)` — builds gate status comment (waiting/approved/rework/escalated)
-- `parse_latest_tracking(comments)` — scans comments (oldest-first) to find latest state or gate tracking entry for crash recovery
+State machine tracking via Linear attachments and conditional comments:
+- `build_attachment_metadata(state, run, extras)` — builds the metadata dict stored on the Linear Attachment
+- `parse_attachment_state(metadata)` — converts attachment metadata back to the tracking format used by the orchestrator for crash recovery
+- `make_state_comment(state, run)` — returns `None` (state transitions are silent; the attachment is the SoT)
+- `make_gate_comment(state, status, prompt, rework_to, run)` — returns human-readable text for `rework` and `escalated` statuses only; returns `None` for `waiting` and `approved`
+- `make_evaluation_comment(state, tier, summary, findings, run, workflow)` — returns human-readable text with findings for `review-required` tier only; returns `None` for `approve` tier
+- `parse_latest_tracking(comments)` — legacy fallback: scans comments (oldest-first) to find latest state or gate tracking entry for crash recovery of pre-attachment issues
 - `get_last_tracking_timestamp(comments)` — finds the timestamp of the latest tracking comment
 - `get_comments_since(comments, since_timestamp)` — filters to non-tracking comments after a given timestamp (used to gather review feedback for rework runs)
-- `make_evaluation_comment(state, tier, summary, findings, run, workflow)` — builds evaluation tracking comment with hidden JSON (`<!-- stokowski:evaluation {...} -->`) + human-readable text
 - `parse_evaluation_tier(result_text)` — extracts tier, summary, findings from agent result; uses last-match semantics; fallback always returns review-required
 
 ---
@@ -270,7 +272,7 @@ State machine tracking via structured Linear comments:
 
 ```
 workflow.yaml parsed → states + config loaded
-    → Linear poll → Issue fetched → state resolved from tracking comments
+    → Linear poll → Issue fetched → state resolved from attachment (fallback: tracking comments)
     → _dispatch() called
         → RunAttempt created in self.running
         → _run_worker() task spawned
@@ -281,7 +283,7 @@ workflow.yaml parsed → states + config loaded
                 → NDJSON streamed: tool_use events, assistant messages, result
                 → session_id captured for next turn
             → _on_worker_exit() called
-                → state transition on success → tracking comment posted
+                → state transition on success → attachment upserted + conditional comment
                 → tokens/timing aggregated
                 → retry or continuation scheduled
 ```
@@ -368,9 +370,11 @@ An automated test suite lives in `tests/` covering config parsing/validation, wo
 - **Multi-repo: tracking comments `repo` field uses defensive read**: `parse_latest_tracking` applies `setdefault("repo", None)`. Readers MUST use `tracking.get("repo") or fallback` — never `tracking["repo"]`. Pre-multi-repo comments don't carry the field; cold-start recovery relies on the fallback and posts a one-time migration notice.
 - **Evaluator `session` should be `fresh`**: Using `inherit` lets the evaluator see the prior agent's conversation, which defeats the adversarial review purpose. `validate_config()` warns but does not error. Evaluators default to `session: fresh` when not explicitly set.
 - **Evaluator must be followed by a gate**: An evaluator not followed by a gate in the workflow path is a validation error — the approve transition has no gate to skip.
-- **Evaluation output parsing is best-effort**: If the evaluator doesn't produce a `<!-- stokowski:evaluation {...} -->` comment, the tier defaults to `review-required` (fail-safe). Check agent logs if evaluations always fall to human review.
+- **Evaluation output parsing is best-effort**: If the evaluator doesn't produce a `<!-- stokowski:evaluation {...} -->` marker in its result text, the tier defaults to `review-required` (fail-safe). Check agent logs if evaluations always fall to human review.
 - **`result_text` vs `last_message`**: `RunAttempt.last_message` is truncated to 200 chars. Evaluator tier parsing uses `result_text` (full text from the result event, capped at 10K). If you add new fields to RunAttempt that are populated in `_process_event`, they don't need cleanup in `_cleanup_issue_state` — RunAttempt is per-dispatch, not per-issue.
 - **Evaluators consume agent concurrency slots**: Evaluators are real agent subprocesses. Operators with high gate throughput should set per-state limits (e.g., `eval-merge: 1`) to avoid starving implementation agents.
-- **Evaluator findings are not shown during rework**: Evaluation tracking comments are filtered by `get_comments_since()` (it excludes all `<!-- stokowski:` comments). If a gate sends work back, the rework agent sees gate reviewer comments but not evaluator findings. This is a known limitation.
+- **Evaluator findings are visible during rework**: When an evaluation results in `review-required`, a human-readable comment with findings is posted. If the gate then sends work back, the rework agent sees both the evaluator findings and any gate reviewer comments via `get_comments_since()`.
 - **`_transition()` handles evaluators in the `else` branch**: Evaluator states are intentionally handled by the catch-all agent branch in `_transition()`. The comment says "Agent or evaluator state." Do not add a separate `elif` for evaluators unless the behavior needs to diverge.
-- **Evaluation comment posting is synchronous (awaited)**: Unlike regular agent tracking via `_fire_and_forget`, `_handle_evaluator_exit()` awaits the `post_comment` call before transitioning. This prevents a crash-recovery gap where the evaluation verdict is lost.
+- **Attachment is the SoT for crash recovery**: State machine position is stored in a Linear Attachment (`stokowski://state/{identifier}`) with metadata JSON. `_upsert_state()` centralizes attachment upsert + conditional comment posting. Comments no longer contain `<!-- stokowski:...-->` JSON payloads — they are human-readable only.
+- **Terminal state deletes the attachment**: When an issue reaches a terminal state, the attachment is removed to keep Linear clean. Workspace cleanup happens separately.
+- **`parse_latest_tracking()` still needed for migration**: Pre-attachment issues store state in HTML comment payloads. The legacy comment scanner is the fallback when no attachment is found. It can be removed once all active issues have been migrated.
