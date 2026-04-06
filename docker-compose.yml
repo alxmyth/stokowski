@@ -33,6 +33,17 @@ services:
       - "${STOKOWSKI_PORT:-4200}:4200"
     command: ["--port", "4200"]
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4200/api/v1/state"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
 # Per-issue workspace volumes (stokowski-ws-*) are created dynamically
 # by the orchestrator via `docker volume create`. The sessions volume
