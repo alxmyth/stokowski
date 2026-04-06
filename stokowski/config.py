@@ -268,6 +268,11 @@ class ServiceConfig:
     states: dict[str, StateConfig] = field(default_factory=dict)
     workflows: dict[str, WorkflowConfig] = field(default_factory=dict)
 
+    @property
+    def docker_if_enabled(self) -> DockerConfig | None:
+        """Return docker config only when enabled, else None."""
+        return self.docker if self.docker.enabled else None
+
     def resolved_api_key(self) -> str:
         key = self.tracker.api_key
         if not key:
@@ -312,9 +317,8 @@ class ServiceConfig:
             if ak:
                 env["ANTHROPIC_API_KEY"] = ak
         for var_name in self.docker.extra_env:
-            val = os.environ.get(var_name, "")
-            if val:
-                env[var_name] = val
+            if var_name in os.environ:
+                env[var_name] = os.environ[var_name]
         return env
 
     @property
