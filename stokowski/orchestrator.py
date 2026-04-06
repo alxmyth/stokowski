@@ -763,7 +763,7 @@ class Orchestrator:
                         )
                         await remove_workspace(
                             ws_root, issue.identifier, repo.name, rendered_hooks,
-                            docker_cfg=pcfg.docker if pcfg.docker.enabled else None,
+                            docker_cfg=pcfg.docker_if_enabled,
                         )
             except Exception as e:
                 logger.warning(f"Startup cleanup failed for {slug} (continuing): {e}")
@@ -1248,7 +1248,7 @@ class Orchestrator:
                 )
                 await remove_workspace(
                     ws_root, issue.identifier, repo.name, rendered_hooks,
-                    docker_cfg=issue_cfg.docker if issue_cfg.docker.enabled else None,
+                    docker_cfg=issue_cfg.docker_if_enabled,
                 )
             except Exception as e:
                 logger.warning(f"Failed to remove workspace for {issue.identifier}: {e}", extra={"linked_to": issue.identifier})
@@ -2221,7 +2221,7 @@ class Orchestrator:
                 return
             ws = await ensure_workspace(
                 ws_root, issue.identifier, repo.name, rendered_hooks,
-                docker_cfg=cfg.docker if cfg.docker.enabled else None,
+                docker_cfg=cfg.docker_if_enabled,
                 docker_image=docker_image,
             )
             attempt.workspace_path = str(ws.path)
@@ -2292,7 +2292,7 @@ class Orchestrator:
                     ws.path,
                     (state_cfg.hooks.timeout_ms if state_cfg.hooks else cfg.hooks.timeout_ms),
                     f"on_stage_enter:{state_name}",
-                    docker_cfg=cfg.docker if cfg.docker.enabled else None,
+                    docker_cfg=cfg.docker_if_enabled,
                     docker_image=docker_image,
                     workspace_key=ws.workspace_key,
                 )
@@ -3067,7 +3067,7 @@ class Orchestrator:
                         )
                         await remove_workspace(
                             ws_root, cached.identifier, repo.name, rendered_hooks,
-                            docker_cfg=issue_cfg.docker if issue_cfg.docker.enabled else None,
+                            docker_cfg=issue_cfg.docker_if_enabled,
                         )
                     self._cleanup_issue_state(issue_id)
                 continue
@@ -3096,7 +3096,7 @@ class Orchestrator:
                         )
                         await remove_workspace(
                             ws_root, attempt.issue_identifier, repo.name, rendered_hooks,
-                            docker_cfg=issue_cfg.docker if issue_cfg.docker.enabled else None,
+                            docker_cfg=issue_cfg.docker_if_enabled,
                         )
                 else:
                     cached = self._last_issues.get(issue_id)
@@ -3110,7 +3110,7 @@ class Orchestrator:
                         )
                         await remove_workspace(
                             ws_root, cached.identifier, repo.name, rendered_hooks,
-                            docker_cfg=issue_cfg.docker if issue_cfg.docker.enabled else None,
+                            docker_cfg=issue_cfg.docker_if_enabled,
                         )
 
                 self._cleanup_issue_state(issue_id)
