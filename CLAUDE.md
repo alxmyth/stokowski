@@ -215,7 +215,7 @@ Optional FastAPI app returned by `create_app(orch)`. Routes:
 - `GET /api/v1/{issue_identifier}` — single issue state
 - `POST /api/v1/refresh` — triggers `orch._tick()` immediately
 
-Dashboard JS polls `/api/v1/state` every 3s and updates the DOM without page reload.
+Dashboard JS polls `/api/v1/state` every 3s and updates the DOM without page reload. Agent cards are clickable — expanding an accordion with token breakdown (input/output), elapsed time, session ID, container name (Docker mode), and full untruncated last message. The `expandedCards` Set preserves accordion state across refreshes. Each card also shows a workflow progress indicator (`implement › eval-code › gate-merge › done`) with the current state highlighted. The API snapshot includes a `workflows` dict (workflow name → path + terminal_state) and `docker_enabled` flag so the frontend can render these without extra requests.
 
 Uvicorn is started as an `asyncio.create_task` with `install_signal_handlers` monkey-patched to a no-op to prevent it hijacking SIGINT/SIGTERM. On shutdown, `server.should_exit = True` is set and the task is awaited with a 2s timeout.
 
