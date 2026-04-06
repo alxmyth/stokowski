@@ -242,6 +242,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     gap: 16px;
     align-items: start;
     transition: background 0.15s;
+    cursor: pointer;
   }
 
   .agent-card:hover {
@@ -319,6 +320,125 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     font-size: 11px;
     color: var(--muted);
     font-weight: 300;
+  }
+
+  /* ── Workflow progress ── */
+  .workflow-steps {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    margin-top: 8px;
+    font-size: 10px;
+    font-weight: 400;
+    letter-spacing: 0.04em;
+  }
+
+  .wf-step {
+    color: var(--dim);
+    padding: 1px 6px;
+    border-radius: 2px;
+    white-space: nowrap;
+  }
+
+  .wf-step.current {
+    color: var(--amber);
+    background: rgba(232, 184, 75, 0.1);
+    font-weight: 600;
+  }
+
+  .wf-step.done {
+    color: var(--muted);
+  }
+
+  .wf-arrow {
+    color: var(--border-hi);
+    font-size: 9px;
+    margin: 0 2px;
+  }
+
+  /* ── Docker badge ── */
+  .docker-badge {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--blue);
+    border: 1px solid rgba(91,156,246,.2);
+    background: rgba(91,156,246,.06);
+    padding: 1px 5px;
+    border-radius: 2px;
+    margin-left: 8px;
+  }
+
+  /* ── Accordion detail ── */
+  .agent-detail {
+    display: none;
+    grid-column: 1 / -1;
+    padding: 16px 0 4px;
+    border-top: 1px solid var(--border);
+    margin-top: 12px;
+  }
+
+  .agent-card.expanded .agent-detail {
+    display: block;
+  }
+
+  .detail-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px 32px;
+  }
+
+  .detail-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .detail-label {
+    font-size: 9px;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .detail-value {
+    font-size: 12px;
+    color: var(--text);
+    font-weight: 400;
+    word-break: break-all;
+  }
+
+  .detail-value.dim {
+    color: var(--muted);
+    font-weight: 300;
+  }
+
+  .detail-message {
+    grid-column: 1 / -1;
+    margin-top: 4px;
+  }
+
+  .detail-message-text {
+    font-size: 12px;
+    color: var(--text);
+    font-weight: 300;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 200px;
+    overflow-y: auto;
+    background: var(--bg);
+    padding: 10px 14px;
+    border-radius: 2px;
+    border: 1px solid var(--border);
+  }
+
+  .detail-error {
+    color: var(--red);
+    font-weight: 400;
   }
 
   /* ── Empty state ── */
@@ -521,61 +641,146 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     return `<span class="status-pill ${cls}">${label}</span>`;
   }
 
+  // Track which cards are expanded across refreshes
+  const expandedCards = new Set();
+
+  function toggleCard(id) {
+    if (expandedCards.has(id)) expandedCards.delete(id);
+    else expandedCards.add(id);
+    const el = document.getElementById('card-' + id);
+    if (el) el.classList.toggle('expanded');
+  }
+
+  function renderWorkflow(stateName, workflowName, workflows) {
+    if (!workflowName || !workflows || !workflows[workflowName]) return '';
+    const path = workflows[workflowName].path || [];
+    const terminal = workflows[workflowName].terminal_state || '';
+    if (path.length === 0) return '';
+    const allSteps = [...path, terminal].filter(Boolean);
+    const currentIdx = allSteps.indexOf(stateName);
+    const steps = allSteps.map((s, i) => {
+      let cls = 'wf-step';
+      if (i === currentIdx) cls += ' current';
+      else if (currentIdx >= 0 && i < currentIdx) cls += ' done';
+      return '<span class="' + cls + '">' + esc(s) + '</span>';
+    }).join('<span class="wf-arrow">&#x203A;</span>');
+    return '<div class="workflow-steps">' + steps + '</div>';
+  }
+
+  function fmtElapsed(isoStr) {
+    if (!isoStr) return '—';
+    const s = (Date.now() - new Date(isoStr).getTime()) / 1000;
+    return fmtSecs(Math.max(0, s));
+  }
+
+  function renderDetail(r, dockerEnabled) {
+    const tokIn = r.tokens?.input_tokens || 0;
+    const tokOut = r.tokens?.output_tokens || 0;
+    const items = [
+      ['Tokens In', fmt(tokIn)],
+      ['Tokens Out', fmt(tokOut)],
+      ['Elapsed', fmtElapsed(r.started_at)],
+      ['Turns', String(r.turn_count || 0)],
+    ];
+    if (r.session_id)
+      items.push(['Session', esc(r.session_id)]);
+    if (dockerEnabled && r.container_name)
+      items.push(['Container', esc(r.container_name)]);
+
+    let grid = '';
+    for (const [l,v] of items) {
+      grid += '<div class="detail-item"><span class="detail-label">'
+        + l + '</span><span class="detail-value">' + v + '</span></div>';
+    }
+
+    if (r.error) {
+      grid += '<div class="detail-item"><span class="detail-label">Error</span>'
+        + '<span class="detail-value detail-error">' + esc(r.error) + '</span></div>';
+    }
+
+    if (r.last_message) {
+      grid += '<div class="detail-message"><span class="detail-label">Last Message</span>'
+        + '<div class="detail-message-text">' + esc(r.last_message) + '</div></div>';
+    }
+
+    return '<div class="agent-detail"><div class="detail-grid">' + grid + '</div></div>';
+  }
+
   function renderAgents(data) {
+    const workflows = data.workflows || {};
+    const dockerEnabled = data.docker_enabled || false;
+    const container = document.getElementById('agents-container');
+
     const all = [
       ...(data.running || []),
-      ...(data.retrying || []).map(r => ({
+      ...(data.retrying || []).map(function(r) { return {
         issue_identifier: r.issue_identifier,
+        issue_id: r.issue_id,
         status: 'retrying',
         turn_count: r.attempt,
-        tokens: { total_tokens: 0 },
+        tokens: { total_tokens: 0, input_tokens: 0, output_tokens: 0 },
         last_message: r.error || 'waiting to retry...',
         session_id: null,
-      })),
-      ...(data.gates || []).map(g => ({
+        container_name: null,
+        state_name: null,
+        workflow: null,
+        started_at: null,
+        error: r.error,
+      }}),
+      ...(data.gates || []).map(function(g) { return {
         issue_identifier: g.issue_identifier,
+        issue_id: g.issue_id,
         status: 'gate',
         state_name: g.gate_state,
         turn_count: g.run,
-        tokens: { total_tokens: 0 },
+        tokens: { total_tokens: 0, input_tokens: 0, output_tokens: 0 },
         last_message: 'Awaiting human review',
         session_id: null,
-      })),
+        container_name: null,
+        workflow: g.workflow,
+        started_at: null,
+        error: null,
+      }}),
     ];
 
     document.getElementById('agent-count').textContent = all.length;
 
     if (all.length === 0) {
-      document.getElementById('agents-container').innerHTML = `
-        <div class="empty">
-          <div class="empty-title">No active agents</div>
-          <div class="empty-sub">Move a Linear issue to Todo or In Progress to start</div>
-        </div>`;
+      container.textContent = '';
+      var emptyDiv = document.createElement('div');
+      emptyDiv.className = 'empty';
+      emptyDiv.innerHTML = '<div class="empty-title">No active agents</div>'
+        + '<div class="empty-sub">Move a Linear issue to Todo or In Progress to start</div>';
+      container.appendChild(emptyDiv);
       return;
     }
 
-    const rows = all.map(r => {
-      const stateInfo = r.state_name ? `<span style="color:var(--muted);font-size:11px;margin-left:8px">${esc(r.state_name)}</span>` : '';
-      return `
-      <div class="agent-card">
-        <div>
-          <div class="agent-id">${esc(r.issue_identifier)}</div>
-        </div>
-        <div>
-          <div class="agent-status-row">
-            ${statusPill(r.status)}${stateInfo}
-          </div>
-          <div class="agent-msg">${esc(r.last_message || '—')}</div>
-        </div>
-        <div class="agent-meta">
-          <div class="agent-tokens">${fmt(r.tokens?.total_tokens || 0)} tok</div>
-          <div class="agent-turns">turn ${r.turn_count || 0}</div>
-        </div>
-      </div>`;
-    }).join('');
+    var rows = '';
+    for (const r of all) {
+      const cardId = (r.issue_identifier || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+      const expanded = expandedCards.has(cardId) ? ' expanded' : '';
+      const dockerBadge = dockerEnabled && r.container_name
+        ? '<span class="docker-badge">docker</span>' : '';
+      const wfHtml = renderWorkflow(r.state_name, r.workflow, workflows);
 
-    document.getElementById('agents-container').innerHTML =
-      `<div class="agents">${rows}</div>`;
+      rows += '<div class="agent-card' + expanded + '" id="card-' + cardId
+        + '" onclick="toggleCard(\'' + cardId + '\')">'
+        + '<div><div class="agent-id">' + esc(r.issue_identifier) + '</div></div>'
+        + '<div>'
+        + '<div class="agent-status-row">' + statusPill(r.status) + dockerBadge + '</div>'
+        + '<div class="agent-msg">' + esc(r.last_message || '—') + '</div>'
+        + wfHtml
+        + '</div>'
+        + '<div class="agent-meta">'
+        + '<div class="agent-tokens">' + fmt(r.tokens?.total_tokens || 0) + ' tok</div>'
+        + '<div class="agent-turns">turn ' + (r.turn_count || 0) + '</div>'
+        + '</div>'
+        + renderDetail(r, dockerEnabled)
+        + '</div>';
+    }
+
+    // All values passed through esc() — data is from orchestrator internal state
+    container.innerHTML = '<div class="agents">' + rows + '</div>';
   }
 
   async function refresh() {
