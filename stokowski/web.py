@@ -654,10 +654,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   function renderWorkflow(stateName, workflowName, workflows) {
     if (!workflowName || !workflows || !workflows[workflowName]) return '';
     const path = workflows[workflowName].path || [];
-    const terminal = workflows[workflowName].terminal_state || '';
     if (path.length === 0) return '';
-    const allSteps = [...path, terminal].filter(Boolean);
-    const currentIdx = allSteps.indexOf(stateName);
+    const currentIdx = path.indexOf(stateName);
+    const allSteps = path;
     const steps = allSteps.map((s, i) => {
       let cls = 'wf-step';
       if (i === currentIdx) cls += ' current';
@@ -725,7 +724,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         state_name: null,
         workflow: null,
         started_at: null,
-        error: r.error,
+        error: null,
       }}),
       ...(data.gates || []).map(function(g) { return {
         issue_identifier: g.issue_identifier,

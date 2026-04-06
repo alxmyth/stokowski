@@ -2756,6 +2756,7 @@ class Orchestrator:
                     "container_name": r.container_name,
                     "workflow": self._issue_workflow.get(r.issue_id),
                     "project_slug": self._issue_project.get(r.issue_id),
+                    "error": r.error,
                 }
                 for r in self.running.values()
             ],
@@ -2789,10 +2790,7 @@ class Orchestrator:
                 ),
             },
             "workflows": {
-                name: {
-                    "path": wf.path,
-                    "terminal_state": wf.terminal_state,
-                }
+                name: {"path": wf.path}
                 for name, wf in self.cfg.workflows.items()
             } if self.cfg else {},
             "docker_enabled": self.cfg.docker.enabled if self.cfg else False,
