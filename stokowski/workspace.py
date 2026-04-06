@@ -12,6 +12,9 @@ from pathlib import Path
 
 from .config import DockerConfig, HooksConfig
 
+# Matches docker_runner._DOCKER_CLI_TIMEOUT (not imported to avoid circular dep)
+_DOCKER_CLI_TIMEOUT = 30  # seconds
+
 logger = logging.getLogger("stokowski.workspace")
 
 
@@ -128,7 +131,7 @@ async def ensure_workspace(
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        await asyncio.wait_for(check.wait(), timeout=30)
+        await asyncio.wait_for(check.wait(), timeout=_DOCKER_CLI_TIMEOUT)
         created_now = check.returncode != 0
         if created_now:
             await create_workspace_volume(docker_cfg, key)

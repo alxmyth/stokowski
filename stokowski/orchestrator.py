@@ -359,7 +359,7 @@ class Orchestrator:
             for issue in terminal:
                 await remove_workspace(
                     ws_root, issue.identifier, self.cfg.hooks,
-                    docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
+                    docker_cfg=self.cfg.docker_if_enabled,
                 )
         except Exception as e:
             logger.warning(f"Startup cleanup failed (continuing): {e}")
@@ -767,7 +767,7 @@ class Orchestrator:
                 ws_root = self.cfg.workspace.resolved_root(self.workflow_path.parent)
                 await remove_workspace(
                     ws_root, issue.identifier, self.cfg.hooks,
-                    docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
+                    docker_cfg=self.cfg.docker_if_enabled,
                 )
             except Exception as e:
                 logger.warning(f"Failed to remove workspace for {issue.identifier}: {e}")
@@ -1181,7 +1181,7 @@ class Orchestrator:
                 )
             ws = await ensure_workspace(
                 ws_root, issue.identifier, self.cfg.hooks,
-                docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
+                docker_cfg=self.cfg.docker_if_enabled,
                 docker_image=docker_image,
             )
             attempt.workspace_path = str(ws.path)
@@ -1225,7 +1225,7 @@ class Orchestrator:
                     ws.path,
                     (state_cfg.hooks.timeout_ms if state_cfg.hooks else self.cfg.hooks.timeout_ms),
                     f"on_stage_enter:{state_name}",
-                    docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
+                    docker_cfg=self.cfg.docker_if_enabled,
                     docker_image=docker_image,
                     workspace_key=ws.workspace_key,
                 )
@@ -1743,7 +1743,7 @@ class Orchestrator:
                         ws_root = self.cfg.workspace.resolved_root(self.workflow_path.parent)
                         await remove_workspace(
                             ws_root, cached.identifier, self.cfg.hooks,
-                            docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
+                            docker_cfg=self.cfg.docker_if_enabled,
                         )
                     self._cleanup_issue_state(issue_id)
                 continue
@@ -1765,7 +1765,7 @@ class Orchestrator:
                         ws_root = self.cfg.workspace.resolved_root(self.workflow_path.parent)
                         await remove_workspace(
                             ws_root, attempt.issue_identifier, self.cfg.hooks,
-                            docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
+                            docker_cfg=self.cfg.docker_if_enabled,
                         )
                 else:
                     # Gated issue — no process to kill, just clean up state
@@ -1774,7 +1774,7 @@ class Orchestrator:
                         ws_root = self.cfg.workspace.resolved_root(self.workflow_path.parent)
                         await remove_workspace(
                             ws_root, cached.identifier, self.cfg.hooks,
-                            docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
+                            docker_cfg=self.cfg.docker_if_enabled,
                         )
 
                 self._cleanup_issue_state(issue_id)
