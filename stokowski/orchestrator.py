@@ -1867,6 +1867,14 @@ class Orchestrator:
                     self.total_seconds_running + active_seconds, 1
                 ),
             },
+            "workflows": {
+                name: {
+                    "path": wf.path,
+                    "terminal_state": wf.terminal_state,
+                }
+                for name, wf in self.cfg.workflows.items()
+            } if self.cfg else {},
+            "docker_enabled": self.cfg.docker.enabled if self.cfg else False,
         }
 
 
