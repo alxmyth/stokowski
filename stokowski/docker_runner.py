@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import logging
 import os
+import re
 import tempfile
+from pathlib import Path
 
 from .config import DockerConfig
 from .workspace import sanitize_key
@@ -48,6 +51,18 @@ _PLUGIN_FILES_TO_REWRITE = (
 )
 
 
+def _cleanup_plugin_cache() -> None:
+    """Remove cached temp files on process exit."""
+    for tmp_path, _ in list(_plugin_file_cache.values()):
+        try:
+            Path(tmp_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+atexit.register(_cleanup_plugin_cache)
+
+
 def _prepare_plugin_file(
     host_claude_dir: str, container_home: str, relative_path: str
 ) -> str | None:
@@ -62,13 +77,13 @@ def _prepare_plugin_file(
     Results are cached per ``(host_claude_dir, container_home, relative_path)``
     and invalidated when the source file's mtime changes.
     """
-    host_file = os.path.join(host_claude_dir, relative_path)
-    if not os.path.isfile(host_file):
+    host_file = Path(host_claude_dir) / relative_path
+    if not host_file.is_file():
         return None
 
     cache_key = (host_claude_dir, container_home, relative_path)
     try:
-        current_mtime = os.path.getmtime(host_file)
+        current_mtime = host_file.stat().st_mtime
     except OSError:
         current_mtime = 0.0
 
@@ -76,12 +91,11 @@ def _prepare_plugin_file(
     cached = _plugin_file_cache.get(cache_key)
     if cached:
         cached_path, cached_mtime = cached
-        if current_mtime == cached_mtime and os.path.isfile(cached_path):
+        if current_mtime == cached_mtime and Path(cached_path).is_file():
             return cached_path
 
     try:
-        with open(host_file, "r") as f:
-            content = f.read()
+        content = host_file.read_text()
     except PermissionError:
         logger.warning("Cannot read %s — skipping path rewrite for container", host_file)
         return None
@@ -96,14 +110,14 @@ def _prepare_plugin_file(
     )
     tmp.write(rewritten)
     tmp.close()
-    os.chmod(tmp.name, 0o644)  # Ensure container agent user can read it
+    Path(tmp.name).chmod(0o644)
 
     # Clean up previous temp file if any
     if cached:
         old_path = cached[0]
         if old_path != tmp.name:
             try:
-                os.unlink(old_path)
+                Path(old_path).unlink(missing_ok=True)
             except OSError:
                 pass
 
@@ -260,27 +274,29 @@ def build_docker_run_args(
     args.append(image)
 
     # Plugin path rewriting: prefer host-side (temp files mounted over originals).
-    # In DooD mode the orchestrator can't read host files, so fall back to an
-    # in-container fixup that COPIES each file to /tmp before rewriting — never
-    # destructively modifying the host's originals via the bind mount.
+    # In DooD mode the orchestrator can't read host files, so we use a tmpfs
+    # overlay for the plugins directory. The tmpfs shadows the bind-mounted
+    # plugins subdir so writes never reach the host filesystem.
     if docker_cfg.inherit_claude_config and not plugins_prepared:
+        # Mount host plugins dir read-only at a secondary path for the script
+        # to read from, and a tmpfs at the real plugins path so writes are
+        # container-local. The parent ~/.claude bind mount remains writable
+        # for session persistence (--resume support).
+        # host_dir and home are already set above (both paths require inherit_claude_config)
+        plugins_host = f"{host_dir}/plugins"
+        args.extend(["-v", f"{plugins_host}:/host-claude-plugins:ro"])
+        # uid=1000 matches the 'agent' user created in Dockerfile.agent
+        args.extend(["--tmpfs", f"{home}/.claude/plugins:exec,size=50m,uid=1000"])
+
         escaped_cmd = " ".join(_shell_escape(c) for c in command)
-        # For each plugin config file: copy to /tmp, rewrite host paths to
-        # container paths, copy back. On Docker Desktop for Mac/Windows,
-        # bind-mounted files appear as owned by the container user so cp works.
-        # Also fix marketplaces/ directory permissions for Linux Docker where
-        # UID mapping doesn't apply and 0700 blocks the agent user.
         fixup_script = (
-            '_rewrite() { '
-            'SRC="$HOME/.claude/$1"; TMP="/tmp/stokowski-$(basename $1)"; '
-            'if [ -f "$SRC" ]; then '
-            'cp "$SRC" "$TMP" 2>/dev/null && '
-            'sed -i "s|$STOKOWSKI_HOST_CLAUDE_DIR|$HOME/.claude|g" "$TMP" && '
-            'cp "$TMP" "$SRC" 2>/dev/null; fi; }; '
-            'if [ -n "$STOKOWSKI_HOST_CLAUDE_DIR" ]; then '
-            '_rewrite plugins/installed_plugins.json; '
-            '_rewrite plugins/known_marketplaces.json; '
-            'chmod a+rx "$HOME/.claude/plugins/marketplaces" 2>/dev/null; '
+            'if [ -n "$STOKOWSKI_HOST_CLAUDE_DIR" ] && [ -d /host-claude-plugins ]; then '
+            'cp -a /host-claude-plugins/. "$HOME/.claude/plugins/" || echo "stokowski: plugin copy failed" >&2; '
+            'for f in installed_plugins.json known_marketplaces.json; do '
+            '[ -f "$HOME/.claude/plugins/$f" ] && '
+            'sed -i "s|$STOKOWSKI_HOST_CLAUDE_DIR|$HOME/.claude|g" "$HOME/.claude/plugins/$f"; '
+            "done; "
+            'chmod -R a+rX "$HOME/.claude/plugins/marketplaces" 2>/dev/null; '
             "fi; "
             f"exec {escaped_cmd}"
         )
@@ -291,12 +307,14 @@ def build_docker_run_args(
     return args
 
 
+_SHELL_SAFE = re.compile(r"^[A-Za-z0-9_./:=@-]+$")
+
+
 def _shell_escape(s: str) -> str:
     """Escape a string for safe inclusion in a shell command."""
     if not s:
         return "''"
-    import re as _re
-    if _re.match(r"^[A-Za-z0-9_./:=@-]+$", s):
+    if _SHELL_SAFE.match(s):
         return s
     return "'" + s.replace("'", "'\\''") + "'"
 
