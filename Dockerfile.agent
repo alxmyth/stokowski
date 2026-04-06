@@ -1,5 +1,8 @@
 FROM node:20-slim
 
+# Pin Claude Code version for reproducible builds (override with --build-arg)
+ARG CLAUDE_CODE_VERSION=latest
+
 # Install system tools
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -14,8 +17,8 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     apt-get update && apt-get install -y gh && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Claude Code
-RUN npm install -g @anthropic-ai/claude-code
+# Install Claude Code (pin version for reproducibility)
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 # Create non-root user (Claude Code refuses --dangerously-skip-permissions as root)
 RUN useradd -m -s /bin/bash agent

@@ -14,7 +14,20 @@ services:
     ports:
       - "${STOKOWSKI_PORT:-4200}:4200"
     command: ["workflow.yaml", "--port", "4200"]
-    restart: unless-stopped
+    # Restarts on crash (up to 5x) but not on clean stop or host reboot.
+    # Use 'unless-stopped' or 'always' if you need reboot survival.
+    restart: on-failure:5
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4200/api/v1/state"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
 # Per-issue workspace volumes (stokowski-ws-*) are created dynamically
 # by the orchestrator via `docker volume create`. The sessions volume
