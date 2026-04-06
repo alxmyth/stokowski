@@ -16,6 +16,17 @@ from .models import Issue, RunAttempt
 
 logger = logging.getLogger("stokowski.runner")
 
+# Prevent GC of fire-and-forget asyncio tasks (e.g. container kills on timeout)
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _fire_and_forget(coro) -> None:
+    """Schedule a coroutine without awaiting it. Prevents GC of the task."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 # Pattern for agent-requested transition directives in result text
 TRANSITION_PATTERN = re.compile(r"<!--\s*transition:(\w[\w-]*)\s*-->")
 
@@ -248,7 +259,7 @@ async def run_codex_turn(
                 )
                 proc.kill()
                 if container_name:
-                    asyncio.create_task(kill_container(container_name))
+                    _fire_and_forget(kill_container(container_name))
                 attempt.status = "stalled"
                 attempt.error = f"No output for {elapsed:.0f}s"
                 return
@@ -267,7 +278,7 @@ async def run_codex_turn(
             logger.warning(f"Codex turn timeout issue={issue.identifier}")
             proc.kill()
             if container_name:
-                asyncio.create_task(kill_container(container_name))
+                _fire_and_forget(kill_container(container_name))
             attempt.status = "timed_out"
             attempt.error = f"Turn exceeded {turn_timeout_s}s"
         else:
@@ -453,7 +464,7 @@ async def run_agent_turn(
                 )
                 proc.kill()
                 if container_name:
-                    asyncio.create_task(kill_container(container_name))
+                    _fire_and_forget(kill_container(container_name))
                 attempt.status = "stalled"
                 attempt.error = f"No output for {elapsed:.0f}s"
                 return
@@ -474,7 +485,7 @@ async def run_agent_turn(
             logger.warning(f"Turn timeout issue={issue.identifier}")
             proc.kill()
             if container_name:
-                asyncio.create_task(kill_container(container_name))
+                _fire_and_forget(kill_container(container_name))
             attempt.status = "timed_out"
             attempt.error = f"Turn exceeded {turn_timeout_s}s"
         else:
@@ -493,7 +504,7 @@ async def run_agent_turn(
         proc.kill()
         attempt.status = "failed"
         attempt.error = str(e)
-        return attempt
+        # Still need to run after_run hook and unregister PID below
     finally:
         # Close log file on all exit paths (normal, stall, timeout, CancelledError)
         if log_file:
