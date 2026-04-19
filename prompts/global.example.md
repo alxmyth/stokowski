@@ -27,6 +27,27 @@ Before starting any implementation work:
 2. Run the project's test command to verify all tests pass.
 3. If either fails, investigate and fix before starting new work.
 
+## Linear access
+
+- No Linear MCP server or CLI is available in this runtime. Talk to Linear
+  over HTTP against `https://api.linear.app/graphql`.
+- The `LINEAR_API_KEY` env var is set. Use it directly as the value of the
+  `Authorization` header (no `Bearer` prefix).
+- The current issue's UUID and identifier are provided in the lifecycle
+  section of this prompt. Do not issue a lookup query to rediscover them.
+- For GraphQL bodies, write the JSON to a file and pass it with `-d @file`
+  to avoid shell-quoting hazards. Example (adding a comment):
+
+      cat > /tmp/q.json <<'EOF'
+      {"query": "mutation($id: String!, $body: String!){
+         commentCreate(input:{issueId:$id, body:$body}){success}}",
+       "variables": {"id": "<issue-uuid>", "body": "<markdown>"}}
+      EOF
+      curl -s -X POST https://api.linear.app/graphql \
+        -H "Authorization: $LINEAR_API_KEY" \
+        -H "Content-Type: application/json" \
+        -d @/tmp/q.json
+
 ## Linear workpad
 
 Use a single Linear comment as a persistent workpad:
