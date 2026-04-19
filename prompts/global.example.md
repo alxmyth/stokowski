@@ -29,18 +29,21 @@ Before starting any implementation work:
 
 ## Linear access
 
-- No Linear MCP server or CLI is available in this runtime. Talk to Linear
-  over HTTP against `https://api.linear.app/graphql`.
-- The `LINEAR_API_KEY` env var is set. Use it directly as the value of the
-  `Authorization` header (no `Bearer` prefix).
+- Prefer a Linear MCP server if one is registered in this session's tools.
+  Otherwise, use HTTP directly against `https://api.linear.app/graphql`.
 - The current issue's UUID and identifier are provided in the lifecycle
   section of this prompt. Do not issue a lookup query to rediscover them.
-- For GraphQL bodies, write the JSON to a file and pass it with `-d @file`
-  to avoid shell-quoting hazards. Example (adding a comment):
+
+When using HTTP:
+
+- Stokowski sets the `LINEAR_API_KEY` env var to the resolved tracker API
+  key. Use it directly as the value of the `Authorization` header (no
+  `Bearer` prefix).
+- Write the JSON body to a file and pass it with `-d @file` to avoid
+  shell-quoting hazards. Example (adding a comment):
 
       cat > /tmp/q.json <<'EOF'
-      {"query": "mutation($id: String!, $body: String!){
-         commentCreate(input:{issueId:$id, body:$body}){success}}",
+      {"query": "mutation($id:String!,$body:String!){commentCreate(input:{issueId:$id,body:$body}){success}}",
        "variables": {"id": "<issue-uuid>", "body": "<markdown>"}}
       EOF
       curl -s -X POST https://api.linear.app/graphql \
