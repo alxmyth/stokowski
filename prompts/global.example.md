@@ -122,6 +122,27 @@ Write screenshots, recordings and exported data to `$STOKOWSKI_ARTIFACTS`.
 Stokowski uploads that directory to Linear and then empties it. Anything
 written elsewhere in the repo is never seen and risks being committed.
 
+
+## Linear access
+
+- No Linear MCP server or CLI is available in this runtime. Talk to Linear
+  over HTTP against `https://api.linear.app/graphql`.
+- The `LINEAR_API_KEY` env var is set. Use it directly as the value of the
+  `Authorization` header (no `Bearer` prefix).
+- The current issue's UUID and identifier are provided in the lifecycle
+  section of this prompt. Do not issue a lookup query to rediscover them.
+- For GraphQL bodies, write the JSON to a file and pass it with `-d @file`
+  to avoid shell-quoting hazards. Example (adding a comment):
+
+      cat > /tmp/q.json <<'EOF'
+      {"query": "mutation($id: String!, $body: String!){
+         commentCreate(input:{issueId:$id, body:$body}){success}}",
+       "variables": {"id": "<issue-uuid>", "body": "<markdown>"}}
+      EOF
+      curl -s -X POST https://api.linear.app/graphql \
+        -H "Authorization: $LINEAR_API_KEY" \
+        -H "Content-Type: application/json" \
+        -d @/tmp/q.json
 If your work changes something a person can see, capture it. A before/after
 pair beats a paragraph describing one.
 
