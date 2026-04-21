@@ -230,7 +230,9 @@ CLI entry point (`cli()`) and keyboard handler.
 
 **`_force_kill_children()`** uses `pgrep -f "claude.*-p.*--output-format.*stream-json"` as a last-resort cleanup on `KeyboardInterrupt`.
 
-**`_load_dotenv()`** reads `.env` from cwd on startup — supports `KEY=value` format, ignores comments and blank lines. The project-local `.env` takes precedence over the shell environment (uses direct assignment, overrides existing env vars).
+**`_load_dotenv()`** reads `.env` from cwd on startup — supports `KEY=value` format, ignores comments and blank lines. The project-local `.env` takes precedence over the shell environment (uses direct assignment, overrides existing env vars). Runs BEFORE `resolve_workflow_paths` so `STOKOWSKI_WORKFLOW_PATH` from `.env` is visible to path resolution.
+
+**`STOKOWSKI_WORKFLOW_PATH`** env var in `resolve_workflow_paths` (stokowski/main.py): when no CLI args are passed AND the env var is a non-empty string, the env value is routed through the single-arg branch (file / directory / glob all work). Precedence: CLI args > env var > auto-detect. Empty or whitespace-only values fall through to auto-detect.
 
 ### prompt.py
 Three-layer prompt assembly for state machine workflows. Main entry point is `assemble_prompt()`.

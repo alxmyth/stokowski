@@ -122,3 +122,64 @@ def test_case_insensitive_sort_across_platforms(tmp_path):
     paths = resolve_workflow_paths([str(b), str(a)])
     # 'Workflow.a' casefold sorts before 'workflow.b', so Workflow.a.yaml first.
     assert [p.name for p in paths] == ["Workflow.a.yaml", "workflow.b.yaml"]
+
+
+# ── STOKOWSKI_WORKFLOW_PATH env var ────────────────────────────────────────
+
+
+def test_env_var_points_at_file(tmp_path, monkeypatch):
+    p = tmp_path / "workflow.yaml"
+    p.write_text("x: 1")
+    monkeypatch.setenv("STOKOWSKI_WORKFLOW_PATH", str(p))
+    paths = resolve_workflow_paths([])
+    assert paths == [p]
+
+
+def test_env_var_points_at_directory(tmp_path, monkeypatch):
+    (tmp_path / "workflow.a.yaml").write_text("x: 1")
+    (tmp_path / "workflow.b.yaml").write_text("x: 1")
+    monkeypatch.setenv("STOKOWSKI_WORKFLOW_PATH", str(tmp_path))
+    paths = resolve_workflow_paths([])
+    assert [p.name for p in paths] == ["workflow.a.yaml", "workflow.b.yaml"]
+
+
+def test_env_var_points_at_glob(tmp_path, monkeypatch):
+    (tmp_path / "workflow.a.yaml").write_text("x: 1")
+    (tmp_path / "workflow.b.yaml").write_text("x: 1")
+    (tmp_path / "other.yaml").write_text("x: 1")
+    monkeypatch.setenv("STOKOWSKI_WORKFLOW_PATH", str(tmp_path / "workflow.*.yaml"))
+    paths = resolve_workflow_paths([])
+    names = sorted(p.name for p in paths)
+    assert names == ["workflow.a.yaml", "workflow.b.yaml"]
+
+
+def test_cli_args_win_over_env_var(tmp_path, monkeypatch):
+    env_file = tmp_path / "from-env.yaml"
+    cli_file = tmp_path / "from-cli.yaml"
+    env_file.write_text("x: 1")
+    cli_file.write_text("x: 1")
+    monkeypatch.setenv("STOKOWSKI_WORKFLOW_PATH", str(env_file))
+    paths = resolve_workflow_paths([str(cli_file)])
+    assert paths == [cli_file]
+
+
+def test_env_var_empty_falls_through_to_auto_detect(tmp_path, monkeypatch):
+    (tmp_path / "workflow.yaml").write_text("x: 1")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("STOKOWSKI_WORKFLOW_PATH", "")
+    paths = resolve_workflow_paths([])
+    assert paths == [Path("./workflow.yaml")]
+
+
+def test_env_var_whitespace_only_falls_through(tmp_path, monkeypatch):
+    (tmp_path / "workflow.yaml").write_text("x: 1")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("STOKOWSKI_WORKFLOW_PATH", "   ")
+    paths = resolve_workflow_paths([])
+    assert paths == [Path("./workflow.yaml")]
+
+
+def test_env_var_pointing_at_missing_path_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv("STOKOWSKI_WORKFLOW_PATH", str(tmp_path / "nope.yaml"))
+    with pytest.raises(FileNotFoundError):
+        resolve_workflow_paths([])

@@ -219,6 +219,15 @@ stokowski 'workflow.*.yml'              # glob
 stokowski workflow.a.yml workflow.b.yml # explicit list
 ```
 
+**Or set it once via `.env`:**
+
+```bash
+# .env
+STOKOWSKI_WORKFLOW_PATH=examples/multi-project/
+```
+
+Then just `stokowski`. `STOKOWSKI_WORKFLOW_PATH` accepts the same shapes (file, directory, glob). Precedence: CLI args > env var > auto-detect (`./workflow.yaml` / `./workflow.yml` / `./WORKFLOW.md`). See `.env.example` for the full set of supported variables.
+
 Per-project isolation:
 - Own `tracker.api_key` — per-project API keys are first-class.
 - Own `linear_states`, `states`, `workflows`, `repos`, `hooks`, `workspace.root`, `docker.*`, `claude` defaults.

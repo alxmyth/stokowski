@@ -230,24 +230,41 @@ def _make_footer(orch: Orchestrator) -> Text:
 
 _GLOB_META_CHARS = frozenset("*?[")
 
+# Env var that lets operators specify the workflow path (file, directory, or
+# glob — same semantics as a single positional CLI arg) without threading it
+# through a wrapper script. CLI args take precedence when both are set.
+_WORKFLOW_PATH_ENV = "STOKOWSKI_WORKFLOW_PATH"
+
 
 def resolve_workflow_paths(args: Sequence[str]) -> list[Path]:
     """Resolve CLI workflow arguments to a sorted, deduplicated list of Paths.
 
     Semantics (see plan Unit 1):
-    - 0 args: auto-detect ``./workflow.yaml`` / ``./workflow.yml`` / ``./WORKFLOW.md``
-      (legacy one-entry behavior).
+    - 0 args AND ``STOKOWSKI_WORKFLOW_PATH`` set: treat the env value as the
+      single positional arg (so a file, directory, or glob all work).
+    - 0 args, env unset: auto-detect ``./workflow.yaml`` / ``./workflow.yml`` /
+      ``./WORKFLOW.md`` (legacy one-entry behavior).
     - 1 arg that is an existing directory: enumerate ``*.yaml`` + ``*.yml`` inside,
       sort case-insensitively.
     - 1 arg containing glob metacharacters: expand via ``glob.glob``.
     - 1 arg that is an existing file: one-entry list (byte-for-byte legacy behavior).
     - N>=2 args: treat all as explicit list (caller may have shell-expanded already).
 
+    Precedence: CLI args > ``STOKOWSKI_WORKFLOW_PATH`` env var > auto-detect.
+
     All resolved paths are deduplicated by resolved absolute path and sorted
     case-insensitively, so the first-loaded ("primary") file is deterministic
     across platforms with mixed case conventions.
     """
     paths: list[Path]
+
+    # Env fallback: if the operator didn't pass a CLI arg, use the env var.
+    # Works for all three shapes (file / directory / glob) because we route
+    # it through the single-arg branch below.
+    if len(args) == 0:
+        env_value = os.environ.get(_WORKFLOW_PATH_ENV, "").strip()
+        if env_value:
+            args = [env_value]
 
     if len(args) == 0:
         if Path("workflow.yaml").exists():
@@ -259,7 +276,8 @@ def resolve_workflow_paths(args: Sequence[str]) -> list[Path]:
         else:
             raise FileNotFoundError(
                 "No workflow file found. Create workflow.yaml / workflow.yml / "
-                "WORKFLOW.md or specify a path explicitly."
+                "WORKFLOW.md, set STOKOWSKI_WORKFLOW_PATH, or specify a path "
+                "explicitly."
             )
     elif len(args) == 1:
         only = args[0]
@@ -414,13 +432,16 @@ def cli():
 
     args = parser.parse_args()
 
+    # Load .env BEFORE workflow-path resolution so STOKOWSKI_WORKFLOW_PATH
+    # from .env is visible to resolve_workflow_paths.
+    _load_dotenv()
+
     try:
         workflow_paths = resolve_workflow_paths(args.workflow)
     except FileNotFoundError as e:
         console.print(f"[red]{e}[/red]")
         sys.exit(1)
 
-    _load_dotenv()
     setup_logging(args.verbose)
 
     if args.dry_run:

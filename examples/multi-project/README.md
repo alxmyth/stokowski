@@ -14,6 +14,17 @@ The directory mode discovers both `workflow.*.yaml` files, sorts case-insensitiv
 stokowski examples/multi-project/workflow.alpha.yaml examples/multi-project/workflow.beta.yaml
 ```
 
+Or set it once in `.env` at the repo root and run with no args:
+
+```bash
+# .env
+STOKOWSKI_WORKFLOW_PATH=examples/multi-project/
+```
+
+```bash
+stokowski
+```
+
 ## What to notice
 
 - **Primary file:** `workflow.alpha.yaml` (sorts first). Its `agent.max_concurrent_agents` and `server.port` apply globally. Beta's corresponding fields are parsed but unused — see the inline comments in `workflow.beta.yaml`.
