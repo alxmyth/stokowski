@@ -228,7 +228,7 @@ Shared globals (first-file-wins, alphabetical-case-insensitive): `agent.max_conc
 
 Every dispatch adds `STOKOWSKI_LINEAR_PROJECT_SLUG` to the agent subprocess env alongside `STOKOWSKI_ISSUE_IDENTIFIER`. The dashboard snapshot emits `project_slug` on every running/gates/retrying entry.
 
-See `workflow.multi-project.example.yaml` for the worked example.
+See `examples/multi-project/` for a worked two-file example with a README and `--dry-run` walkthrough.
 
 </details>
 
