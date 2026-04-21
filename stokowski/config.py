@@ -266,6 +266,11 @@ class ProjectConfig:
     # Per-project cap (overrides AgentConfig.max_concurrent_per_project[name]).
     max_concurrent: int | None = None
     workflows: dict[str, WorkflowConfig] = field(default_factory=dict)
+    repos: dict[str, RepoConfig] = field(default_factory=dict)
+    # Set by the parser: True when the repos: section was absent from the
+    # source YAML and a synthetic `_default` entry was generated for backward
+    # compatibility. Operators should never set this field directly.
+    repos_synthesized: bool = False
 
     def resolved_api_key(self) -> str:
         key = self.tracker.api_key
@@ -961,6 +966,7 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
             wd = wf_data or {}
             label = wd.get("label")
             default = bool(wd.get("default", False))
+            triage = bool(wd.get("triage", False))
             path = _coerce_list(wd.get("path"))
             terminal_state = str(wd.get("terminal_state", "terminal"))
             transitions = derive_workflow_transitions(path, states)
@@ -979,6 +985,7 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
                 terminal_state=terminal_state,
                 transitions=transitions,
                 entry_state=entry,
+                triage=triage,
             )
     else:
         # Legacy/backward compat: synthesize a single _default workflow
@@ -1000,6 +1007,40 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
             entry_state=entry,
         )
 
+    # Parse repos registry. Distinguish "absent" from "explicit empty dict":
+    # absent triggers legacy synthesis; explicit-empty is a config error that
+    # surfaces via validate_config.
+    repos_raw = config_raw.get("repos", None)
+    repos: dict[str, RepoConfig] = {}
+    repos_synthesized = False
+
+    if isinstance(repos_raw, dict) and repos_raw:
+        # Explicit registry with at least one entry
+        for repo_name, repo_data in repos_raw.items():
+            rd = repo_data or {}
+            repos[repo_name] = RepoConfig(
+                name=repo_name,
+                label=rd.get("label"),
+                clone_url=str(rd.get("clone_url", "")),
+                default=bool(rd.get("default", False)),
+                docker_image=rd.get("docker_image"),
+            )
+    elif repos_raw is None:
+        # Absent: synthesize a _default entry for backward compat.
+        # Mirrors the multi-workflow _default synthesis at the workflows
+        # branch above. The synthetic entry carries sentinel values
+        # (empty clone_url, None label) and is exempt from R21 validation.
+        repos["_default"] = RepoConfig(
+            name="_default",
+            label=None,
+            clone_url="",
+            default=True,
+            docker_image=None,
+        )
+        repos_synthesized = True
+    # else: repos_raw is explicit empty dict ({}) — leave repos empty;
+    # validate_config will surface the error.
+
     cfg = ServiceConfig(
         tracker=p0.tracker,
         polling=polling,
@@ -1020,6 +1061,8 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
         routing=p0.routing,
         projects=projects,
         workflow_dir=workflow_dir,
+        repos=repos,
+        repos_synthesized=repos_synthesized,
     )
 
     return ParsedConfig(config=cfg, prompt_template=prompt_template)
