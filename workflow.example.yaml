@@ -1,13 +1,24 @@
 # =============================================================================
-# Stokowski — Example State Machine Workflow
+# Stokowski — Example: single Linear project mapped to a single repo (1:1)
 # =============================================================================
 #
-# Copy this file to workflow.yaml and customise for your project.
+# This is the simplest Stokowski setup: one Linear project, one Git repo,
+# one state machine pipeline. No `repos:` registry, no triage, no
+# multi-repo routing. If your team operates with a single product/repo
+# per Linear project, start here.
+#
+# Other worked examples:
+#   workflow.multi-repo.example.yaml         — one project spanning N repos
+#                                              (label-driven routing, default repo)
+#   workflow.multi-repo-triage.example.yaml  — same + triage agent that
+#                                              re-labels tickets via
+#                                              `workflow:triage`
+#
 # Stokowski re-reads this file on every poll tick — changes take effect
 # without restart.
 #
-# Prompt files live in the prompts/ directory.  Each agent state references
-# its prompt via the `prompt` field.  A global prompt (shared preamble) is
+# Prompt files live in the prompts/ directory. Each agent state references
+# its prompt via the `prompt` field. A global prompt (shared preamble) is
 # injected before the stage-specific prompt when set.
 #
 # Linear states mapping:
@@ -28,7 +39,7 @@
 # ---------------------------------------------------------------------------
 tracker:
   kind: linear
-  project_slug: "abc123def456"    # hex slugId from your Linear project URL
+  project_slug: "abc123def456"      # hex slugId from your Linear project URL
   api_key: "lin_api_your_key_here"  # your Linear API key — agents inherit this
 
 # ---------------------------------------------------------------------------
@@ -66,59 +77,19 @@ workspace:
 # ---------------------------------------------------------------------------
 # Hooks — shell scripts run in the workspace directory
 # ---------------------------------------------------------------------------
-# When a `repos:` section is present (see below), root hooks are rendered
-# as Jinja2 templates at dispatch time with a `repo` namespace:
-# {{ repo.name }}, {{ repo.clone_url }}, {{ repo.label }}.
-# When no `repos:` section is present (legacy 1:1 config), hooks pass
-# through to the shell verbatim — shell bodies containing literal `{`/`}`
-# (e.g., `!f() { ...; }; f` credential helpers) continue to work unchanged.
+# In this 1:1 layout (no `repos:` section), hooks pass through to the shell
+# verbatim — Stokowski does NOT Jinja-render them. This means shell bodies
+# containing literal `{`/`}` (e.g., `!f() { ...; }; f` credential helpers)
+# continue to work unchanged. If you migrate to multi-repo, hooks will be
+# rendered with a `{{ repo.* }}` namespace — see the multi-repo examples.
 hooks:
   after_create: |
-    git clone --depth 1 {{ repo.clone_url }} .
+    git clone --depth 1 git@github.com:your-org/your-repo.git .
     npm install
   before_run: |
     git fetch origin main
     git rebase origin/main 2>/dev/null || git rebase --abort
   timeout_ms: 120000
-
-# ---------------------------------------------------------------------------
-# Repos — multi-repo registry (optional; omit for legacy 1:1 configs)
-# ---------------------------------------------------------------------------
-# Each entry is identified by a stable name (the registry key). Tickets
-# are routed to a repo via `repo:<name>` Linear labels — triage agents
-# apply them automatically, or humans can pre-apply.
-#
-# Omit this section entirely to run in legacy 1:1 mode: a synthetic
-# `_default` repo is created automatically with no label and an empty
-# clone_url, and root hooks are passed through to the shell verbatim
-# (no Jinja rendering).
-#
-# repos:
-#   api:
-#     label: "repo:api"
-#     clone_url: "git@github.com:your-org/api.git"
-#     default: true                      # one repo must be marked default
-#     # docker_image: stokowski/node-agent:latest    # optional per-repo image
-#   web:
-#     label: "repo:web"
-#     clone_url: "git@github.com:your-org/web.git"
-#     # docker_image: stokowski/node-agent:latest
-#   infra:
-#     label: "repo:infra"
-#     clone_url: "git@github.com:your-org/infra.git"
-#     docker_image: stokowski/terraform-agent:latest
-#
-# Multi-repo validation rules (R21):
-#   - Each entry needs non-empty `clone_url` and `label`.
-#   - clone_url must use https://, ssh://, or git@ form (no file://, no
-#     embedded credentials).
-#   - At most one repo may set `default: true`. Single-repo configs MUST
-#     mark their sole repo as default.
-#   - If multiple repos are defined and none is default, the config must
-#     contain exactly one workflow with `triage: true` (see workflows
-#     section below for an example).
-#   - Repo names must match [A-Za-z0-9._-]; `_default` is reserved for
-#     the synthesis branch and may not be used by an operator entry.
 
 # ---------------------------------------------------------------------------
 # Claude defaults (inherited by all agent states unless overridden)
@@ -202,7 +173,7 @@ states:
 
   # ── 1. Investigate ──────────────────────────────────────────────────────
   # Read the codebase, understand the problem, post an investigation summary.
-  # Uses Opus for deeper reasoning.  Low turn count — investigation only.
+  # Uses Opus for deeper reasoning. Low turn count — investigation only.
   investigate:
     type: agent
     prompt: prompts/investigate.example.md
@@ -226,7 +197,7 @@ states:
 
   # ── 3. Implement ────────────────────────────────────────────────────────
   # Write code, create branch, run tests, open PR.
-  # Uses Sonnet for fast iteration.  Higher turn count for complex work.
+  # Uses Sonnet for fast iteration. Higher turn count for complex work.
   implement:
     type: agent
     prompt: prompts/implement.example.md
@@ -276,7 +247,7 @@ states:
       approve: merge
 
   # ── 7. Merge ────────────────────────────────────────────────────────────
-  # Merge the PR and clean up.  Short turn count — just the merge.
+  # Merge the PR and clean up. Short turn count — just the merge.
   merge:
     type: agent
     prompt: prompts/merge.example.md
@@ -290,34 +261,3 @@ states:
   done:
     type: terminal
     linear_state: terminal
-
-# ---------------------------------------------------------------------------
-# Workflows — multi-workflow routing (optional; omit for legacy)
-# ---------------------------------------------------------------------------
-# When present, each workflow defines a path through the shared `states:`
-# pool and selects on `workflow:<label>` Linear labels. When absent, a
-# single synthesized `_default` workflow is created using every state
-# declared above (legacy 1:1 mode).
-#
-# Uncomment and adjust when ready to use multi-workflow routing.
-#
-# workflows:
-#   standard:
-#     label: "workflow:standard"
-#     default: true
-#     path: [investigate, research-review, implement, implementation-review,
-#            code-review, merge-review, merge, done]
-#
-#   # Triage workflow: dispatches against STOKOWSKI_REPOS_JSON (see below)
-#   # and emits repo:* labels. Required when multi-repo is enabled AND no
-#   # repo has default: true. Only one workflow may have triage: true.
-#   intake:
-#     label: "workflow:intake"
-#     triage: true
-#     terminal_state: todo       # triage recycles back to todo for re-dispatch
-#     path: [triage-agent, done]
-#
-#   # Triage runs a single agent state that applies labels only — no code,
-#   # no branch, no PR. You'd add a `triage-agent:` entry above under
-#   # `states:` referencing `prompts/triage.example.md`.
-

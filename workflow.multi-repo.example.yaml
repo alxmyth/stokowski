@@ -1,0 +1,267 @@
+# =============================================================================
+# Stokowski — Example: single Linear project spanning multiple repos
+# =============================================================================
+#
+# One Linear project, N Git repos. Tickets are routed to a repo by a
+# `repo:<name>` Linear label (humans or agents apply the label). Unlabeled
+# tickets route to the repo marked `default: true`.
+#
+# Key differences from workflow.example.yaml (the 1:1 legacy shape):
+#   1. `repos:` registry declares each repo with {label, clone_url,
+#      default, docker_image?}.
+#   2. Root `hooks:` are Jinja-rendered with a `repo` namespace
+#      ({{ repo.name }}, {{ repo.clone_url }}, {{ repo.label }}).
+#   3. Workspace directories are keyed per-(issue, repo), so the same
+#      ticket running against two repos gets two distinct workspaces.
+#   4. `docker_image` resolution becomes a 3-level hybrid:
+#      team-stage-declared > repo default > platform default.
+#
+# Use this file when your team board spans multiple products and you're
+# happy with a default repo catching unlabeled tickets. If you want an
+# explicit triage step that re-labels tickets, see
+# workflow.multi-repo-triage.example.yaml.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Tracker
+# ---------------------------------------------------------------------------
+tracker:
+  kind: linear
+  project_slug: "abc123def456"
+  api_key: "lin_api_your_key_here"
+
+# ---------------------------------------------------------------------------
+# Linear state name mapping
+# ---------------------------------------------------------------------------
+linear_states:
+  todo: "Todo"
+  active: "In Progress"
+  review: "Human Review"
+  gate_approved: "Gate Approved"
+  rework: "Rework"
+  terminal:
+    - Done
+    - Closed
+    - Cancelled
+    - Canceled
+    - Duplicate
+
+polling:
+  interval_ms: 15000
+
+workspace:
+  root: ~/code/stokowski-workspaces
+
+# ---------------------------------------------------------------------------
+# Hooks — now Jinja-rendered because a `repos:` section exists
+# ---------------------------------------------------------------------------
+# The `repo` namespace is populated per-dispatch with the resolved repo's
+# metadata. StrictUndefined is in effect — a typo like `{{ repo.clne_url }}`
+# raises at render time, posts a Linear comment on the ticket, and blocks
+# dispatch via `_config_blocked` until the config is fixed. Retry loops
+# are explicitly prevented.
+#
+# NOTE on brace-embedded shell syntax: if you're migrating from a legacy
+# 1:1 config that uses credential-helper patterns like
+#   `git config credential.helper '!f() { ...; }; f'`
+# the literal `{`/`}` won't activate Jinja (Jinja only triggers on `{{ `,
+# `{% `, `{# `), so existing credential helpers keep working. But if you
+# need DOUBLE-brace shell syntax anywhere, escape it with `{{ '{{' }}` or
+# move the line into an external script that hooks invoke.
+hooks:
+  after_create: |
+    git clone --depth 1 {{ repo.clone_url }} .
+    # Project-specific setup — the Jinja repo.name lets you branch setup
+    # logic per repo without splitting the hook into multiple configs.
+    if [ -f package.json ]; then npm install; fi
+    if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+  before_run: |
+    git fetch origin main
+    git rebase origin/main 2>/dev/null || git rebase --abort
+  timeout_ms: 120000
+
+# ---------------------------------------------------------------------------
+# Repos — the registry that makes this file a multi-repo config
+# ---------------------------------------------------------------------------
+# Each entry is identified by a stable name (the registry key). That name
+# is also what appears in Linear labels (`repo:<name>`) and in the
+# workspace key (`{len}-{issue}-{name}`).
+#
+# Validation rules (R21):
+#   - clone_url is required and must use https://, ssh://, or git@ form
+#     (file:// and credential-embedded URLs are rejected)
+#   - label is required (use the `repo:<name>` convention)
+#   - labels must be unique across repos
+#   - at most one repo may set `default: true`
+#   - if multiple repos are defined and none is default, a `triage:true`
+#     workflow is required (see the triage example)
+#   - repo names must match [A-Za-z0-9._-]; `_default` is reserved
+repos:
+  api:
+    label: "repo:api"
+    clone_url: "git@github.com:your-org/api.git"
+    # Repo-level docker_image: used when no state-level image is set
+    # (the 3-level hybrid — see docker section below).
+    docker_image: "stokowski/node-agent:latest"
+
+  web:
+    label: "repo:web"
+    clone_url: "git@github.com:your-org/web.git"
+    default: true                 # unlabeled tickets route here
+    docker_image: "stokowski/node-agent:latest"
+
+  # Heterogeneous stack — Python service on a different image.
+  py-service:
+    label: "repo:py-service"
+    clone_url: "git@github.com:your-org/py-service.git"
+    docker_image: "stokowski/python-agent:latest"
+
+# ---------------------------------------------------------------------------
+# Claude defaults
+# ---------------------------------------------------------------------------
+claude:
+  permission_mode: auto
+  model: claude-sonnet-4-6
+  max_turns: 20
+  turn_timeout_ms: 3600000
+  stall_timeout_ms: 300000
+
+# ---------------------------------------------------------------------------
+# Agent concurrency
+# ---------------------------------------------------------------------------
+agent:
+  max_concurrent_agents: 4
+  max_retry_backoff_ms: 300000
+  max_concurrent_agents_by_state:
+    investigate: 2
+    implement: 2
+    code-review: 1
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+prompts:
+  global_prompt: prompts/global.example.md
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+server:
+  port: 4200
+
+# ---------------------------------------------------------------------------
+# Docker isolation + the 3-level docker_image hybrid
+# ---------------------------------------------------------------------------
+# When docker.enabled is true, the image used for each (stage, repo)
+# dispatch is resolved in priority order:
+#   1. states[stage].docker_image  (team-workflow-stage declaration;
+#                                   wins for repo-agnostic stages like
+#                                   adversarial code review)
+#   2. repos[name].docker_image    (repo default; used for toolchain-bound
+#                                   stages — implement, merge, etc.)
+#   3. docker.default_image         (platform fallback)
+#
+# Example below configures: generic image as platform default, Opus-specific
+# image at the `code-review` stage (overrides all repos), per-repo images
+# above for other stages.
+#
+# docker:
+#   enabled: true
+#   default_image: "stokowski/generic-agent:latest"
+#   inherit_claude_config: true
+#   host_claude_dir: "${HOST_HOME}/.claude"
+#   host_claude_dir_mount: "/host-claude"
+#   plugin_shim_host_path: "${HOST_PLUGIN_SHIM}"
+#   plugin_shim_container_path: "/plugin-shim"
+#   extra_env:
+#     - GITHUB_TOKEN
+#     - CLAUDE_CODE_OAUTH_TOKEN
+#   extra_volumes:
+#     - "${HOST_HOME}/.ssh:/root/.ssh:ro"
+#     - "${HOST_HOME}/.gitconfig:/root/.gitconfig:ro"
+
+# ---------------------------------------------------------------------------
+# State machine (same pipeline as legacy)
+# ---------------------------------------------------------------------------
+#
+# No explicit `workflows:` section — Stokowski synthesizes a single
+# `_default` workflow from every state below. Every ticket flows through
+# this pipeline, with the repo chosen by label.
+#
+# If you want multiple workflows selected by `workflow:<name>` label
+# (e.g. quick-fix vs full-ce) see the triage example for the nested
+# shape.
+#
+states:
+
+  investigate:
+    type: agent
+    prompt: prompts/investigate.example.md
+    linear_state: active
+    model: claude-opus-4-6
+    max_turns: 8
+    session: inherit
+    transitions:
+      complete: research-review
+
+  research-review:
+    type: gate
+    linear_state: review
+    rework_to: investigate
+    max_rework: 3
+    transitions:
+      approve: implement
+
+  implement:
+    type: agent
+    prompt: prompts/implement.example.md
+    linear_state: active
+    model: claude-sonnet-4-6
+    max_turns: 30
+    session: inherit
+    transitions:
+      complete: implementation-review
+
+  implementation-review:
+    type: gate
+    linear_state: review
+    rework_to: implement
+    max_rework: 5
+    transitions:
+      approve: code-review
+
+  # Adversarial code review: image pinned at the state level so ALL repos
+  # use this image regardless of their own docker_image. This is the
+  # level-1 declaration in the 3-level hybrid.
+  code-review:
+    type: agent
+    prompt: prompts/review.example.md
+    linear_state: active
+    runner: claude
+    model: claude-opus-4-6
+    max_turns: 10
+    session: fresh
+    # docker_image: "stokowski/adversarial-reviewer:latest"   # uncomment in Docker mode
+    transitions:
+      complete: merge-review
+
+  merge-review:
+    type: gate
+    linear_state: review
+    rework_to: implement
+    max_rework: 5
+    transitions:
+      approve: merge
+
+  merge:
+    type: agent
+    prompt: prompts/merge.example.md
+    linear_state: active
+    max_turns: 5
+    session: inherit
+    transitions:
+      complete: done
+
+  done:
+    type: terminal
+    linear_state: terminal

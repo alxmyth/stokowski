@@ -1,0 +1,269 @@
+# =============================================================================
+# Stokowski — Example: multi-repo + triage workflow for automatic re-labeling
+# =============================================================================
+#
+# Multi-repo routing PLUS a triage agent that inspects every unlabeled
+# ticket and applies `workflow:<name>` and `repo:<name>` labels before
+# the main pipeline runs.
+#
+# Routing flow for an unlabeled ticket:
+#   1. Unlabeled ticket enters "Todo" state in Linear
+#   2. resolve_workflow: no `workflow:*` label → falls back to default
+#      workflow, which is `triage` (marked `default: true` below)
+#   3. Triage workflow dispatches its `triage-agent` state. The agent
+#      reads the ticket title/description, reads STOKOWSKI_REPOS_JSON
+#      (injected because the workflow has `triage: true`), and uses the
+#      Linear MCP to apply:
+#        - `workflow:<name>`   — which pipeline to run
+#        - `repo:<name>`        — which repo the work targets
+#   4. The triage state's `complete` transition leads to `done` (the
+#      triage workflow's terminal state), and `terminal_state: todo`
+#      recycles the ticket back to Linear's Todo state.
+#   5. On the next poll tick, the ticket has labels, so resolve_workflow
+#      picks up the main workflow and resolve_repo picks up the chosen repo.
+#
+# KEY CONFIG DETAILS:
+#   - There IS a default repo (`web`). v1 requires this because the
+#     triage workflow itself needs a workspace to dispatch (even though
+#     triage only applies labels and doesn't read code). If no default
+#     is set, triage can't dispatch. This limitation will be lifted in a
+#     future iteration where triage becomes workspace-less.
+#   - The triage workflow has `triage: true` (enables
+#     STOKOWSKI_REPOS_JSON injection) AND `default: true` (so unlabeled
+#     tickets route here).
+#   - The main workflow has `label: workflow:main` and no `default` —
+#     tickets only reach it after triage has applied the label.
+#
+# Use this pattern when:
+#   - Your team has many repos and operators don't want to manually label
+#     every ticket
+#   - You want a consistent classification pass before the main pipeline
+#   - You want an auditable record of how each ticket was classified
+#     (the triage agent can post a rationale comment on Linear)
+#
+# Use workflow.multi-repo.example.yaml instead if operators are willing
+# to pre-apply labels themselves (simpler — no triage overhead).
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Tracker
+# ---------------------------------------------------------------------------
+tracker:
+  kind: linear
+  project_slug: "abc123def456"
+  api_key: "lin_api_your_key_here"
+
+# ---------------------------------------------------------------------------
+# Linear state name mapping
+# ---------------------------------------------------------------------------
+linear_states:
+  todo: "Todo"
+  active: "In Progress"
+  review: "Human Review"
+  gate_approved: "Gate Approved"
+  rework: "Rework"
+  terminal:
+    - Done
+    - Closed
+    - Cancelled
+    - Canceled
+    - Duplicate
+
+polling:
+  interval_ms: 15000
+
+workspace:
+  root: ~/code/stokowski-workspaces
+
+# ---------------------------------------------------------------------------
+# Hooks — Jinja-rendered, same as the multi-repo example
+# ---------------------------------------------------------------------------
+# The triage dispatch uses the default repo's workspace, so these hooks
+# run once with `repo.name == "web"` for unlabeled tickets (triage
+# doesn't actually use the cloned code, but the workspace is still
+# created as part of the dispatch lifecycle).
+hooks:
+  after_create: |
+    git clone --depth 1 {{ repo.clone_url }} .
+    if [ -f package.json ]; then npm install; fi
+    if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+  before_run: |
+    git fetch origin main
+    git rebase origin/main 2>/dev/null || git rebase --abort
+  timeout_ms: 120000
+
+# ---------------------------------------------------------------------------
+# Repos — multi-repo registry with a default for triage's workspace
+# ---------------------------------------------------------------------------
+repos:
+  api:
+    label: "repo:api"
+    clone_url: "git@github.com:your-org/api.git"
+    docker_image: "stokowski/node-agent:latest"
+
+  web:
+    label: "repo:web"
+    clone_url: "git@github.com:your-org/web.git"
+    default: true                 # required for triage to dispatch a workspace
+    docker_image: "stokowski/node-agent:latest"
+
+  infra:
+    label: "repo:infra"
+    clone_url: "git@github.com:your-org/infra.git"
+    docker_image: "stokowski/terraform-agent:latest"
+
+# ---------------------------------------------------------------------------
+# Claude defaults
+# ---------------------------------------------------------------------------
+claude:
+  permission_mode: auto
+  model: claude-sonnet-4-6
+  max_turns: 20
+  turn_timeout_ms: 3600000
+  stall_timeout_ms: 300000
+
+# ---------------------------------------------------------------------------
+# Agent concurrency
+# ---------------------------------------------------------------------------
+agent:
+  max_concurrent_agents: 4
+  max_retry_backoff_ms: 300000
+  max_concurrent_agents_by_state:
+    triage-agent: 2               # triage is cheap, allow parallelism
+    investigate: 2
+    implement: 2
+    code-review: 1
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+prompts:
+  global_prompt: prompts/global.example.md
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+server:
+  port: 4200
+
+# ---------------------------------------------------------------------------
+# State machine — pool shared across both workflows
+# ---------------------------------------------------------------------------
+# The `workflows:` section below references states by name. A state can
+# appear in multiple workflows (though in this example each state is used
+# by exactly one).
+states:
+
+  # ── Triage agent ─────────────────────────────────────────────────────
+  # Reads issue title + description + STOKOWSKI_REPOS_JSON, applies
+  # `workflow:<name>` and `repo:<name>` labels via Linear MCP, posts a
+  # short rationale comment, and exits. Does NOT read the cloned repo.
+  # session: fresh so each triage dispatch starts with zero prior context.
+  # See prompts/triage.example.md for the contract the agent follows.
+  triage-agent:
+    type: agent
+    prompt: prompts/triage.example.md
+    linear_state: active
+    runner: claude
+    model: claude-sonnet-4-6
+    max_turns: 3                  # triage should finish in 1–2 turns
+    session: fresh
+
+  # ── Main pipeline (the full CE flow) ─────────────────────────────────
+  investigate:
+    type: agent
+    prompt: prompts/investigate.example.md
+    linear_state: active
+    model: claude-opus-4-6
+    max_turns: 8
+    session: inherit
+
+  research-review:
+    type: gate
+    linear_state: review
+    rework_to: investigate
+    max_rework: 3
+
+  implement:
+    type: agent
+    prompt: prompts/implement.example.md
+    linear_state: active
+    model: claude-sonnet-4-6
+    max_turns: 30
+    session: inherit
+
+  implementation-review:
+    type: gate
+    linear_state: review
+    rework_to: implement
+    max_rework: 5
+
+  code-review:
+    type: agent
+    prompt: prompts/review.example.md
+    linear_state: active
+    runner: claude
+    model: claude-opus-4-6
+    max_turns: 10
+    session: fresh
+
+  merge-review:
+    type: gate
+    linear_state: review
+    rework_to: implement
+    max_rework: 5
+
+  merge:
+    type: agent
+    prompt: prompts/merge.example.md
+    linear_state: active
+    max_turns: 5
+    session: inherit
+
+  done:
+    type: terminal
+    linear_state: terminal
+
+# ---------------------------------------------------------------------------
+# Workflows — two paths through the states pool
+# ---------------------------------------------------------------------------
+# When `workflows:` is explicit (this file), Stokowski does NOT derive
+# transitions from per-state `transitions:` fields. Instead, transitions
+# are auto-derived from each workflow's `path:` ordering:
+#   - Agent states: `complete` → next state in path
+#   - Gate states: `approve` → next state in path,
+#                  `rework_to` → nearest prior agent state in path (or
+#                                the explicit `rework_to` field on the
+#                                StateConfig if set)
+#   - Terminal states: no outgoing transitions
+workflows:
+
+  # The triage workflow: default for unlabeled tickets.
+  # `triage: true` → orchestrator injects STOKOWSKI_REPOS_JSON when
+  # dispatching this workflow.
+  # `terminal_state: todo` → after triage-agent finishes, the ticket
+  # moves back to Linear's Todo state so the next poll tick picks it up
+  # with its new labels.
+  triage:
+    label: "workflow:triage"      # operators can also invoke triage by hand
+    default: true                 # unlabeled tickets route here
+    triage: true                  # enables STOKOWSKI_REPOS_JSON injection
+    terminal_state: todo          # recycle for re-dispatch after labels applied
+    path: [triage-agent, done]
+
+  # The main pipeline: invoked when a ticket has `workflow:main`.
+  main:
+    label: "workflow:main"
+    path:
+      - investigate
+      - research-review
+      - implement
+      - implementation-review
+      - code-review
+      - merge-review
+      - merge
+      - done
+
+  # Add additional pipelines here (e.g., `quick-fix`, `refinement`) and
+  # the triage agent can pick between them. Each workflow is a named path
+  # through the shared states pool.

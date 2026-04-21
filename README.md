@@ -198,7 +198,7 @@ Symphony is tightly coupled to Codex via its `app-server` JSON-RPC protocol. Sto
 
 Symphony assumes one Linear project maps to one repo. Stokowski supports the team-affine pattern where a single Linear project spans multiple repositories (common for infrastructure teams, platform teams, or teams owning N microservices):
 
-- **`repos:` registry in `workflow.yaml`** — declare each repo with `{name, label, clone_url, default, docker_image?}`. See `workflow.example.yaml` for the commented example.
+- **`repos:` registry in `workflow.yaml`** — declare each repo with `{name, label, clone_url, default, docker_image?}`. See `workflow.multi-repo.example.yaml` for a complete example without triage, or `workflow.multi-repo-triage.example.yaml` for automatic classification.
 - **Label-driven routing** — tickets are routed to a repo by a `repo:<name>` Linear label, applied by a triage agent or by humans. The existing multi-workflow label convention extends naturally to the repo axis.
 - **Backward compatible** — configs without a `repos:` section continue to work unchanged. A synthetic `_default` repo is created and hooks pass through the shell verbatim (no Jinja rendering), preserving existing credential-helper shell patterns.
 - **Hybrid `docker_image` resolution** — stage-level override → repo-level default → platform default. Heterogeneous stacks (one Node repo, one Python repo) each pick up their toolchain image without forking the workflow.
@@ -398,8 +398,20 @@ flowchart LR
 
 ### 5. Configure your workflow
 
+Stokowski ships three worked examples — pick the one matching your team's setup and copy it to `workflow.yaml`:
+
+| Example file | When to use |
+|---|---|
+| `workflow.example.yaml` | **Start here.** One Linear project, one Git repo. Shortest config, no multi-repo ceremony. |
+| `workflow.multi-repo.example.yaml` | One Linear project spanning multiple repos. Operators (or agents) apply `repo:<name>` labels; unlabeled tickets go to a default repo. Demonstrates Jinja-templated hooks and the 3-level `docker_image` hybrid. |
+| `workflow.multi-repo-triage.example.yaml` | Multi-repo + automatic classification. A triage agent reads each unlabeled ticket and applies `workflow:<name>` and `repo:<name>` labels before the main pipeline runs. |
+
 ```bash
+# Single-repo setup (most common starting point)
 cp workflow.example.yaml workflow.yaml
+
+# Or, for a multi-repo team
+cp workflow.multi-repo.example.yaml workflow.yaml
 ```
 
 Open `workflow.yaml` and update these fields:
@@ -842,10 +854,10 @@ stokowski --dry-run
 pip install --upgrade git+https://github.com/Sugar-Coffee/stokowski.git#egg=stokowski[web]
 ```
 
-**After upgrading, check if `workflow.example.yaml` has changed** — new config fields may have been added that you'll want to adopt:
+**After upgrading, check if the example files have changed** — new config fields may have been added that you'll want to adopt:
 
 ```bash
-git diff HEAD@{1} workflow.example.yaml
+git diff HEAD@{1} workflow.example.yaml workflow.multi-repo.example.yaml workflow.multi-repo-triage.example.yaml
 ```
 
 ---
