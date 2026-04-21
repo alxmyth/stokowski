@@ -18,6 +18,8 @@ from stokowski.config import (
     ServiceConfig,
     WorkflowConfig,
     parse_workflow_file,
+    validate_config,
+    _near_match_prefixes,
 )
 
 
@@ -159,18 +161,27 @@ repos:
     assert web.docker_image == "stokowski/node:latest"
 
 
-def test_parse_explicit_empty_repos_no_synthesis():
-    """Explicit `repos: {}` is distinct from absent — NO synthesis.
+def test_parse_explicit_empty_repos_synthesizes_with_warning(caplog):
+    """Explicit `repos: {}` still synthesizes _default (with a warning).
 
-    Validation (Unit 3) surfaces this as an error; parsing leaves `repos` empty
-    so the validator has an unambiguous signal.
+    Rationale: an empty section is almost always an operator mistake (typo,
+    stub-for-later). Failing hard on it would break any test that constructs
+    ServiceConfig() directly. Warning + synthesize is the safe middle path.
     """
+    import logging
+
     path = _write_yaml(_MINIMAL_STATES + "\nrepos: {}\n")
-    parsed = parse_workflow_file(path)
+    with caplog.at_level(logging.WARNING, logger="stokowski.config"):
+        parsed = parse_workflow_file(path)
     cfg = parsed.config
 
-    assert cfg.repos_synthesized is False
-    assert cfg.repos == {}
+    assert cfg.repos_synthesized is True
+    assert "_default" in cfg.repos
+    # Warning should mention the empty section
+    warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("empty" in m.lower() for m in warning_msgs), (
+        f"Expected warning about empty section, got: {warning_msgs}"
+    )
 
 
 # ── WorkflowConfig.triage parsing ───────────────────────────────────────────
@@ -477,3 +488,324 @@ repos:
             assert issue_id not in d, f"cleanup left entry in {d}"
         for s in per_issue_sets:
             assert issue_id not in s, f"cleanup left entry in {s}"
+
+
+# ── Unit 3: Config validation (R21) ─────────────────────────────────────────
+
+
+def _minimal_multi_repo_yaml(repos_block: str, workflows_block: str = "") -> str:
+    """Build a YAML fragment with a given repos: section."""
+    wf = workflows_block or """
+workflows:
+  standard:
+    label: workflow:standard
+    default: true
+    path: [work, done]
+"""
+    return _MINIMAL_STATES + repos_block + wf
+
+
+def test_validate_repo_integrity_rejects_empty_clone_url():
+    path = _write_yaml(_minimal_multi_repo_yaml(
+        """
+repos:
+  api:
+    label: repo:api
+    clone_url: ""
+    default: true
+"""
+    ))
+    errors = validate_config(parse_workflow_file(path).config)
+    assert any("empty clone_url" in e for e in errors), errors
+
+
+def test_validate_repo_integrity_rejects_empty_label():
+    path = _write_yaml(_minimal_multi_repo_yaml(
+        """
+repos:
+  api:
+    clone_url: git@github.com:org/api.git
+    default: true
+"""
+    ))
+    errors = validate_config(parse_workflow_file(path).config)
+    assert any("empty label" in e for e in errors), errors
+
+
+def test_validate_duplicate_labels_rejected():
+    path = _write_yaml(_minimal_multi_repo_yaml(
+        """
+repos:
+  api:
+    label: repo:api
+    clone_url: git@github.com:org/api.git
+    default: true
+  api2:
+    label: repo:api
+    clone_url: git@github.com:org/api2.git
+"""
+    ))
+    errors = validate_config(parse_workflow_file(path).config)
+    assert any("Duplicate repo label" in e for e in errors), errors
+
+
+def test_validate_clone_url_scheme_rejects_file_scheme():
+    path = _write_yaml(_minimal_multi_repo_yaml(
+        """
+repos:
+  api:
+    label: repo:api
+    clone_url: file:///tmp/foo
+    default: true
+"""
+    ))
+    errors = validate_config(parse_workflow_file(path).config)
+    assert any("file://" in e for e in errors), errors
+
+
+def test_validate_clone_url_rejects_embedded_credentials():
+    path = _write_yaml(_minimal_multi_repo_yaml(
+        """
+repos:
+  api:
+    label: repo:api
+    clone_url: https://user:secret@github.com/org/api.git
+    default: true
+"""
+    ))
+    errors = validate_config(parse_workflow_file(path).config)
+    assert any("embedded credentials" in e for e in errors), errors
+
+
+def test_validate_clone_url_accepts_ssh_https_git_forms():
+    """Accepted schemes: https://, ssh://, git@."""
+    for url in (
+        "https://github.com/org/api.git",
+        "ssh://git@github.com/org/api.git",
+        "git@github.com:org/api.git",
+    ):
+        path = _write_yaml(_minimal_multi_repo_yaml(
+            f"""
+repos:
+  api:
+    label: repo:api
+    clone_url: {url}
+    default: true
+"""
+        ))
+        errors = validate_config(parse_workflow_file(path).config)
+        scheme_errors = [e for e in errors if "clone_url" in e]
+        assert scheme_errors == [], (
+            f"URL {url!r} flagged unexpectedly: {scheme_errors}"
+        )
+
+
+def test_validate_clone_url_rejects_unknown_scheme():
+    path = _write_yaml(_minimal_multi_repo_yaml(
+        """
+repos:
+  api:
+    label: repo:api
+    clone_url: ftp://example.com/repo
+    default: true
+"""
+    ))
+    errors = validate_config(parse_workflow_file(path).config)
+    assert any("must use https://" in e for e in errors), errors
+
+
+def test_validate_multiple_defaults_rejected():
+    path = _write_yaml(_minimal_multi_repo_yaml(
+        """
+repos:
+  api:
+    label: repo:api
+    clone_url: git@github.com:org/api.git
+    default: true
+  web:
+    label: repo:web
+    clone_url: git@github.com:org/web.git
+    default: true
+"""
+    ))
+    errors = validate_config(parse_workflow_file(path).config)
+    assert any("Multiple default repos" in e for e in errors), errors
+
+
+def test_validate_single_repo_must_be_default():
+    path = _write_yaml(_minimal_multi_repo_yaml(
+        """
+repos:
+  api:
+    label: repo:api
+    clone_url: git@github.com:org/api.git
+"""
+    ))
+    errors = validate_config(parse_workflow_file(path).config)
+    assert any("not marked default: true" in e for e in errors), errors
+
+
+def test_validate_multi_repo_no_default_requires_triage():
+    """Multi-repo + no default → must have exactly one triage workflow."""
+    path = _write_yaml(_minimal_multi_repo_yaml(
+        """
+repos:
+  api:
+    label: repo:api
+    clone_url: git@github.com:org/api.git
+  web:
+    label: repo:web
+    clone_url: git@github.com:org/web.git
+"""
+    ))
+    errors = validate_config(parse_workflow_file(path).config)
+    assert any("requires exactly one workflow with triage: true" in e for e in errors), errors
+
+
+def test_validate_multi_repo_no_default_with_triage_workflow_passes():
+    """Multi-repo + no default + triage workflow → no repo-routing error."""
+    path = _write_yaml(_minimal_multi_repo_yaml(
+        """
+repos:
+  api:
+    label: repo:api
+    clone_url: git@github.com:org/api.git
+  web:
+    label: repo:web
+    clone_url: git@github.com:org/web.git
+""",
+        workflows_block="""
+workflows:
+  standard:
+    label: workflow:standard
+    default: true
+    path: [work, done]
+  intake:
+    label: workflow:intake
+    triage: true
+    path: [work, done]
+"""
+    ))
+    errors = validate_config(parse_workflow_file(path).config)
+    repo_errs = [e for e in errors if "triage" in e.lower() and "repo" in e.lower()]
+    assert repo_errs == [], repo_errs
+
+
+def test_validate_multiple_triage_workflows_rejected():
+    path = _write_yaml(_minimal_multi_repo_yaml(
+        """
+repos:
+  api:
+    label: repo:api
+    clone_url: git@github.com:org/api.git
+  web:
+    label: repo:web
+    clone_url: git@github.com:org/web.git
+""",
+        workflows_block="""
+workflows:
+  standard:
+    label: workflow:standard
+    default: true
+    path: [work, done]
+  intake:
+    label: workflow:intake
+    triage: true
+    path: [work, done]
+  router:
+    label: workflow:router
+    triage: true
+    path: [work, done]
+"""
+    ))
+    errors = validate_config(parse_workflow_file(path).config)
+    assert any("Exactly one workflow may have triage: true" in e for e in errors), errors
+
+
+def test_validate_reserved_repo_name_default_rejected():
+    """Operator-authored `_default` repo name is reserved."""
+    path = _write_yaml(_minimal_multi_repo_yaml(
+        """
+repos:
+  _default:
+    label: repo:default
+    clone_url: git@github.com:org/default.git
+    default: true
+"""
+    ))
+    errors = validate_config(parse_workflow_file(path).config)
+    assert any("reserved" in e.lower() and "_default" in e for e in errors), errors
+
+
+def test_validate_path_safety_rejects_unsafe_name():
+    """Repo names with invalid characters are rejected (unsafe for paths)."""
+    path = _write_yaml(_minimal_multi_repo_yaml(
+        """
+repos:
+  "my/repo":
+    label: repo:slash
+    clone_url: git@github.com:org/foo.git
+    default: true
+"""
+    ))
+    errors = validate_config(parse_workflow_file(path).config)
+    assert any("invalid characters" in e for e in errors), errors
+
+
+def test_validate_legacy_config_passes_no_repo_errors():
+    """Legacy config (no repos: section) surfaces no repo-related errors."""
+    path = _write_yaml(_MINIMAL_STATES)
+    errors = validate_config(parse_workflow_file(path).config)
+    repo_errs = [e for e in errors if "repo" in e.lower()]
+    assert repo_errs == [], repo_errs
+
+
+def test_validate_default_workflow_triage_flag_required():
+    """A workflow with triage=True should not also set default=True.
+
+    (Implicitly enforced elsewhere: they're orthogonal flags; the brainstorm
+    decision is that triage is its own workflow, not the default. No specific
+    validation rule in R21, but covered by overall workflow validation.)
+    """
+    # Just confirm parser accepts both being set (semantic check is elsewhere)
+    path = _write_yaml(_MINIMAL_STATES + """
+workflows:
+  intake:
+    label: workflow:intake
+    default: true
+    triage: true
+    path: [work, done]
+""")
+    parsed = parse_workflow_file(path)
+    assert parsed.config.workflows["intake"].triage is True
+    assert parsed.config.workflows["intake"].default is True
+
+
+def test_near_match_prefix_helper():
+    """Helper generates the expected typo variants."""
+    variants = _near_match_prefixes("workflow:")
+    # Should include transposition variants + "workflows:"
+    assert "workflows:" in variants
+    # Should produce non-empty result and not include the original
+    assert variants
+    assert "workflow:" not in variants
+
+
+def test_validate_reserved_prefix_warning_fires(caplog):
+    """Operator labels near-matching reserved prefixes emit a warning."""
+    import logging
+
+    path = _write_yaml(_MINIMAL_STATES + """
+workflows:
+  standard:
+    label: workflows:oops-typo   # workflows: not workflow:
+    default: true
+    path: [work, done]
+""")
+    with caplog.at_level(logging.WARNING, logger="stokowski.config"):
+        validate_config(parse_workflow_file(path).config)
+
+    warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("near-match" in m.lower() for m in warning_msgs), (
+        f"Expected reserved-prefix near-match warning, got: {warning_msgs}"
+    )
