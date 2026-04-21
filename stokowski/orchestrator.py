@@ -37,7 +37,13 @@ from .docker_runner import (
 from .linear import LinearClient
 from .models import Issue, RetryEntry, RunAttempt
 from .pool import ConcurrencyPool
-from .prompt import assemble_prompt, build_lifecycle_section
+from .prompt import (
+    assemble_prompt,
+    build_lifecycle_section,
+    render_hook_template,
+    render_hooks_for_dispatch,
+)
+from jinja2 import UndefinedError
 from .runner import run_agent_turn, run_turn
 from .tracking import make_gate_comment, make_state_comment, parse_latest_tracking
 from . import artifacts as artifacts_mod
@@ -47,6 +53,28 @@ from .ledger import Ledger
 from .workspace import ensure_workspace, remove_workspace, sanitize_key
 
 logger = logging.getLogger("stokowski")
+
+
+def _render_hooks_best_effort(
+    hooks: HooksConfig,
+    repo: RepoConfig,
+    synthesized: bool,
+) -> HooksConfig:
+    """Render hooks for teardown paths without aborting on UndefinedError.
+
+    Used from remove_workspace call sites where a mid-flight config typo
+    shouldn't prevent cleanup. The hook execution would fail anyway if the
+    typo is real, but we prefer a clean cleanup path over re-raising here.
+    """
+    try:
+        return render_hooks_for_dispatch(hooks, repo, synthesized)
+    except UndefinedError as e:
+        logger.warning(
+            "Hook rendering failed during teardown for repo=%s: %s — "
+            "passing raw hooks through (execution may fail)",
+            repo.name, e,
+        )
+        return hooks
 
 
 class Orchestrator:
@@ -409,6 +437,22 @@ class Orchestrator:
             )
         except Exception as e:
             logger.debug(f"Failed to post cancellation comment for {issue_id}: {e}")
+
+    async def _post_hook_error_comment(self, issue_id: str, detail: str) -> None:
+        """Post a Linear comment when a hook template or hook execution fails.
+
+        Hook-rendering errors are config typos (e.g. ``{{ repo.clne_url }}``);
+        silent log-only errors leave operators staring at a stuck ticket with
+        no visible cause. Posting the detail on the ticket surfaces the
+        problem without requiring log access.
+        """
+        try:
+            client = self._ensure_linear_client()
+            await client.post_comment(
+                issue_id, f"[Stokowski] {detail}"
+            )
+        except Exception as e:
+            logger.debug(f"Failed to post hook-error comment for {issue_id}: {e}")
 
     async def _cleanup_logs(self) -> None:
         """Run log retention cleanup. Best-effort — errors logged and swallowed."""
@@ -1015,8 +1059,11 @@ class Orchestrator:
             try:
                 ws_root = self.cfg.workspace.resolved_root()
                 repo = self._get_issue_repo_config(issue.id)
+                rendered_hooks = _render_hooks_best_effort(
+                    self.cfg.hooks, repo, self.cfg.repos_synthesized
+                )
                 await remove_workspace(
-                    ws_root, issue.identifier, repo.name, self.cfg.hooks,
+                    ws_root, issue.identifier, repo.name, rendered_hooks,
                     docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
                 )
             except Exception as e:
@@ -1606,8 +1653,35 @@ class Orchestrator:
                     (state_cfg.docker_image if state_cfg else None)
                     or self.cfg.docker.default_image
                 )
+            # Render root hooks with repo metadata when the config has an
+            # explicit repos: section. Legacy configs (repos_synthesized)
+            # bypass rendering — preserves R19 backward compat for hook
+            # bodies containing literal {}/${ shell syntax.
+            try:
+                rendered_hooks = render_hooks_for_dispatch(
+                    self.cfg.hooks, repo, self.cfg.repos_synthesized
+                )
+            except UndefinedError as render_err:
+                # Config typo in a hook template. Surface as Linear comment
+                # + log error. Cap retries at 1 — the template won't fix
+                # itself via exponential backoff.
+                msg = (
+                    f"Hook template rendering failed for "
+                    f"{issue.identifier} (repo={repo.name}): {render_err}. "
+                    f"This typically means a typo in a Jinja2 variable "
+                    f"reference (e.g. `{{{{ repo.clne_url }}}}` instead of "
+                    f"`{{{{ repo.clone_url }}}}`). Check your root hooks."
+                )
+                logger.error(msg)
+                self._fire_and_forget(self._post_hook_error_comment(issue.id, msg))
+                attempt.status = "failed"
+                attempt.error = f"hook template error: {render_err}"
+                # Mark as non-retriable by setting attempt number high
+                attempt.attempt = 999
+                self._on_worker_exit(issue, attempt)
+                return
             ws = await ensure_workspace(
-                ws_root, issue.identifier, repo.name, self.cfg.hooks,
+                ws_root, issue.identifier, repo.name, rendered_hooks,
                 docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
                 docker_image=docker_image,
             )
@@ -1648,11 +1722,35 @@ class Orchestrator:
                 if attempt.attempt is None or attempt.attempt == 0:
                     await self._announce_state(issue, state_name, run)
 
-            # Run on_stage_enter hook if defined
+            # Run on_stage_enter hook if defined. Render over repo metadata
+            # (same gate as root hooks — only when repos: section is explicit).
             if state_cfg and state_cfg.hooks and state_cfg.hooks.on_stage_enter:
                 from .workspace import run_hook
+                try:
+                    stage_enter_script = (
+                        state_cfg.hooks.on_stage_enter
+                        if self.cfg.repos_synthesized
+                        else render_hook_template(
+                            state_cfg.hooks.on_stage_enter, repo
+                        )
+                    )
+                except UndefinedError as render_err:
+                    msg = (
+                        f"on_stage_enter hook template rendering failed for "
+                        f"{issue.identifier} state={state_name} repo={repo.name}: "
+                        f"{render_err}"
+                    )
+                    logger.error(msg)
+                    self._fire_and_forget(
+                        self._post_hook_error_comment(issue.id, msg)
+                    )
+                    attempt.status = "failed"
+                    attempt.error = f"hook template error: {render_err}"
+                    attempt.attempt = 999
+                    self._on_worker_exit(issue, attempt)
+                    return
                 ok = await run_hook(
-                    state_cfg.hooks.on_stage_enter,
+                    stage_enter_script,
                     ws.path,
                     (state_cfg.hooks.timeout_ms if state_cfg.hooks else self.cfg.hooks.timeout_ms),
                     f"on_stage_enter:{state_name}",
@@ -1678,6 +1776,14 @@ class Orchestrator:
             if state_name:
                 agent_env["STOKOWSKI_STATE"] = state_name
             agent_env["STOKOWSKI_ISSUE_IDENTIFIER"] = issue.identifier
+            # Per-dispatch repo env vars (R16). STOKOWSKI_REPO_NAME is always
+            # set (it carries the sentinel "_default" for legacy configs);
+            # STOKOWSKI_REPO_CLONE_URL is set only when non-empty so hooks
+            # can test its presence to distinguish "no repo metadata" from
+            # "repo with empty URL".
+            agent_env["STOKOWSKI_REPO_NAME"] = repo.name
+            if repo.clone_url:
+                agent_env["STOKOWSKI_REPO_CLONE_URL"] = repo.clone_url
 
             # Build log path if logging enabled
             log_path = None
@@ -1814,6 +1920,9 @@ class Orchestrator:
             workflow = self._get_issue_workflow_config(issue.id)
             wf_transitions = workflow.transitions.get(state_name)
 
+            # Resolve repo for prompt context (cache-first; three-tier fallback)
+            repo = self._get_issue_repo_config(issue.id)
+
             return assemble_prompt(
                 cfg=self.cfg,
                 workflow_dir=str(self.workflow_path.parent),
@@ -1827,6 +1936,7 @@ class Orchestrator:
                 comments=comments,
                 global_prompt=(wf.global_prompt if (wf := self._workflow_for(issue)) else None),
                 transitions=wf_transitions,
+                repo=repo,
             )
 
         # Legacy fallback
@@ -1850,6 +1960,9 @@ class Orchestrator:
             workflow = self._get_issue_workflow_config(issue.id)
             wf_transitions = workflow.transitions.get(state_name)
 
+            # Resolve repo for prompt context
+            repo = self._get_issue_repo_config(issue.id)
+
             return assemble_prompt(
                 cfg=self.cfg,
                 workflow_dir=str(self.workflow_path.parent),
@@ -1863,6 +1976,7 @@ class Orchestrator:
                 comments=None,
                 global_prompt=(wf.global_prompt if (wf := self._workflow_for(issue)) else None),
                 transitions=wf_transitions,
+                repo=repo,
             )
 
         # Legacy mode: use workflow prompt_template with Jinja2
@@ -2347,8 +2461,11 @@ class Orchestrator:
                     if cached:
                         ws_root = self.cfg.workspace.resolved_root()
                         repo = self._get_issue_repo_config(issue_id)
+                        rendered_hooks = _render_hooks_best_effort(
+                            self.cfg.hooks, repo, self.cfg.repos_synthesized
+                        )
                         await remove_workspace(
-                            ws_root, cached.identifier, repo.name, self.cfg.hooks,
+                            ws_root, cached.identifier, repo.name, rendered_hooks,
                             docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
                         )
                     self._cleanup_issue_state(issue_id)
@@ -2372,8 +2489,11 @@ class Orchestrator:
                     if attempt:
                         ws_root = self.cfg.workspace.resolved_root()
                         repo = self._get_issue_repo_config(issue_id)
+                        rendered_hooks = _render_hooks_best_effort(
+                            self.cfg.hooks, repo, self.cfg.repos_synthesized
+                        )
                         await remove_workspace(
-                            ws_root, attempt.issue_identifier, repo.name, self.cfg.hooks,
+                            ws_root, attempt.issue_identifier, repo.name, rendered_hooks,
                             docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
                         )
                 else:
@@ -2382,8 +2502,11 @@ class Orchestrator:
                     if cached:
                         ws_root = self.cfg.workspace.resolved_root()
                         repo = self._get_issue_repo_config(issue_id)
+                        rendered_hooks = _render_hooks_best_effort(
+                            self.cfg.hooks, repo, self.cfg.repos_synthesized
+                        )
                         await remove_workspace(
-                            ws_root, cached.identifier, repo.name, self.cfg.hooks,
+                            ws_root, cached.identifier, repo.name, rendered_hooks,
                             docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
                         )
 
