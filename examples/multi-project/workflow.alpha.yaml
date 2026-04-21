@@ -1,0 +1,88 @@
+# =============================================================================
+# Stokowski multi-project example — ALPHA project (file 1 of 2)
+# =============================================================================
+#
+# Runs alongside workflow.beta.yaml in the same directory. Invoke both with:
+#
+#   stokowski examples/multi-project/
+#
+# Alphabetical (case-insensitive) sort of discovered files makes alpha the
+# "primary" — shared globals (`agent.max_concurrent_agents`, `server.port`)
+# are taken from this file. `polling.interval_ms` uses the min across both
+# files, so beta's tighter 10s cadence (see workflow.beta.yaml) wins.
+#
+# Compare this file to workflow.beta.yaml to see which fields diverge:
+#   - Different project_slug, tracker.api_key (required — must be unique)
+#   - Different workspace.root (so the two projects don't share workspace dirs)
+#   - Different repos and hooks (alpha is a monorepo; beta ships N services)
+#   - Different state names (Linear allows per-project state customization)
+# =============================================================================
+
+tracker:
+  kind: linear
+  project_slug: "alpha_team_abc123"
+  api_key: "$ALPHA_LINEAR_API_KEY"
+
+# Alpha team uses the default Linear state names.
+linear_states:
+  todo: "Todo"
+  active: "In Progress"
+  review: "Human Review"
+  gate_approved: "Gate Approved"
+  rework: "Rework"
+  terminal:
+    - Done
+    - Cancelled
+
+polling:
+  interval_ms: 30000              # 30s — but beta's 10s min wins globally
+
+workspace:
+  root: ~/code/stokowski-workspaces/alpha
+
+hooks:
+  after_create: |
+    git clone --depth 1 {{ repo.clone_url }} .
+  timeout_ms: 120000
+
+claude:
+  permission_mode: auto
+  model: claude-sonnet-4-6
+  max_turns: 20
+  turn_timeout_ms: 3600000
+  stall_timeout_ms: 300000
+
+# Primary config → the global dispatch budget comes from here (4 slots total,
+# shared across alpha + beta).
+agent:
+  max_concurrent_agents: 4
+  max_retry_backoff_ms: 300000
+  max_concurrent_agents_by_state:
+    investigate: 2
+    implement: 2
+
+server:
+  port: 4200                      # Primary wins — only one dashboard.
+
+repos:
+  monorepo:
+    label: "repo:monorepo"
+    clone_url: "git@github.com:alpha-org/monorepo.git"
+    default: true
+
+states:
+  investigate:
+    type: agent
+    prompt: prompts/investigate.example.md
+    linear_state: active
+    transitions:
+      complete: implement
+  implement:
+    type: agent
+    prompt: prompts/implement.example.md
+    linear_state: active
+    transitions:
+      complete: done
+  done:
+    type: terminal
+    linear_state: terminal

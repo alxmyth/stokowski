@@ -1,0 +1,111 @@
+# =============================================================================
+# Stokowski multi-project example — BETA project (file 2 of 2)
+# =============================================================================
+#
+# Runs alongside workflow.alpha.yaml in the same directory. Alpha sorts
+# first alphabetically, so it's the "primary" — beta's agent.server.port
+# and agent.max_concurrent_agents settings below are IGNORED at runtime
+# (first-file-wins for shared globals).
+#
+# Key per-project differences from workflow.alpha.yaml:
+#   - Renamed Linear states ("Working" instead of "In Progress"). A ticket
+#     from beta with state="Working" passes _is_eligible using beta's
+#     state-name set, while the same state value on an alpha ticket would
+#     NOT pass. Per-issue config routing via _cfg_for_issue(issue_id).
+#   - Multiple repos (beta runs N services, label-routed via `repo:<name>`).
+#   - Tighter polling interval (10s) — wins globally via min() across files.
+#   - Different tracker.api_key (per-project API keys are first-class).
+#
+# To verify correct routing on a live run: `GET /api/v1/state` returns
+# `project_slug` on every running/gates/retrying entry so you can see
+# which project each dispatched issue belongs to.
+# =============================================================================
+
+tracker:
+  kind: linear
+  project_slug: "beta_team_xyz789"
+  api_key: "$BETA_LINEAR_API_KEY"
+
+# Beta team renamed their Linear workflow states.
+linear_states:
+  todo: "Backlog"
+  active: "Working"
+  review: "In Review"
+  gate_approved: "Approved"
+  rework: "Changes Requested"
+  terminal:
+    - Shipped
+    - Won't Fix
+
+polling:
+  interval_ms: 10000              # 10s — this wins globally as the min.
+
+workspace:
+  root: ~/code/stokowski-workspaces/beta
+
+# Beta ships multiple services — hooks render per-repo via Jinja2 when a
+# `repos:` section is present.
+hooks:
+  after_create: |
+    git clone --depth 1 {{ repo.clone_url }} .
+    cd $(basename {{ repo.clone_url }} .git) || true
+  timeout_ms: 180000
+
+claude:
+  permission_mode: auto
+  model: claude-opus-4-6
+  max_turns: 15
+  turn_timeout_ms: 3600000
+  stall_timeout_ms: 300000
+
+# These two settings are IGNORED at runtime — alpha (loaded first
+# alphabetically) wins for shared globals. Documented here for clarity so
+# operators see the full schema, not because beta's values apply.
+agent:
+  max_concurrent_agents: 8        # IGNORED — alpha's 4 wins
+  max_retry_backoff_ms: 600000
+  # Per-state caps ARE per-project — state names differ per workflow, so
+  # these apply only to beta's tickets.
+  max_concurrent_agents_by_state:
+    triage-stage: 1
+    implement: 3
+
+server:
+  port: 4300                      # IGNORED — alpha's 4200 wins
+
+repos:
+  api:
+    label: "repo:api"
+    clone_url: "git@github.com:beta-org/api.git"
+    default: true
+  web:
+    label: "repo:web"
+    clone_url: "git@github.com:beta-org/web.git"
+  worker:
+    label: "repo:worker"
+    clone_url: "git@github.com:beta-org/worker.git"
+
+workflows:
+  triage:
+    label: "workflow:triage"
+    triage: true
+    default: true
+    path: [triage-stage, done]
+  standard:
+    label: "workflow:standard"
+    path: [implement, done]
+
+# In multi-workflow mode, transitions are DERIVED from workflow path arrays
+# above — per-state `transitions:` blocks are rejected by validation.
+states:
+  triage-stage:
+    type: agent
+    prompt: prompts/triage.example.md
+    linear_state: active
+  implement:
+    type: agent
+    prompt: prompts/implement.example.md
+    linear_state: active
+  done:
+    type: terminal
+    linear_state: terminal
