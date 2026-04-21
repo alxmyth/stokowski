@@ -459,13 +459,16 @@ def cli():
 
     args = parser.parse_args()
 
+    # Load .env BEFORE workflow-path resolution so STOKOWSKI_WORKFLOW_PATH
+    # from .env is visible to resolve_workflow_paths.
+    _load_dotenv()
+
     try:
         workflow_paths = resolve_workflow_paths(args.workflow)
     except FileNotFoundError as e:
         console.print(f"[red]{e}[/red]")
         sys.exit(1)
 
-    _load_dotenv()
     setup_logging(args.verbose)
 
     if args.stats:
