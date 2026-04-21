@@ -154,14 +154,18 @@ def test_rejection_prepass_dedup_across_ticks(tmp_path):
 
 def test_rejection_prepass_label_change_invalidates_marker(tmp_path):
     """When labels change to a new dual-label set, the sentinel doesn't match
-    and a fresh rejection fires."""
+    and a fresh rejection fires.
+
+    Regression test for COR-001: the invalidation now compares against
+    _prev_issue_labels (captured BEFORE _last_issues is updated each tick),
+    not _last_issues (which would always reflect the current tick and make
+    the comparison a no-op).
+    """
     orch = _make_orch(tmp_path)
     orch._linear = _StubLinearClient()
 
     # Tick 1: dual labels {api, web}
-    orch._last_issues["iid-1"] = _issue(["repo:api", "repo:web"])
     _run(orch._process_rejections([_issue(["repo:api", "repo:web"])]))
-    first_count = len(orch._linear.posted.get("iid-1", []))
 
     # Preload existing comment into the thread
     orch._linear.preloaded["iid-1"] = [
@@ -170,15 +174,76 @@ def test_rejection_prepass_label_change_invalidates_marker(tmp_path):
     ]
     orch._linear.posted = {}
 
+    # Simulate the _tick snapshot discipline: record the PRIOR tick's labels
+    # BEFORE the new-tick update. This matches what _tick does at its
+    # "Snapshot prior-tick labels BEFORE updating _last_issues" block.
+    orch._prev_issue_labels["iid-1"] = sorted(
+        l.lower() for l in ["repo:api", "repo:web"]
+    )
+
     # Tick 2: labels change to {api, mobile}
     new_issue = _issue(["repo:api", "repo:mobile"])
-    orch._last_issues["iid-1"] = _issue(["repo:api", "repo:web"])  # prior state
     _run(orch._process_rejections([new_issue]))
 
-    # Stale marker discarded, new rejection posted
+    # Stale marker discarded, new rejection posted for the new label set
     assert "iid-1" in orch._rejected_issues
     assert "iid-1" in orch._linear.posted
     assert len(orch._linear.posted["iid-1"]) == 1
+
+
+def test_rejection_prepass_coro1_covers_full_tick_prior_labels_flow(tmp_path):
+    """End-to-end regression test for COR-001: exercise _process_rejections
+    through two simulated ticks that use the same _prev_issue_labels snapshot
+    discipline as the real _tick loop.
+
+    Without the COR-001 fix, tick 2 would incorrectly keep the issue
+    rejected because the stale-label invalidation always compared the
+    current issue against itself.
+    """
+    orch = _make_orch(tmp_path)
+    orch._linear = _StubLinearClient()
+
+    def simulate_tick(issues):
+        """Mini-_tick that mirrors the prior-labels snapshot discipline."""
+        for i in issues:
+            prior = orch._last_issues.get(i.id)
+            if prior is not None:
+                orch._prev_issue_labels[i.id] = sorted(
+                    l.lower() for l in prior.labels
+                )
+            else:
+                orch._prev_issue_labels.pop(i.id, None)
+        for i in issues:
+            orch._last_issues[i.id] = i
+        _run(orch._process_rejections(issues))
+
+    # Tick 1: dual labels → rejection posted, marker set
+    issue_t1 = _issue(["repo:api", "repo:web"])
+    simulate_tick([issue_t1])
+    assert "iid-1" in orch._rejected_issues
+    t1_posts = list(orch._linear.posted.get("iid-1", []))
+    assert len(t1_posts) == 1
+
+    # Preload the first post into the comment thread and reset posted tracker
+    orch._linear.preloaded["iid-1"] = [
+        {"body": t1_posts[0], "createdAt": "2026-04-20T00:00:00Z"}
+    ]
+    orch._linear.posted = {}
+
+    # Tick 2: labels change {api, web} → {api, mobile}. Without the COR-001
+    # fix, prior_labels would equal current_labels (both = {api, mobile}
+    # because _last_issues was already updated), the invalidation would
+    # not fire, the marker would stay, and no new rejection would post.
+    issue_t2 = _issue(["repo:api", "repo:mobile"])
+    simulate_tick([issue_t2])
+
+    assert "iid-1" in orch._rejected_issues, (
+        "Marker should be re-set for the new label combination"
+    )
+    assert "iid-1" in orch._linear.posted, (
+        "New rejection comment should fire for the new label set "
+        "(regression: COR-001 made this a silent stall)"
+    )
 
 
 def test_rejection_prepass_labels_fixed_clears_marker(tmp_path):
@@ -421,8 +486,120 @@ def test_cleanup_removes_rejected_and_migrated_markers(tmp_path):
     issue_id = "cleanup-test"
     orch._rejected_issues.add(issue_id)
     orch._migrated_issues.add(issue_id)
+    orch._config_blocked.add(issue_id)
+    orch._rejection_fetch_pending.add(issue_id)
 
     orch._cleanup_issue_state(issue_id)
 
     assert issue_id not in orch._rejected_issues
     assert issue_id not in orch._migrated_issues
+    assert issue_id not in orch._config_blocked
+    assert issue_id not in orch._rejection_fetch_pending
+
+
+# ── R10 integration: _rejected_issues -> _is_eligible -> blocked dispatch ──
+
+
+def test_is_eligible_rejects_when_in_rejected_issues_set(tmp_path):
+    """T-02 integration path: _is_eligible must return False for any issue
+    in _rejected_issues. This was untested before — a regression that
+    removed the guard in _is_eligible would pass all other rejection
+    tests because they only verify _rejected_issues is populated, not
+    that it actually blocks dispatch.
+    """
+    orch = _make_orch(tmp_path)
+    # Build an Issue that would otherwise be eligible: active state,
+    # required fields present, no blockers.
+    issue = _issue(["repo:api"])
+    issue.state = "In Progress"  # one of cfg.active_linear_states()
+
+    # Sanity: eligible when NOT in _rejected_issues
+    assert orch._is_eligible(issue) is True
+
+    # Add to _rejected_issues — now must be ineligible
+    orch._rejected_issues.add(issue.id)
+    assert orch._is_eligible(issue) is False
+
+    # Discard — back to eligible
+    orch._rejected_issues.discard(issue.id)
+    assert orch._is_eligible(issue) is True
+
+
+def test_is_eligible_rejects_when_in_config_blocked_set(tmp_path):
+    """Companion check for the config_error block: _is_eligible must
+    return False when an issue is in _config_blocked (hook template typo).
+    """
+    orch = _make_orch(tmp_path)
+    issue = _issue(["repo:api"])
+    issue.state = "In Progress"
+
+    assert orch._is_eligible(issue) is True
+
+    orch._config_blocked.add(issue.id)
+    assert orch._is_eligible(issue) is False
+
+    orch._config_blocked.discard(issue.id)
+    assert orch._is_eligible(issue) is True
+
+
+def test_rejection_prepass_fails_closed_on_fetch_error(tmp_path):
+    """ADV-003 regression: when fetch_comments fails for a dual-labeled
+    issue, the issue MUST NOT be dispatched. Failing closed prevents
+    arbitrary first-wins repo routing from being committed to the
+    tracking thread during a transient Linear outage.
+
+    The fix: mark rejected AND flag for retry in _rejection_fetch_pending
+    so the next tick re-attempts the fetch regardless of label changes.
+    """
+
+    class _FailingFetchClient(_StubLinearClient):
+        async def fetch_comments(self, issue_id: str) -> list[dict]:
+            raise RuntimeError("Linear API unavailable")
+
+    orch = _make_orch(tmp_path)
+    orch._linear = _FailingFetchClient()
+
+    dual_label_issue = _issue(["repo:api", "repo:web"])
+    _run(orch._process_rejections([dual_label_issue]))
+
+    # Must be marked rejected (block this tick)
+    assert "iid-1" in orch._rejected_issues
+    # And flagged for retry on next tick
+    assert "iid-1" in orch._rejection_fetch_pending
+    # _is_eligible must agree — dispatch is blocked
+    dual_label_issue.state = "In Progress"
+    assert orch._is_eligible(dual_label_issue) is False
+
+
+def test_rejection_fetch_failure_retries_on_next_tick(tmp_path):
+    """Companion to ADV-003: on the next tick, _rejection_fetch_pending
+    clears the marker so fetch is re-attempted. If fetch succeeds and
+    there's no prior sentinel, the normal path runs."""
+
+    class _TransientFailClient(_StubLinearClient):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def fetch_comments(self, issue_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transient")
+            return await super().fetch_comments(issue_id)
+
+    orch = _make_orch(tmp_path)
+    orch._linear = _TransientFailClient()
+
+    # Tick 1: fetch fails → pessimistic rejection
+    dual_label_issue = _issue(["repo:api", "repo:web"])
+    _run(orch._process_rejections([dual_label_issue]))
+    assert "iid-1" in orch._rejected_issues
+    assert "iid-1" in orch._rejection_fetch_pending
+
+    # Tick 2: same labels, fetch succeeds — retry is honored, pessimistic
+    # marker is cleared at the top of the loop iteration, fetch runs,
+    # sentinel posted, issue re-added to _rejected_issues (confirmed now).
+    _run(orch._process_rejections([dual_label_issue]))
+    assert "iid-1" in orch._rejected_issues
+    # The pessimistic flag is cleared (fetch succeeded)
+    assert "iid-1" not in orch._rejection_fetch_pending

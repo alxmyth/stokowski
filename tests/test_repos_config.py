@@ -469,7 +469,11 @@ repos:
             orch._issue_workflow,
             orch._issue_repo,  # new in Unit 2
         ]
-        per_issue_sets = [orch.claimed]
+        per_issue_sets = [
+            orch.claimed,
+            orch._rejected_issues,  # new in Unit 7
+            orch._migrated_issues,  # new in Unit 7
+        ]
 
         for d in per_issue_dicts:
             # Use a sentinel value shape that matches each dict's real usage.

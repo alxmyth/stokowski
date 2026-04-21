@@ -23,16 +23,26 @@ def sanitize_key(identifier: str) -> str:
 def compose_workspace_key(issue_identifier: str, repo_name: str) -> str:
     """Build a path-safe composite workspace key for an (issue, repo) pair.
 
-    Both components are passed through ``sanitize_key`` so the final key
-    is safe to use as a filesystem subdirectory, a Docker volume name
-    component, etc. The shape is ``{issue}-{repo}``.
+    The shape is ``{len(issue)}-{issue}-{repo}`` where both components are
+    passed through ``sanitize_key`` first. The length prefix is what makes
+    this scheme **provably collision-free** regardless of hyphens in either
+    component — a naive ``{issue}-{repo}`` delimiter has real collisions
+    (adversarial ADV-001: ``('SMI-my', 'repo')`` and ``('SMI', 'my-repo')``
+    both map to ``SMI-my-repo``). By reading the integer prefix first, the
+    parse point is unambiguous.
 
-    For legacy 1:1 configs, the synthetic ``_default`` repo produces keys
-    like ``SMI-14-_default``. v1 single-repo-per-ticket means this is a
-    one-to-one rename of the prior flat ``{issue}`` layout; v2 multi-repo
-    scope will reuse the same shape without modification.
+    Examples:
+      compose_workspace_key("SMI-14", "api")       -> "6-SMI-14-api"
+      compose_workspace_key("SMI", "my-repo")       -> "3-SMI-my-repo"
+      compose_workspace_key("SMI-my", "repo")       -> "6-SMI-my-repo"   (distinct)
+      compose_workspace_key("SMI-14", "_default")   -> "6-SMI-14-_default"
+
+    The resulting key satisfies Docker volume naming (alphanumeric plus
+    ``_.-``) and is safe as a filesystem directory name.
     """
-    return f"{sanitize_key(issue_identifier)}-{sanitize_key(repo_name)}"
+    s_issue = sanitize_key(issue_identifier)
+    s_repo = sanitize_key(repo_name)
+    return f"{len(s_issue)}-{s_issue}-{s_repo}"
 
 
 @dataclass
