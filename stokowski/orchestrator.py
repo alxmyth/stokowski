@@ -572,66 +572,83 @@ class Orchestrator:
             logger.debug(f"Failed to post hook-error comment for {issue_id}: {e}")
 
     async def _cleanup_logs(self) -> None:
-        """Run log retention cleanup. Best-effort — errors logged and swallowed."""
-        if not self.cfg.logging.enabled or not self.cfg.logging.log_dir:
-            return
-        try:
-            log_dir = self.cfg.logging.resolved_log_dir(self.workflow_path.parent)
-            if not log_dir.exists():
-                return
+        """Run log retention cleanup. Best-effort — errors logged and swallowed.
 
-            exempt = {
-                self.running[iid].issue_identifier
-                for iid in self.running
-                if self.running[iid].issue_identifier
-            }
-
-            if self.cfg.logging.max_age_days > 0:
-                cleanup_old_logs(log_dir, self.cfg.logging.max_age_days)
-            if self.cfg.logging.max_total_size_mb > 0:
-                enforce_size_limit(
-                    log_dir, self.cfg.logging.max_total_size_mb, exempt
-                )
-        except Exception as e:
-            logger.warning(f"Log retention cleanup failed: {e}")
+        Multi-project: iterate each project's logging config. Projects may
+        share a log_dir (union the exempt set) or use different dirs.
+        """
+        exempt = {
+            self.running[iid].issue_identifier
+            for iid in self.running
+            if self.running[iid].issue_identifier
+        }
+        for slug, parsed in self.configs.items():
+            pcfg = parsed.config
+            if not pcfg.logging.enabled or not pcfg.logging.log_dir:
+                continue
+            try:
+                workflow_dir = self._config_paths.get(slug, self.workflow_path).parent
+                log_dir = pcfg.logging.resolved_log_dir(workflow_dir)
+                if not log_dir.exists():
+                    continue
+                if pcfg.logging.max_age_days > 0:
+                    cleanup_old_logs(log_dir, pcfg.logging.max_age_days)
+                if pcfg.logging.max_total_size_mb > 0:
+                    enforce_size_limit(
+                        log_dir, pcfg.logging.max_total_size_mb, exempt
+                    )
+            except Exception as e:
+                logger.warning(f"Log retention cleanup failed for {slug}: {e}")
 
     async def start(self):
         """Start the orchestration loop."""
-        errors = self._load_workflow()
-        if errors:
-            for e in errors:
-                logger.error(f"Config error: {e}")
-            raise RuntimeError(f"Startup validation failed: {errors}")
+        errors_by_slug = self._load_all_workflows()
+        if errors_by_slug:
+            for slug, errs in errors_by_slug.items():
+                for e in errs:
+                    logger.error(f"Config error ({slug}): {e}")
+            raise RuntimeError(f"Startup validation failed: {errors_by_slug}")
 
-        # Docker startup checks
-        if self.cfg.docker.enabled:
+        # Startup filename → project_slug log (operators can see which file
+        # supplies shared globals).
+        primary_slug = next(iter(self.configs.keys()))
+        for slug, path in self._config_paths.items():
+            logger.info(
+                f"Loaded project file={path} slug={slug} primary={slug == primary_slug}"
+            )
+
+        # Docker startup checks — union of all docker-enabled projects.
+        docker_enabled_cfgs = [
+            p.config for p in self.configs.values() if p.config.docker.enabled
+        ]
+        if docker_enabled_cfgs:
             ok, msg = await check_docker_available()
             if not ok:
                 raise RuntimeError(f"Docker mode enabled but: {msg}")
-            # Pre-pull all configured images across the 3-level hybrid:
-            # platform default + every state-level override + every
-            # repo-level default. Missing an image here would force a cold
-            # pull during the agent's first dispatch (no timeout wrapper),
-            # so the union must stay in sync with resolve_docker_image.
+            # Pre-pull every image across the 3-level hybrid for every
+            # docker-enabled project.
             images: set[str] = set()
-            if self.cfg.docker.default_image:
-                images.add(self.cfg.docker.default_image)
-            for sc in self.cfg.states.values():
-                if sc.docker_image:
-                    images.add(sc.docker_image)
-            for repo in self.cfg.repos.values():
-                if repo.docker_image:
-                    images.add(repo.docker_image)
+            for cfg in docker_enabled_cfgs:
+                if cfg.docker.default_image:
+                    images.add(cfg.docker.default_image)
+                for sc in cfg.states.values():
+                    if sc.docker_image:
+                        images.add(sc.docker_image)
+                for repo in cfg.repos.values():
+                    if repo.docker_image:
+                        images.add(repo.docker_image)
             for img in images:
                 logger.info(f"Pulling Docker image: {img}")
                 if not await pull_image(img):
                     logger.warning(f"Failed to pull image: {img} (may already be cached)")
 
+        primary = self._primary_cfg()
         logger.info(
             f"Starting Stokowski "
-            f"project={self.cfg.tracker.project_slug} "
-            f"max_agents={self.cfg.agent.max_concurrent_agents} "
-            f"poll_ms={self.cfg.polling.interval_ms}"
+            f"projects={list(self.configs.keys())} "
+            f"primary={primary.tracker.project_slug} "
+            f"max_agents={primary.agent.max_concurrent_agents} "
+            f"poll_ms={self._polling_interval_ms}"
         )
 
         self._running = True
@@ -647,11 +664,12 @@ class Orchestrator:
             except Exception as e:
                 logger.error(f"Tick error: {e}")
 
-            # Interruptible sleep
+            # Interruptible sleep — read the cached min polling interval so
+            # a hot-reload that changes the min is picked up next tick.
             try:
                 await asyncio.wait_for(
                     self._stop_event.wait(),
-                    timeout=self.cfg.polling.interval_ms / 1000,
+                    timeout=self._polling_interval_ms / 1000,
                 )
                 break  # stop_event was set
             except asyncio.TimeoutError:
@@ -674,8 +692,12 @@ class Orchestrator:
                     pass
         self._child_pids.clear()
 
-        # Kill Docker agent containers by label
-        if self.cfg.docker.enabled:
+        # Kill Docker agent containers by label — if any project has docker
+        # enabled, run one cleanup pass (containers are labeled globally).
+        any_docker = any(
+            p.config.docker.enabled for p in self.configs.values()
+        )
+        if any_docker or (self.workflow and self.cfg.docker.enabled):
             try:
                 await cleanup_orphaned_containers()
             except Exception:
@@ -689,62 +711,86 @@ class Orchestrator:
             await asyncio.sleep(0.5)
         self._tasks.clear()
 
+        # Close the legacy single-client slot AND every per-project client.
         if self._linear:
-            await self._linear.close()
+            try:
+                await self._linear.close()
+            except Exception:
+                pass
+        for slug, client in list(self._linear_clients.items()):
+            try:
+                await client.close()
+            except Exception:
+                pass
+        self._linear_clients.clear()
 
     async def _startup_cleanup(self):
-        """Remove workspaces for issues already in terminal states."""
-        if self.cfg.docker.enabled:
+        """Remove workspaces for issues already in terminal states.
+
+        Multi-project: iterate each project, fetch its terminal issues via
+        its own client, remove workspaces using its repos/hooks. Docker
+        container cleanup runs once (containers are labeled globally).
+        Volume pruning unions active keys across every docker-enabled project
+        and prunes in a single pass.
+        """
+        any_docker = any(p.config.docker.enabled for p in self.configs.values())
+
+        if any_docker:
             count = await cleanup_orphaned_containers()
             if count:
                 logger.info(f"Killed {count} orphaned agent containers")
 
-        try:
-            client = self._ensure_linear_client()
-            terminal = await client.fetch_issues_by_states(
-                self.cfg.tracker.project_slug,
-                self.cfg.terminal_linear_states(),
-            )
-            ws_root = self.cfg.workspace.resolved_root()
-            # At startup we don't know which repo each terminal issue last ran
-            # against (the _issue_repo cache is empty). Iterate every repo and
-            # try to remove the composite-keyed workspace. remove_workspace is
-            # idempotent — missing workspaces are a silent no-op. Per-repo hooks
-            # are rendered best-effort so a hook template typo doesn't block
-            # the cleanup sweep.
-            for issue in terminal:
-                for repo in self.cfg.repos.values():
-                    rendered_hooks = _render_hooks_best_effort(
-                        self.cfg.hooks, repo, self.cfg.repos_synthesized,
-                    )
-                    await remove_workspace(
-                        ws_root, issue.identifier, repo.name, rendered_hooks,
-                        docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
-                    )
-        except Exception as e:
-            logger.warning(f"Startup cleanup failed (continuing): {e}")
+        # Per-project terminal-issue workspace cleanup.
+        for slug, parsed in self.configs.items():
+            pcfg = parsed.config
+            try:
+                client = self._linear_client_for(slug)
+                terminal = await client.fetch_issues_by_states(
+                    pcfg.tracker.project_slug,
+                    pcfg.terminal_linear_states(),
+                )
+                ws_root = pcfg.workspace.resolved_root()
+                for issue in terminal:
+                    for repo in pcfg.repos.values():
+                        rendered_hooks = _render_hooks_best_effort(
+                            pcfg.hooks, repo, pcfg.repos_synthesized,
+                        )
+                        await remove_workspace(
+                            ws_root, issue.identifier, repo.name, rendered_hooks,
+                            docker_cfg=pcfg.docker if pcfg.docker.enabled else None,
+                        )
+            except Exception as e:
+                logger.warning(f"Startup cleanup failed for {slug} (continuing): {e}")
 
-        # Prune orphaned Docker volumes that don't correspond to any currently
-        # active issue. This catches (a) pre-upgrade flat-keyed volumes from
-        # before the composite-key migration, and (b) stale volumes from
-        # crashed orchestrator runs. The active_keys set contains the
-        # composite key for every (issue, repo) pair an active issue could
-        # currently occupy.
-        if self.cfg.docker.enabled:
+        # Union Docker volume pruning across docker-enabled projects.
+        if any_docker:
             try:
                 active_keys: set[str] = set()
-                # Seed with any currently-running or cached issues across all
-                # configured repos. We don't know which repo each issue maps
-                # to yet, so include the full cartesian product — false
-                # negatives are safe, false positives are the bug we're
-                # trying to avoid.
+                from .workspace import compose_workspace_key
                 for issue_id, issue_obj in self._last_issues.items():
-                    for repo in self.cfg.repos.values():
-                        from .workspace import compose_workspace_key
+                    # Resolve the issue's project; fall back to every project's
+                    # repos if binding not known (conservative union).
+                    slug = self._issue_project.get(issue_id)
+                    if slug and slug in self.configs:
+                        repos = self.configs[slug].config.repos.values()
+                    else:
+                        repos = (
+                            r
+                            for parsed in self.configs.values()
+                            for r in parsed.config.repos.values()
+                        )
+                    for repo in repos:
                         active_keys.add(
                             compose_workspace_key(issue_obj.identifier, repo.name).lower()
                         )
-                removed = await cleanup_orphaned_volumes(self.cfg.docker, active_keys)
+                # Use the first docker-enabled project's DockerConfig for the
+                # volume-cleanup call (volume labels are global).
+                docker_cfg_for_cleanup = next(
+                    p.config.docker
+                    for p in self.configs.values()
+                    if p.config.docker.enabled
+                )
+                removed = await cleanup_orphaned_volumes(docker_cfg_for_cleanup, active_keys)
                 if removed:
                     logger.info(
                         f"Pruned {removed} orphaned Docker workspace volume(s)"
@@ -1258,33 +1304,69 @@ class Orchestrator:
             self._schedule_retry(issue, attempt_num=0, delay_ms=1000)
 
     async def _handle_gate_responses(self):
-        """Check for gate-approved and rework issues, handle transitions."""
-        # Early return if no gate states in config
-        has_gates = any(sc.type == "gate" for sc in self.cfg.states.values())
-        if not has_gates:
-            return
+        """Check for gate-approved and rework issues, handle transitions.
 
-        client = self._ensure_linear_client()
+        Multi-project cold-start ordering (critical): for each project we
+        fetch gate issues with THAT project's client, stamp
+        ``_issue_project`` before any downstream ``_cfg_for_issue`` call,
+        and then run the existing per-issue logic which reads cfg via
+        ``_cfg_for_issue(issue.id)``. Gate states (review / gate_approved /
+        rework) are not in ``active_linear_states()`` so ``_tick``'s
+        candidate fetch cannot stamp them — this method is the sole
+        binding site for gate issues after orchestrator restart.
+        """
+        # Iterate per project — skip projects without gates.
+        approved_pairs: list[tuple[Issue, str]] = []  # (issue, project_slug)
+        rework_pairs: list[tuple[Issue, str]] = []
 
-        # Fetch gate-approved issues
-        try:
-            approved_issues = await client.fetch_issues_by_states(
-                self.cfg.tracker.project_slug,
-                [self.cfg.linear_states.gate_approved],
-            )
-        except Exception as e:
-            logger.warning(f"Failed to fetch gate-approved issues: {e}")
-            approved_issues = []
+        for slug, parsed in list(self.configs.items()):
+            pcfg = parsed.config
+            if not any(sc.type == "gate" for sc in pcfg.states.values()):
+                continue
+            try:
+                client = self._linear_client_for(slug)
+            except RuntimeError:
+                continue
 
-        for issue in approved_issues:
+            # Fetch gate-approved issues for this project
+            try:
+                approved_issues = await client.fetch_issues_by_states(
+                    pcfg.tracker.project_slug,
+                    [pcfg.linear_states.gate_approved],
+                )
+            except Exception as e:
+                logger.warning(f"Failed to fetch gate-approved issues ({slug}): {e}")
+                approved_issues = []
+            for issue in approved_issues:
+                # Bind BEFORE any caller may invoke _cfg_for_issue.
+                self._issue_project[issue.id] = slug
+                approved_pairs.append((issue, slug))
+
+            # Fetch rework issues for this project
+            try:
+                rework_issues = await client.fetch_issues_by_states(
+                    pcfg.tracker.project_slug,
+                    [pcfg.linear_states.rework],
+                )
+            except Exception as e:
+                logger.warning(f"Failed to fetch rework issues ({slug}): {e}")
+                rework_issues = []
+            for issue in rework_issues:
+                self._issue_project[issue.id] = slug
+                rework_pairs.append((issue, slug))
+
+        # Process gate approvals
+        for issue, slug in approved_pairs:
             if issue.id in self.running or issue.id in self.claimed:
                 continue
+
+            client = self._linear_client_for(slug)
+            issue_cfg = self._cfg_for_issue(issue.id)
 
             gate_state = self._pending_gates.pop(issue.id, None)
             tracking: dict | None = None
             comments: list[dict] | None = None
             if not gate_state:
-                # Cold-start fallback: fetch comments to find gate state
                 comments = await client.fetch_comments(issue.id)
                 tracking = parse_latest_tracking(comments)
                 if tracking and tracking.get("type") == "gate" and tracking.get("status") == "waiting":
@@ -1292,16 +1374,8 @@ class Orchestrator:
 
             if gate_state:
                 try:
-                    # Resolve workflow (cold-start recovery if needed)
                     workflow = self._resolve_gate_workflow(issue, tracking)
 
-                    # Resolve repo too — after an orchestrator restart the
-                    # _issue_repo cache is empty, so _repo_name_for_tracking
-                    # would fall through to the default repo and stamp the
-                    # wrong repo name into gate/state comments (COR-003).
-                    # _resolve_repo_for_coldstart populates the cache from
-                    # the tracking comment's repo field or from labels,
-                    # with a one-time migrated-comment for pre-v1 threads.
                     if issue.id not in self._issue_repo:
                         if comments is None:
                             comments = await client.fetch_comments(issue.id)
@@ -1318,13 +1392,11 @@ class Orchestrator:
                     )
                     await client.post_comment(issue.id, comment)
 
-                    # Follow approve transition from workflow
                     self._issue_current_state[issue.id] = gate_state
                     wf_transitions = workflow.transitions.get(gate_state, {})
                     target = wf_transitions.get("approve")
                     if not target:
-                        # Fallback to StateConfig transitions for backward compat
-                        gate_cfg = self.cfg.states.get(gate_state)
+                        gate_cfg = issue_cfg.states.get(gate_state)
                         if gate_cfg and "approve" in gate_cfg.transitions:
                             target = gate_cfg.transitions["approve"]
                     if not target:
@@ -1336,14 +1408,13 @@ class Orchestrator:
                     self._issue_current_state[issue.id] = target
                     self._issue_state_runs[issue.id] = 1
 
-                    # Post state-entry comment for the approve target
                     state_comment = make_state_comment(
                         state=target, run=1, workflow=workflow.name,
                         repo=repo_name,
                     )
                     await client.post_comment(issue.id, state_comment)
 
-                    active_state = self.cfg.linear_states.active
+                    active_state = issue_cfg.linear_states.active
                     moved = await client.update_issue_state(issue.id, active_state)
                     if moved:
                         issue.state = active_state
@@ -1357,19 +1428,13 @@ class Orchestrator:
                         exc_info=True,
                     )
 
-        # Fetch rework issues
-        try:
-            rework_issues = await client.fetch_issues_by_states(
-                self.cfg.tracker.project_slug,
-                [self.cfg.linear_states.rework],
-            )
-        except Exception as e:
-            logger.warning(f"Failed to fetch rework issues: {e}")
-            rework_issues = []
-
-        for issue in rework_issues:
+        # Process rework
+        for issue, slug in rework_pairs:
             if issue.id in self.running or issue.id in self.claimed:
                 continue
+
+            client = self._linear_client_for(slug)
+            issue_cfg = self._cfg_for_issue(issue.id)
 
             gate_state = self._pending_gates.pop(issue.id, None)
             tracking: dict | None = None
@@ -1396,7 +1461,7 @@ class Orchestrator:
                             issue, tracking, comments,
                         )
 
-                    gate_cfg = self.cfg.states.get(gate_state)
+                    gate_cfg = issue_cfg.states.get(gate_state)
 
                     # Resolve rework_to from workflow transitions, then StateConfig fallback
                     wf_transitions = workflow.transitions.get(gate_state, {})
@@ -1443,7 +1508,7 @@ class Orchestrator:
 
                     self._issue_current_state[issue.id] = rework_to
 
-                    active_state = self.cfg.linear_states.active
+                    active_state = issue_cfg.linear_states.active
                     moved = await client.update_issue_state(issue.id, active_state)
                     if moved:
                         issue.state = active_state
@@ -1461,9 +1526,17 @@ class Orchestrator:
                     )
 
     async def _tick(self):
-        """Single poll tick: reconcile, validate, fetch, dispatch."""
-        # Reload workflow (supports hot-reload)
-        errors = self._load_workflow()
+        """Single poll tick: reconcile, validate, fetch, dispatch.
+
+        Multi-project: iterate each loaded project, fetch with its own
+        LinearClient, and stamp ``_issue_project[issue.id]`` before any
+        downstream per-issue config lookup runs.
+        """
+        # Reload workflow (supports hot-reload) — independent per-file.
+        errors_by_slug = self._load_all_workflows()
+        if errors_by_slug:
+            for slug, errs in errors_by_slug.items():
+                logger.warning(f"Config invalid ({slug}): {errs}")
 
         # Part 1: Reconcile running issues
         await self._reconcile()
@@ -1471,27 +1544,33 @@ class Orchestrator:
         # Handle gate responses
         await self._handle_gate_responses()
 
-        # Part 2: Validate config
-        if errors:
-            logger.warning(f"Config invalid, skipping dispatch: {errors}")
+        # Part 2: If every project has errored, skip dispatch entirely.
+        if not self.configs:
+            logger.warning("No healthy projects loaded, skipping dispatch")
             return
 
-        # Part 3: Fetch candidates
-        try:
-            client = self._ensure_linear_client()
-            candidates = await client.fetch_candidate_issues(
-                self.cfg.tracker.project_slug,
-                self.cfg.active_linear_states(),
-            )
-        except Exception as e:
-            logger.error(f"Failed to fetch candidates: {e}")
-            return
+        # Part 3: Fetch candidates — per project, with its own client.
+        all_candidates: list[Issue] = []
+        for slug, parsed in list(self.configs.items()):
+            pcfg = parsed.config
+            try:
+                client = self._linear_client_for(slug)
+                candidates = await client.fetch_candidate_issues(
+                    pcfg.tracker.project_slug,
+                    pcfg.active_linear_states(),
+                )
+            except Exception as e:
+                logger.error(f"Failed to fetch candidates for {slug}: {e}")
+                continue
+            for issue in candidates:
+                # Bind every returned issue to its project BEFORE any
+                # downstream lookup that may call _cfg_for_issue.
+                self._issue_project[issue.id] = slug
+            all_candidates.extend(candidates)
 
-        # Snapshot prior-tick labels BEFORE updating _last_issues. The
-        # rejection pre-pass needs the PREVIOUS tick's labels to detect a
-        # label change (see COR-001: the stale-label invalidation in
-        # _process_rejections was dead code when it compared against the
-        # freshly-updated _last_issues).
+        candidates = all_candidates
+
+        # Snapshot prior-tick labels BEFORE updating _last_issues. See COR-001.
         for issue in candidates:
             prior = self._last_issues.get(issue.id)
             if prior is not None:
@@ -1499,16 +1578,13 @@ class Orchestrator:
                     l.lower() for l in prior.labels
                 )
             else:
-                # No prior record — either the first tick we've seen this
-                # issue, or the orchestrator just restarted. Either way,
-                # there's no change to detect.
                 self._prev_issue_labels.pop(issue.id, None)
 
         # Cache issues for retry lookup
         for issue in candidates:
             self._last_issues[issue.id] = issue
 
-        # Part 4: Sort by priority
+        # Part 4: Sort by priority (global sort — projects interleave)
         candidates.sort(
             key=lambda i: (
                 i.priority if i.priority is not None else 999,
@@ -1525,16 +1601,17 @@ class Orchestrator:
                 except Exception as e:
                     logger.warning(f"Failed to resolve state for {issue.identifier}: {e}")
 
-        # Rejection pre-pass: R10 enforcement needs async I/O (Linear comment
-        # fetch for dedup), but _is_eligible is synchronous. This pre-pass
-        # populates _rejected_issues so the sync eligibility check is
-        # I/O-free.
+        # Rejection pre-pass
         await self._process_rejections(candidates)
 
-        # Part 5: Dispatch
+        # Part 5: Dispatch — shared global budget from the primary config.
+        primary_cfg = self._primary_cfg()
         available_slots = max(
-            self.cfg.agent.max_concurrent_agents - len(self.running), 0
+            primary_cfg.agent.max_concurrent_agents - len(self.running), 0
         )
+
+        # Track starved projects for the end-of-dispatch WARN log.
+        any_dispatch = False
 
         for issue in candidates:
             if available_slots <= 0:
@@ -1542,10 +1619,14 @@ class Orchestrator:
             if not self._is_eligible(issue):
                 continue
 
-            # Per-state concurrency check — use internal state machine name,
-            # not Linear state name (multiple states share "In Progress")
+            # Per-state concurrency check — uses the issue's own project cfg
+            # (state names are per-project; a limit from project A cannot
+            # apply to project B's states).
+            issue_cfg = self._cfg_for_issue(issue.id)
             internal_state = self._issue_current_state.get(issue.id, "")
-            state_limit = self.cfg.agent.max_concurrent_agents_by_state.get(internal_state)
+            state_limit = issue_cfg.agent.max_concurrent_agents_by_state.get(
+                internal_state
+            )
             if state_limit is not None:
                 state_count = sum(
                     1
@@ -1556,7 +1637,30 @@ class Orchestrator:
                     continue
 
             self._dispatch(issue)
+            any_dispatch = True
             available_slots -= 1
+
+        # Starvation signal: if the budget is exhausted AND some project has
+        # eligible issues but zero running, operators should see it.
+        if available_slots == 0 and self.running:
+            running_slugs = {
+                self._issue_project.get(iid)
+                for iid in self.running
+                if iid in self._issue_project
+            }
+            for slug in self.configs.keys():
+                if slug in running_slugs:
+                    continue
+                starved = [
+                    c for c in candidates
+                    if self._issue_project.get(c.id) == slug
+                    and self._is_eligible(c)
+                ]
+                if starved:
+                    logger.warning(
+                        f"Dispatch budget exhausted: project={slug} has "
+                        f"{len(starved)} eligible but 0 running issues"
+                    )
 
     async def _resolve_repo_for_coldstart(
         self,
@@ -2465,15 +2569,22 @@ class Orchestrator:
         if entry is None:
             return
 
-        # Fetch fresh candidates to check eligibility
+        # Fetch fresh candidates using the issue's OWN project client + states.
+        slug = self._issue_project.get(issue_id)
+        if slug is None or slug not in self.configs:
+            # Lost binding (project evicted, or never bound) — nothing to retry.
+            self.claimed.discard(issue_id)
+            logger.info(f"Retry: issue {entry.identifier} lost project binding, releasing")
+            return
+        pcfg = self.configs[slug].config
         try:
-            client = self._ensure_linear_client()
+            client = self._linear_client_for(slug)
             candidates = await client.fetch_candidate_issues(
-                self.cfg.tracker.project_slug,
-                self.cfg.active_linear_states(),
+                pcfg.tracker.project_slug,
+                pcfg.active_linear_states(),
             )
         except Exception as e:
-            logger.warning(f"Retry candidate fetch failed: {e}")
+            logger.warning(f"Retry candidate fetch failed ({slug}): {e}")
             self.claimed.discard(issue_id)
             return
 
@@ -2489,9 +2600,9 @@ class Orchestrator:
             logger.info(f"Retry: issue {entry.identifier} no longer active, releasing")
             return
 
-        # Check slots
+        # Check slots — shared global budget from the primary config.
         available = max(
-            self.cfg.agent.max_concurrent_agents - len(self.running), 0
+            self._primary_cfg().agent.max_concurrent_agents - len(self.running), 0
         )
         if available <= 0:
             # Re-queue
@@ -2506,28 +2617,51 @@ class Orchestrator:
         self._dispatch(issue, attempt_num=entry.attempt)
 
     async def _reconcile(self):
-        """Reconcile running and gated issues against current Linear state."""
+        """Reconcile running and gated issues against current Linear state.
+
+        Multi-project: fetch each issue's state through ITS project's client
+        and compare against ITS project's state names (active/terminal/review
+        differ per project).
+        """
         ids_to_check = set(self.running) | set(self._pending_gates)
         if not ids_to_check:
             return
 
-        try:
-            client = self._ensure_linear_client()
-            states = await client.fetch_issue_states_by_ids(list(ids_to_check))
-        except Exception as e:
-            logger.warning(f"Reconciliation state fetch failed: {e}")
-            return
+        # Group IDs by project (fallback to primary for un-bound issues).
+        primary_slug = next(iter(self.configs.keys())) if self.configs else None
+        by_project: dict[str, list[str]] = {}
+        for issue_id in ids_to_check:
+            slug = self._issue_project.get(issue_id) or primary_slug
+            if slug is None:
+                continue
+            by_project.setdefault(slug, []).append(issue_id)
 
-        terminal_lower = [
-            s.strip().lower() for s in self.cfg.terminal_linear_states()
-        ]
-        active_lower = [
-            s.strip().lower() for s in self.cfg.active_linear_states()
-        ]
-        review_lower = self.cfg.linear_states.review.strip().lower()
+        states: dict[str, str] = {}
+        for slug, ids in by_project.items():
+            try:
+                client = self._linear_client_for(slug)
+                proj_states = await client.fetch_issue_states_by_ids(ids)
+            except Exception as e:
+                logger.warning(f"Reconciliation state fetch failed ({slug}): {e}")
+                continue
+            states.update(proj_states)
 
         for issue_id in list(ids_to_check):
             current_state = states.get(issue_id)
+            # Look up this issue's project config for state-name comparison.
+            slug = self._issue_project.get(issue_id) or primary_slug
+            issue_cfg = (
+                self.configs[slug].config
+                if slug and slug in self.configs
+                else self._primary_cfg()
+            )
+            terminal_lower = [
+                s.strip().lower() for s in issue_cfg.terminal_linear_states()
+            ]
+            active_lower = [
+                s.strip().lower() for s in issue_cfg.active_linear_states()
+            ]
+            review_lower = issue_cfg.linear_states.review.strip().lower()
 
             if current_state is None:
                 # Issue not found in Linear — may be deleted/archived.
