@@ -194,6 +194,20 @@ Symphony is tightly coupled to Codex via its `app-server` JSON-RPC protocol. Sto
 </details>
 
 <details>
+<summary><strong>Multi-repo routing</strong></summary>
+
+Symphony assumes one Linear project maps to one repo. Stokowski supports the team-affine pattern where a single Linear project spans multiple repositories (common for infrastructure teams, platform teams, or teams owning N microservices):
+
+- **`repos:` registry in `workflow.yaml`** — declare each repo with `{name, label, clone_url, default, docker_image?}`. See `workflow.example.yaml` for the commented example.
+- **Label-driven routing** — tickets are routed to a repo by a `repo:<name>` Linear label, applied by a triage agent or by humans. The existing multi-workflow label convention extends naturally to the repo axis.
+- **Backward compatible** — configs without a `repos:` section continue to work unchanged. A synthetic `_default` repo is created and hooks pass through the shell verbatim (no Jinja rendering), preserving existing credential-helper shell patterns.
+- **Hybrid `docker_image` resolution** — stage-level override → repo-level default → platform default. Heterogeneous stacks (one Node repo, one Python repo) each pick up their toolchain image without forking the workflow.
+- **Triage workflow support** — a workflow marked `triage: true` receives the repo list as `STOKOWSKI_REPOS_JSON` env var and applies `repo:*` labels automatically. See `prompts/triage.example.md`.
+- **v1 caps at one repo per ticket** — tickets with multiple `repo:*` labels are rejected with a Linear comment (deduped across ticks). v2 multi-repo-per-ticket is on the roadmap.
+
+</details>
+
+<details>
 <summary><strong>Three-layer prompt assembly</strong></summary>
 
 Symphony renders a single Jinja2 template from `WORKFLOW.md`. Stokowski builds prompts from three layers:

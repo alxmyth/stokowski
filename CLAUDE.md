@@ -71,7 +71,18 @@ Each workflow defines a set of internal states that map to Linear states. States
 **Structured comment tracking:** State transitions and gate decisions are persisted as HTML comments on Linear issues (`<!-- stokowski:state {...} -->` and `<!-- stokowski:gate {...} -->`). These enable crash recovery and provide context for rework runs.
 
 ### Workspace isolation
-Each issue gets its own directory under `workspace.root`. Agents run with `cwd` set to that directory. Workspaces persist across turns for the same session; they're deleted when the issue reaches a terminal state.
+Each issue gets its own directory under `workspace.root`. Agents run with `cwd` set to that directory. Workspaces persist across turns for the same session; they're deleted when the issue reaches a terminal state. The workspace path is `{workspace.root}/{issue_identifier}-{repo_name}` — legacy 1:1 configs synthesize `repo_name="_default"` and get paths like `{root}/SMI-14-_default`.
+
+### Multi-repo support
+A Linear project may map to N repos via the optional `repos:` registry in `workflow.yaml`. Each entry is `{name, label, clone_url, default, docker_image?}`. Tickets are routed to a repo by `repo:<name>` Linear label — triage agents apply labels, or humans pre-apply.
+
+- **Registry resolution:** `ServiceConfig.resolve_repo(issue)` mirrors `resolve_workflow` — case-insensitive label match (first wins), fallback to the `default: true` repo. `Orchestrator._issue_repo` caches the repo name per-issue with the same three-tier hot-reload fallback used for `_issue_workflow`.
+- **Legacy synthesis:** configs without a `repos:` section get a synthetic `_default` entry with `label=None`, `clone_url=""`, `default=True`, and `repos_synthesized=True` on the ServiceConfig. This preserves R19 backward compatibility.
+- **Jinja hook rendering:** root hooks are rendered at dispatch-time with `StrictUndefined` and a `repo` namespace (`{{ repo.name }}`, `{{ repo.clone_url }}`, `{{ repo.label }}`). Rendering is **gated on `repos_synthesized == False`** — legacy configs pass hooks through verbatim so shell bodies with literal `{`/`}` (e.g., `git config credential.helper '!f() { ...; }; f'`) continue to work unchanged.
+- **`docker_image` 3-level hybrid:** resolution precedence is `StateConfig.docker_image` → `RepoConfig.docker_image` → `docker.default_image`. Startup pre-pull unions all three sources.
+- **R10 single-repo cap (v1):** tickets with > 1 `repo:*` label are rejected via an async pre-pass in `_tick` (before the sync eligibility loop). The pre-pass fetches comments, dedups via `<!-- stokowski:rejected {...} -->` sentinels, posts a rejection comment, and marks `_rejected_issues`. `_is_eligible` simply observes set membership. Label-change invalidation clears stale markers so dispatch resumes when operators fix the labels.
+- **Triage routing:** when the dispatching workflow has `triage: true`, the orchestrator injects `STOKOWSKI_REPOS_JSON` (`[{name, label, clone_url}, ...]`, excluding `_default`). The triage prompt classifies the issue and applies `repo:<name>` and `workflow:<name>` labels; the issue re-enters the dispatch cycle with the labels applied.
+- **Cold-start recovery:** tracking comments now carry a `repo` field. On restart, `_resolve_repo_for_coldstart` reads the field with a defensive `.get('repo') or fallback` pattern. Pre-multi-repo tracking threads (no `repo` field) fall back to label resolution and post a one-time `<!-- stokowski:migrated {...} -->` notice when the result is `_default`.
 
 ### Headless system prompt
 Every first-turn launch appends a system prompt via `--append-system-prompt` that instructs Claude not to use interactive skills, slash commands, or plan mode. This prevents agents from stalling on interactive workflows.
@@ -141,7 +152,7 @@ while running:
 **Cancellation infrastructure:**
 - `_kill_pid(pid)` — static method, sends SIGKILL to process group with individual kill fallback
 - `_kill_worker(issue_id, reason)` — kills subprocess PID → Docker container → async task (order matters: CancelledError does not propagate to child processes)
-- `_cleanup_issue_state(issue_id)` — removes all 11 per-issue tracking dict entries. Idempotent. Also used by `_transition()` terminal branch.
+- `_cleanup_issue_state(issue_id)` — removes all 14 per-issue tracking dict/set entries (added `_issue_repo`, `_rejected_issues`, `_migrated_issues` with multi-repo support). Idempotent. Also used by `_transition()` terminal branch.
 - `_force_cancelled` set — populated by `_reconcile()` before calling `_kill_worker()`. Checked at the top of `_on_worker_exit()` to prevent double-processing (token aggregation is not idempotent, and `_safe_transition()` could re-populate tracking dicts after cleanup).
 - `_fire_and_forget(coro)` — schedules a coroutine without awaiting it, with `_background_tasks` set to prevent GC.
 
@@ -177,7 +188,7 @@ while running:
 `remove_workspace()` runs `before_remove` hook, then deletes the directory.
 `run_hook()` executes shell scripts via `asyncio.create_subprocess_shell` with timeout.
 
-Workspace key is the sanitized issue identifier: only `[A-Za-z0-9._-]` characters.
+Workspace key is the composite `{sanitize(issue_identifier)}-{sanitize(repo_name)}` built by `compose_workspace_key`. Legacy 1:1 configs pass `repo_name="_default"` (the synthetic fallback) and get paths like `{root}/SMI-14-_default`. Both components are sanitized to `[A-Za-z0-9._-]` so the composite is path-safe.
 
 ### web.py
 Optional FastAPI app returned by `create_app(orch)`. Routes:
@@ -280,7 +291,7 @@ stokowski -v
 stokowski --port 4200
 ```
 
-There are no automated tests beyond `--dry-run`. The system is best verified by running against a real Linear project with a test ticket.
+An automated test suite lives in `tests/` covering config parsing/validation, workspace key composition, cancel semantics, docker_runner, log retention, state machine routing, multi-repo routing, rejection handling, cold-start recovery, and prompt assembly. Run with `pytest tests/`. End-to-end flow is still best verified by running against a real Linear project with a test ticket.
 
 ---
 
@@ -319,3 +330,7 @@ There are no automated tests beyond `--dry-run`. The system is best verified by 
 - **`STOKOWSKI_ISSUE_IDENTIFIER` env var**: Set per-dispatch in `_run_worker()`, not in `ServiceConfig`. Informational only — useful for hooks that need to know which issue they service. Not a security boundary.
 - **`_cleanup_issue_state()` must stay in sync with `__init__`**: Any new per-issue tracking dict added to `Orchestrator.__init__` must also be added to `_cleanup_issue_state()`. Failure to do so causes memory leaks and stale state on cancellation.
 - **Agent run logs**: When `logging.enabled` is true, raw agent stdout is captured to `{log_dir}/{issue_identifier}/` as `.ndjson` (Claude Code) or `.log` (Codex) files. To debug an agent run: `cat {log_dir}/SMI-14/20260324T041500Z-turn-1.ndjson | jq .` Logs survive workspace cleanup — their lifetime is controlled by `max_age_days` and `max_total_size_mb`. Retention cleanup runs at startup and after each worker exit. Log writes are best-effort — failures do not affect agent execution.
+- **Multi-repo: hook Jinja rendering is gated on `cfg.repos_synthesized`**: When `repos:` section is absent (synthesized=True), root hooks bypass Jinja entirely and pass through to the shell verbatim. This is deliberate — legacy configs may contain literal `{`/`}` shell syntax (credential helpers with `!f() { ...; }; f`). When the operator adds an explicit `repos:` section, Jinja rendering activates with `StrictUndefined` over the `repo` namespace. Typos (e.g. `{{ repo.clne_url }}`) raise `UndefinedError` and post a user-facing Linear comment with retry-cap = 1. Do NOT switch rendering to `_SilentUndefined` for hooks — `git clone $EMPTY` from a silent substitution is catastrophic.
+- **Multi-repo: `_default` repo name is reserved**: Operator-authored `repos:` entries must not use the name `_default`. R21 validation rejects configs that try. The synthesis branch uses `_default` with `label=None`/`clone_url=""` as its sentinel shape, and `_repos_synthesized` distinguishes synthesis from operator authorship.
+- **Multi-repo: R10 rejection is posted by an async pre-pass, not `_is_eligible`**: `_is_eligible` stays synchronous and only reads `_rejected_issues`. The async work (comment fetch + dedup + post) happens in `_process_rejections` before the sync eligibility loop runs in `_tick`. Any future eligibility rule requiring Linear I/O should follow the same pre-pass pattern rather than making `_is_eligible` async.
+- **Multi-repo: tracking comments `repo` field uses defensive read**: `parse_latest_tracking` applies `setdefault("repo", None)`. Readers MUST use `tracking.get("repo") or fallback` — never `tracking["repo"]`. Pre-multi-repo comments don't carry the field; cold-start recovery relies on the fallback and posts a one-time migration notice.
