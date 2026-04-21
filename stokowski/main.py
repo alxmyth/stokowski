@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import glob as _glob
 import logging
 import os
 import select
@@ -13,6 +14,7 @@ import termios
 import threading
 import tty
 from pathlib import Path
+from typing import Sequence
 
 
 def _load_dotenv():
@@ -378,9 +380,14 @@ async def run_orchestrator(workflow_path: str, host_ip: str | None = None, port:
 
     await check_for_updates()
 
+    _paths_display = (
+        str(workflow_paths)
+        if isinstance(workflow_paths, (str, Path))
+        else ", ".join(str(p) for p in workflow_paths)
+    )
     console.print(Panel(
         f"[bold]Stokowski[/bold]  [dim]Claude Code Orchestrator[/dim]\n"
-        f"[dim]workflow:[/dim] {workflow_path}",
+        f"[dim]workflow:[/dim] {_paths_display}",
         border_style="dim",
     ))
 
@@ -420,9 +427,13 @@ def cli():
     )
     parser.add_argument(
         "workflow",
-        nargs="?",
-        default=None,
-        help="Path to workflow.yaml or WORKFLOW.md (auto-detected if not specified)",
+        nargs="*",
+        default=[],
+        help=(
+            "Paths to workflow file(s). Accepts a single file, a directory "
+            "containing workflow files, a glob, or multiple paths. "
+            "Auto-detected if not specified."
+        ),
     )
     parser.add_argument(
         "--host",
@@ -448,19 +459,11 @@ def cli():
 
     args = parser.parse_args()
 
-    if args.workflow is None:
-        if Path("workflow.yaml").exists():
-            args.workflow = "./workflow.yaml"
-        elif Path("workflow.yml").exists():
-            args.workflow = "./workflow.yml"
-        elif Path("WORKFLOW.md").exists():
-            args.workflow = "./WORKFLOW.md"
-        else:
-            console.print(
-                "[red]No workflow file found. Create workflow.yaml or WORKFLOW.md, "
-                "or specify a path: stokowski <path>[/red]"
-            )
-            sys.exit(1)
+    try:
+        workflow_paths = resolve_workflow_paths(args.workflow)
+    except FileNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
 
     _load_dotenv()
     setup_logging(args.verbose)
@@ -598,35 +601,54 @@ def _force_kill_children():
 
 # ── Dry run ───────────────────────────────────────────────────────────────────
 
-async def dry_run(workflow_path: str):
+async def dry_run(workflow_paths: Sequence[Path] | Path | str):
     from .config import parse_workflow_file, validate_config
+    from .linear import LinearClient
+
+    if isinstance(workflow_paths, (str, Path)):
+        paths = [Path(workflow_paths)]
+    else:
+        paths = list(workflow_paths)
 
     console.print("[bold]Dry run mode[/bold]\n")
 
-    try:
-        workflow = parse_workflow_file(workflow_path)
-    except Exception as e:
-        console.print(f"[red]Failed to load workflow: {e}[/red]")
-        sys.exit(1)
+    any_errors = False
+    seen_slugs: dict[str, Path] = {}
 
-    errors = validate_config(workflow.config)
-    if errors:
-        for e in errors:
-            console.print(f"[red]Config error: {e}[/red]")
-        sys.exit(1)
+    for idx, path in enumerate(paths):
+        console.print(f"[bold cyan]── Project file {idx + 1}/{len(paths)}: {path}[/bold cyan]")
+        try:
+            workflow = parse_workflow_file(str(path))
+        except Exception as e:
+            console.print(f"[red]Failed to load workflow: {e}[/red]\n")
+            any_errors = True
+            continue
 
-    cfg = workflow.config
-    server_port = cfg.server.port
-    server_host = cfg.server.host or "127.0.0.1"
-    server_info = f"http://{server_host}:{server_port}" if server_port else "disabled"
-    console.print("[green]Config valid[/green]")
-    console.print(f"  Global max_concurrent_agents: {cfg.agent.max_concurrent_agents}")
-    console.print(f"  Polling interval: {cfg.polling.interval_ms}ms")
-    console.print(f"  Web dashboard: {server_info}")
-    console.print(f"  Projects: {len(cfg.projects)}")
-    console.print()
+        errors = validate_config(workflow.config)
+        if errors:
+            for e in errors:
+                console.print(f"[red]  Config error: {e}[/red]")
+            any_errors = True
+            console.print()
+            continue
+        # Cross-file duplicate slug check.
+        slug = cfg.tracker.project_slug
+        if slug in seen_slugs:
+            console.print(
+                f"[red]  Duplicate project_slug={slug!r} — also declared in "
+                f"{seen_slugs[slug]}[/red]\n"
+            )
+            any_errors = True
+            continue
+        seen_slugs[slug] = path
 
-    from .linear import LinearClient
+        console.print("[green]  Config valid[/green]")
+        console.print(f"    Tracker: {cfg.tracker.kind}")
+        console.print(f"    Project: {cfg.tracker.project_slug}")
+        console.print(f"    Max agents: {cfg.agent.max_concurrent_agents}")
+        console.print(f"    Claude model: {cfg.claude.model or 'default'}")
+        console.print(f"    Permission mode: {cfg.claude.permission_mode}")
+        console.print(f"    Workspace root: {cfg.workspace.resolved_root()}")
 
     for project in cfg.projects:
         per_project_cap = (
@@ -685,6 +707,9 @@ async def dry_run(workflow_path: str):
                 )
             console.print(table)
         await client.close()
+        console.print()
+
+    if any_errors:
         console.print()
 
 

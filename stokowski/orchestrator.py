@@ -167,7 +167,7 @@ class Orchestrator:
         self.ledger = Ledger.for_workflow(Path(self.workflow_path))
 
         # Internal
-        self._linear: LinearClient | None = None
+        self._linear: LinearClient | None = None  # legacy single-client slot (Unit 5 removes)
         self._tasks: dict[str, asyncio.Task] = {}
         self._retry_timers: dict[str, asyncio.TimerHandle] = {}
         self._child_pids: set[int] = set()  # Track claude subprocess PIDs
@@ -193,6 +193,7 @@ class Orchestrator:
         self._pending_gates: dict[str, str] = {}           # issue_id -> gate state name
         self._issue_workflow: dict[str, str] = {}          # issue_id -> workflow name
         self._issue_repo: dict[str, str] = {}              # issue_id -> repo name (multi-repo)
+        self._issue_project: dict[str, str] = {}           # issue_id -> project_slug (multi-project)
 
         # Eligible-but-not-dispatched (queue panel data, refreshed each tick)
         self._queued: list[dict] = []
@@ -247,7 +248,17 @@ class Orchestrator:
 
     @property
     def cfg(self) -> ServiceConfig:
-        assert self.workflow is not None
+        """Transitional shim: returns the primary (first-loaded) project cfg.
+
+        Kept so the existing (mostly single-project) call sites and tests
+        continue to work during the Unit 5 sweep. Post-dispatch sites should
+        migrate to ``self._cfg_for_issue(issue_id)``; pre-dispatch shared-
+        globals sites should migrate to ``self._primary_cfg()`` explicitly.
+        Removed at the end of Unit 5.
+        """
+        if self.workflow is None and self.configs:
+            self.workflow = next(iter(self.configs.values()))
+        assert self.workflow is not None, "cfg accessed before _load_all_workflows()"
         return self.workflow.config
 
     def _project_view(self, full: WorkflowDefinition, project: ProjectConfig) -> WorkflowDefinition:
@@ -273,12 +284,13 @@ class Orchestrator:
         )
         return WorkflowDefinition(config=project_cfg, prompt_template=full.prompt_template)
 
-    def _load_workflow(self) -> list[str]:
-        """Load/reload workflow file. Returns validation errors.
+    def _primary_cfg(self) -> ServiceConfig:
+        """Return the first-loaded project's config (for shared globals).
 
-        On successful reload (no validation errors), clears
-        ``_config_blocked`` — a config-error-blocked issue gets a fresh
-        chance after the operator has updated workflow.yaml.
+        Shared globals (``agent.max_concurrent_agents``, ``server.port``) come
+        from whichever project file loaded first, case-insensitively sorted.
+        ``polling.interval_ms`` is NOT read from here — it's cached on
+        ``self._polling_interval_ms`` as the min across all files.
         """
         try:
             full = parse_workflow_file(self.workflow_path)
@@ -415,12 +427,27 @@ class Orchestrator:
             self.pool.release(self.project_name or "")
 
     def _ensure_linear_client(self) -> LinearClient:
-        if self._linear is None:
+        """Legacy single-client accessor.
+
+        Returns the primary project's client. Unit 5 sweep migrates callers
+        to ``_linear_client_for(project_slug)`` with an explicit slug. Kept
+        during Unit 2-4 so existing call sites in the orchestrator keep
+        working before the sweep.
+
+        Test stub support: if ``self._linear`` is set explicitly (as
+        existing tests do), it takes priority — this lets tests continue to
+        stub a single client against the primary project.
+        """
+        if self._linear is not None:
+            return self._linear
+        if not self.configs:
             self._linear = LinearClient(
                 endpoint=self.cfg.tracker.endpoint,
                 api_key=self.cfg.resolved_api_key(),
             )
-        return self._linear
+            return self._linear
+        primary_slug = next(iter(self.configs.keys()))
+        return self._linear_client_for(primary_slug)
 
     # -- Kill / cleanup helpers --
 
@@ -482,6 +509,7 @@ class Orchestrator:
         self._pending_gates.pop(issue_id, None)
         self._issue_workflow.pop(issue_id, None)
         self._issue_repo.pop(issue_id, None)
+        self._issue_project.pop(issue_id, None)
         self._rejected_issues.discard(issue_id)
         self._migrated_issues.discard(issue_id)
         self._config_blocked.discard(issue_id)
