@@ -58,6 +58,24 @@ All state lives in memory. The orchestrator recovers from restart by re-polling 
 ### workflow.yaml as the operator contract
 The operator's `workflow.yaml` defines the runtime config and state machine. Stokowski re-parses it on every poll tick — config changes take effect without restart. Both `.yaml` and legacy `.md` (YAML front matter + Jinja2 body) formats are supported. Prompt templates are now separate `.md` files referenced by path from the config.
 
+### Multi-project polling
+Stokowski supports polling N Linear projects from one orchestrator process by binding multiple `workflow.<project>.yml` files. Each file stays a complete self-contained `ServiceConfig` — no nested schema. The orchestrator multiplexes via `self.configs: dict[project_slug, ParsedConfig]` plus a per-issue `_issue_project: dict[issue_id, project_slug]` cache; every per-issue config lookup routes through `self._cfg_for_issue(issue_id)`.
+
+Operators invoke with a single file (legacy), a directory, a glob, or an explicit list:
+```bash
+stokowski workflow.yaml                 # single project (legacy, unchanged)
+stokowski workflows/                    # directory → every *.yaml/.yml inside
+stokowski 'workflow.*.yml'              # glob
+stokowski workflow.a.yml workflow.b.yml # explicit list
+```
+
+Config settings split three ways:
+- *Shared globals, first-file-wins (alphabetical, case-insensitive):* `agent.max_concurrent_agents`, `server.port`.
+- *Shared globals, min across files:* `polling.interval_ms` (tightest interval wins).
+- *Per-project (isolated by issue.id):* `workspace.root`, `hooks`, `docker.*`, `claude`, `linear_states`, `states`, `workflows`, `repos`, `agent.max_concurrent_agents_by_state`.
+
+Each project has its own `LinearClient` (supports per-project `tracker.api_key`). Broken files are isolated — healthy projects keep dispatching on hot-reload failures.
+
 ### State machine workflow
 Each workflow defines a set of internal states that map to Linear states. States have types: `agent` (runs Claude Code), `gate` (waits for human review), or `terminal` (issue complete). Transitions between states are declared explicitly in config.
 
@@ -152,7 +170,7 @@ while running:
 **Cancellation infrastructure:**
 - `_kill_pid(pid)` — static method, sends SIGKILL to process group with individual kill fallback
 - `_kill_worker(issue_id, reason)` — kills subprocess PID → Docker container → async task (order matters: CancelledError does not propagate to child processes)
-- `_cleanup_issue_state(issue_id)` — removes all 15 per-issue tracking dict/set entries (added `_issue_repo`, `_rejected_issues`, `_migrated_issues` with multi-repo support). Idempotent. Also used by `_transition()` terminal branch.
+- `_cleanup_issue_state(issue_id)` — removes all 16 per-issue tracking dict/set entries (added `_issue_repo`, `_rejected_issues`, `_migrated_issues` with multi-repo support, and `_issue_project` with multi-project support). Idempotent. Also used by `_transition()` terminal branch.
 - `_force_cancelled` set — populated by `_reconcile()` before calling `_kill_worker()`. Checked at the top of `_on_worker_exit()` to prevent double-processing (token aggregation is not idempotent, and `_safe_transition()` could re-populate tracking dicts after cleanup).
 - `_fire_and_forget(coro)` — schedules a coroutine without awaiting it, with `_background_tasks` set to prevent GC.
 
@@ -329,6 +347,8 @@ An automated test suite lives in `tests/` covering config parsing/validation, wo
 - **Agent scope guardrails**: Agents receive a scope restriction in both the system prompt (first turn) and lifecycle section (every turn) prohibiting writes to other Linear issues. This is a probabilistic guardrail, not hard enforcement. For hard enforcement, operators can use `permission_mode: allowedTools` to exclude Linear MCP tools — but this also blocks agents from managing their own ticket (posting comments, moving state).
 - **`STOKOWSKI_ISSUE_IDENTIFIER` env var**: Set per-dispatch in `_run_worker()`, not in `ServiceConfig`. Informational only — useful for hooks that need to know which issue they service. Not a security boundary.
 - **`_cleanup_issue_state()` must stay in sync with `__init__`**: Any new per-issue tracking dict added to `Orchestrator.__init__` must also be added to `_cleanup_issue_state()`. Failure to do so causes memory leaks and stale state on cancellation.
+- **Multi-project: every per-issue `self.cfg` read must route via `_cfg_for_issue(issue_id)`**: Reading `self.cfg` directly in a post-dispatch path silently falls back to the primary project's cfg — project B's ticket would resolve against project A's workflows, repos, or state names. The transitional `self.cfg` property exists only as a back-compat shim during the Unit 5 sweep; new code should use `self._cfg_for_issue_or_primary(issue.id)` (falls back to primary when `_issue_project` has no binding yet) or `self._primary_cfg()` for shared-globals reads.
+- **Multi-project: `_issue_project` must be stamped before any `_cfg_for_issue` call for gate issues**: Gate states (review / gate_approved / rework) are not in `active_linear_states()` so they're never returned by `_tick`'s candidate fetch. `_handle_gate_responses` is the sole binding site for gate issues after orchestrator restart — it iterates projects, stamps `_issue_project` before fetching comments, then runs the existing per-issue logic.
 - **Agent run logs**: When `logging.enabled` is true, raw agent stdout is captured to `{log_dir}/{issue_identifier}/` as `.ndjson` (Claude Code) or `.log` (Codex) files. To debug an agent run: `cat {log_dir}/SMI-14/20260324T041500Z-turn-1.ndjson | jq .` Logs survive workspace cleanup — their lifetime is controlled by `max_age_days` and `max_total_size_mb`. Retention cleanup runs at startup and after each worker exit. Log writes are best-effort — failures do not affect agent execution.
 - **Multi-repo: hook Jinja rendering is gated on `cfg.repos_synthesized`**: When `repos:` section is absent (synthesized=True), root hooks bypass Jinja entirely and pass through to the shell verbatim. This is deliberate — legacy configs may contain literal `{`/`}` shell syntax (credential helpers with `!f() { ...; }; f`). When the operator adds an explicit `repos:` section, Jinja rendering activates with `StrictUndefined` over the `repo` namespace. Typos (e.g. `{{ repo.clne_url }}`) raise `UndefinedError` and post a user-facing Linear comment with retry-cap = 1. Do NOT switch rendering to `_SilentUndefined` for hooks — `git clone $EMPTY` from a silent substitution is catastrophic.
 - **Multi-repo: `_default` repo name is reserved**: Operator-authored `repos:` entries must not use the name `_default`. R21 validation rejects configs that try. The synthesis branch uses `_default` with `label=None`/`clone_url=""` as its sentinel shape, and `_repos_synthesized` distinguishes synthesis from operator authorship.

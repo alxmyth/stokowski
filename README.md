@@ -208,6 +208,31 @@ Symphony assumes one Linear project maps to one repo. Stokowski supports the tea
 </details>
 
 <details>
+<summary><strong>Multi-project orchestration</strong></summary>
+
+One orchestrator process can poll N Linear projects by binding multiple `workflow.<project>.yml` files. Each file stays a complete self-contained config — no nested schema, no cross-file coupling. Invoke with a single file (legacy), a directory, a glob, or an explicit list:
+
+```bash
+stokowski workflow.yaml                 # single project (legacy, unchanged)
+stokowski workflows/                    # directory → every *.yaml/.yml inside
+stokowski 'workflow.*.yml'              # glob
+stokowski workflow.a.yml workflow.b.yml # explicit list
+```
+
+Per-project isolation:
+- Own `tracker.api_key` — per-project API keys are first-class.
+- Own `linear_states`, `states`, `workflows`, `repos`, `hooks`, `workspace.root`, `docker.*`, `claude` defaults.
+- Own `LinearClient` — one httpx client per project, closed together at shutdown.
+
+Shared globals (first-file-wins, alphabetical-case-insensitive): `agent.max_concurrent_agents`, `server.port`. Shared global that reduces across files: `polling.interval_ms` (min wins). A broken edit to one project file does not stall healthy projects — per-file hot-reload with last-known-good preservation.
+
+Every dispatch adds `STOKOWSKI_LINEAR_PROJECT_SLUG` to the agent subprocess env alongside `STOKOWSKI_ISSUE_IDENTIFIER`. The dashboard snapshot emits `project_slug` on every running/gates/retrying entry.
+
+See `workflow.multi-project.example.yaml` for the worked example.
+
+</details>
+
+<details>
 <summary><strong>Three-layer prompt assembly</strong></summary>
 
 Symphony renders a single Jinja2 template from `WORKFLOW.md`. Stokowski builds prompts from three layers:

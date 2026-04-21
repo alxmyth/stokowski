@@ -1,0 +1,111 @@
+# =============================================================================
+# Stokowski — Example: one orchestrator polling N Linear projects
+# =============================================================================
+#
+# This file is one of N workflow.<project>.yml files bound to a single
+# orchestrator process. Each file remains a complete, self-contained
+# ServiceConfig — there is no nested "projects:" schema, no cross-file
+# coupling. The orchestrator multiplexes by project_slug.
+#
+# Operators invoke Stokowski with multiple files like so:
+#   stokowski workflows/                        # every *.yaml/.yml in the dir
+#   stokowski 'workflow.*.yml'                  # glob
+#   stokowski workflow.api.yml workflow.web.yml # explicit list
+#   stokowski workflow.yaml                     # single project (legacy)
+#
+# Primary-file-wins shared globals:
+#   - agent.max_concurrent_agents  → from the first-loaded file
+#   - server.port                  → from the first-loaded file
+#
+# Min-across-files shared globals:
+#   - polling.interval_ms  → smallest value across all files
+#
+# Per-project (isolated):
+#   - workspace.root, hooks, docker.*, claude defaults, linear_states,
+#     states, workflows, repos, agent.max_concurrent_agents_by_state
+#
+# File ordering is case-insensitive alphabetical, so "primary" selection
+# is deterministic across platforms.
+# =============================================================================
+
+tracker:
+  kind: linear
+  project_slug: "abc123def456"      # unique hex slugId per project
+  api_key: "$ALPHA_LINEAR_API_KEY"  # per-project API key supported
+
+linear_states:
+  todo: "Todo"
+  active: "In Progress"
+  review: "Human Review"
+  gate_approved: "Gate Approved"
+  rework: "Rework"
+  terminal:
+    - Done
+    - Cancelled
+
+polling:
+  interval_ms: 15000                # min across files wins globally
+
+workspace:
+  root: ~/code/stokowski-workspaces/alpha
+
+hooks:
+  after_create: |
+    git clone --depth 1 {{ repo.clone_url }} .
+  timeout_ms: 120000
+
+claude:
+  permission_mode: auto
+  model: claude-sonnet-4-6
+  max_turns: 20
+  turn_timeout_ms: 3600000
+  stall_timeout_ms: 300000
+
+agent:
+  max_concurrent_agents: 4          # first-file-wins — applies globally
+  max_retry_backoff_ms: 300000
+  max_concurrent_agents_by_state:   # per-project — state names are per-workflow
+    implement: 2
+    code-review: 1
+
+prompts:
+  global_prompt: prompts/global.example.md
+
+server:
+  port: 4200                        # first-file-wins — only one dashboard
+
+repos:
+  api:
+    label: "repo:api"
+    clone_url: "git@github.com:alpha-org/api.git"
+    default: true
+  web:
+    label: "repo:web"
+    clone_url: "git@github.com:alpha-org/web.git"
+
+states:
+  investigate:
+    type: agent
+    prompt: prompts/investigate.example.md
+    linear_state: active
+    transitions:
+      complete: implement
+  implement:
+    type: agent
+    prompt: prompts/implement.example.md
+    linear_state: active
+    transitions:
+      complete: done
+  done:
+    type: terminal
+    linear_state: terminal
+
+# ---------------------------------------------------------------------------
+# Environment variables added for multi-project dispatches:
+# ---------------------------------------------------------------------------
+# Every agent subprocess receives:
+#   STOKOWSKI_LINEAR_PROJECT_SLUG=<this project's slug>
+# alongside the existing STOKOWSKI_ISSUE_IDENTIFIER / STOKOWSKI_REPO_NAME /
+# STOKOWSKI_REPO_CLONE_URL. Hooks can branch on the project slug — useful
+# when multiple projects target a single monorepo with project-specific
+# setup.
