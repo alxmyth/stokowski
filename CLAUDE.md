@@ -152,7 +152,7 @@ while running:
 **Cancellation infrastructure:**
 - `_kill_pid(pid)` — static method, sends SIGKILL to process group with individual kill fallback
 - `_kill_worker(issue_id, reason)` — kills subprocess PID → Docker container → async task (order matters: CancelledError does not propagate to child processes)
-- `_cleanup_issue_state(issue_id)` — removes all 14 per-issue tracking dict/set entries (added `_issue_repo`, `_rejected_issues`, `_migrated_issues` with multi-repo support). Idempotent. Also used by `_transition()` terminal branch.
+- `_cleanup_issue_state(issue_id)` — removes all 15 per-issue tracking dict/set entries (added `_issue_repo`, `_rejected_issues`, `_migrated_issues` with multi-repo support). Idempotent. Also used by `_transition()` terminal branch.
 - `_force_cancelled` set — populated by `_reconcile()` before calling `_kill_worker()`. Checked at the top of `_on_worker_exit()` to prevent double-processing (token aggregation is not idempotent, and `_safe_transition()` could re-populate tracking dicts after cleanup).
 - `_fire_and_forget(coro)` — schedules a coroutine without awaiting it, with `_background_tasks` set to prevent GC.
 

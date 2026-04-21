@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -11,7 +12,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from jinja2 import Environment, StrictUndefined, TemplateSyntaxError
+from jinja2 import (
+    Environment,
+    StrictUndefined,
+    TemplateSyntaxError,
+    UndefinedError,
+)
 
 from .config import (
     ClaudeConfig,
@@ -29,6 +35,7 @@ from .config import (
 from .docker_runner import (
     check_docker_available,
     cleanup_orphaned_containers,
+    cleanup_orphaned_volumes,
     kill_container,
     pull_image,
 )
@@ -40,7 +47,6 @@ from .prompt import (
     render_hook_template,
     render_hooks_for_dispatch,
 )
-from jinja2 import UndefinedError
 from .runner import run_agent_turn, run_turn
 from .tracking import (
     has_pending_rejection,
@@ -156,18 +162,54 @@ class Orchestrator:
         # so a sequence of gate fetches on the same issue does not spam.
         self._migrated_issues: set[str] = set()
 
+        # Config-error block set — populated when a dispatch fails due to a
+        # permanent config problem (hook template typo, Jinja2 syntax error).
+        # _is_eligible observes this to prevent retry loops on unrecoverable
+        # errors. Cleared on every successful _load_workflow so dispatch
+        # resumes when the operator fixes workflow.yaml. Also cleared on
+        # issue-labels change (_last_issues diff) in case the issue was
+        # moved to a different repo/workflow whose config is healthy.
+        self._config_blocked: set[str] = set()
+
+        # Rejection fetch-failure marker — when _process_rejections can't
+        # fetch comments for a dual-label issue, we fail closed (add to
+        # _rejected_issues) to prevent dispatching with arbitrary first-wins
+        # repo routing. This companion set tracks "pessimistic" rejections
+        # that should be re-evaluated on the next tick instead of sticking
+        # until labels change. See ADV-003.
+        self._rejection_fetch_pending: set[str] = set()
+
+        # Prior-tick labels snapshot — captured BEFORE _last_issues is
+        # updated on each tick. Consumed by _process_rejections to detect
+        # label changes since the previous tick (see COR-001). Keyed by
+        # issue id, holds the sorted lowercase label list from the prior
+        # tick's Issue. Empty on the first tick / orchestrator restart
+        # (which is correct: no prior tick to compare against).
+        self._prev_issue_labels: dict[str, list[str]] = {}
+
     @property
     def cfg(self) -> ServiceConfig:
         assert self.workflow is not None
         return self.workflow.config
 
     def _load_workflow(self) -> list[str]:
-        """Load/reload workflow file. Returns validation errors."""
+        """Load/reload workflow file. Returns validation errors.
+
+        On successful reload (no validation errors), clears
+        ``_config_blocked`` — a config-error-blocked issue gets a fresh
+        chance after the operator has updated workflow.yaml.
+        """
         try:
             self.workflow = parse_workflow_file(self.workflow_path)
         except Exception as e:
             return [f"Workflow load error: {e}"]
-        return validate_config(self.cfg)
+        errors = validate_config(self.cfg)
+        if not errors:
+            # Config is healthy — give previously blocked issues a fresh
+            # chance to dispatch. If the hook template is still broken,
+            # _run_worker will re-block them on the next dispatch.
+            self._config_blocked.clear()
+        return errors
 
     def _ensure_linear_client(self) -> LinearClient:
         if self._linear is None:
@@ -239,6 +281,9 @@ class Orchestrator:
         self._issue_repo.pop(issue_id, None)
         self._rejected_issues.discard(issue_id)
         self._migrated_issues.discard(issue_id)
+        self._config_blocked.discard(issue_id)
+        self._rejection_fetch_pending.discard(issue_id)
+        self._prev_issue_labels.pop(issue_id, None)
         # -- Session/timing --
         self._last_session_ids.pop(issue_id, None)
         self._last_completed_at.pop(issue_id, None)
@@ -427,15 +472,48 @@ class Orchestrator:
             # At startup we don't know which repo each terminal issue last ran
             # against (the _issue_repo cache is empty). Iterate every repo and
             # try to remove the composite-keyed workspace. remove_workspace is
-            # idempotent — missing workspaces are a silent no-op.
+            # idempotent — missing workspaces are a silent no-op. Per-repo hooks
+            # are rendered best-effort so a hook template typo doesn't block
+            # the cleanup sweep.
             for issue in terminal:
                 for repo in self.cfg.repos.values():
+                    rendered_hooks = _render_hooks_best_effort(
+                        self.cfg.hooks, repo, self.cfg.repos_synthesized,
+                    )
                     await remove_workspace(
-                        ws_root, issue.identifier, repo.name, self.cfg.hooks,
+                        ws_root, issue.identifier, repo.name, rendered_hooks,
                         docker_cfg=self.cfg.docker if self.cfg.docker.enabled else None,
                     )
         except Exception as e:
             logger.warning(f"Startup cleanup failed (continuing): {e}")
+
+        # Prune orphaned Docker volumes that don't correspond to any currently
+        # active issue. This catches (a) pre-upgrade flat-keyed volumes from
+        # before the composite-key migration, and (b) stale volumes from
+        # crashed orchestrator runs. The active_keys set contains the
+        # composite key for every (issue, repo) pair an active issue could
+        # currently occupy.
+        if self.cfg.docker.enabled:
+            try:
+                active_keys: set[str] = set()
+                # Seed with any currently-running or cached issues across all
+                # configured repos. We don't know which repo each issue maps
+                # to yet, so include the full cartesian product — false
+                # negatives are safe, false positives are the bug we're
+                # trying to avoid.
+                for issue_id, issue_obj in self._last_issues.items():
+                    for repo in self.cfg.repos.values():
+                        from .workspace import compose_workspace_key
+                        active_keys.add(
+                            compose_workspace_key(issue_obj.identifier, repo.name).lower()
+                        )
+                removed = await cleanup_orphaned_volumes(self.cfg.docker, active_keys)
+                if removed:
+                    logger.info(
+                        f"Pruned {removed} orphaned Docker workspace volume(s)"
+                    )
+            except Exception as e:
+                logger.warning(f"Docker volume cleanup failed (continuing): {e}")
 
         await self._cleanup_logs()
 
@@ -479,7 +557,7 @@ class Orchestrator:
             return next(iter(self.cfg.workflows.values()))
         raise RuntimeError("No workflows defined in config")
 
-    def _resolve_repo(self, issue: Issue) -> "RepoConfig":
+    def _resolve_repo(self, issue: Issue) -> RepoConfig:
         """Resolve which repo applies to an issue and cache the result.
 
         Mirrors ``_resolve_workflow``. Calls ``self.cfg.resolve_repo(issue)``
@@ -499,7 +577,7 @@ class Orchestrator:
         """
         return self._get_issue_repo_config(issue_id).name
 
-    def _get_issue_repo_config(self, issue_id: str) -> "RepoConfig":
+    def _get_issue_repo_config(self, issue_id: str) -> RepoConfig:
         """Look up the cached repo for an issue, with fallbacks.
 
         Resolution order, mirroring ``_get_issue_workflow_config``:
@@ -966,7 +1044,8 @@ class Orchestrator:
                 continue
 
             gate_state = self._pending_gates.pop(issue.id, None)
-            tracking = None
+            tracking: dict | None = None
+            comments: list[dict] | None = None
             if not gate_state:
                 # Cold-start fallback: fetch comments to find gate state
                 comments = await client.fetch_comments(issue.id)
@@ -978,6 +1057,21 @@ class Orchestrator:
                 try:
                     # Resolve workflow (cold-start recovery if needed)
                     workflow = self._resolve_gate_workflow(issue, tracking)
+
+                    # Resolve repo too — after an orchestrator restart the
+                    # _issue_repo cache is empty, so _repo_name_for_tracking
+                    # would fall through to the default repo and stamp the
+                    # wrong repo name into gate/state comments (COR-003).
+                    # _resolve_repo_for_coldstart populates the cache from
+                    # the tracking comment's repo field or from labels,
+                    # with a one-time migrated-comment for pre-v1 threads.
+                    if issue.id not in self._issue_repo:
+                        if comments is None:
+                            comments = await client.fetch_comments(issue.id)
+                            tracking = tracking or parse_latest_tracking(comments)
+                        await self._resolve_repo_for_coldstart(
+                            issue, tracking, comments,
+                        )
 
                     run = self._issue_state_runs.get(issue.id, 1)
                     repo_name = self._repo_name_for_tracking(issue.id)
@@ -1041,7 +1135,8 @@ class Orchestrator:
                 continue
 
             gate_state = self._pending_gates.pop(issue.id, None)
-            tracking = None
+            tracking: dict | None = None
+            comments: list[dict] | None = None
             if not gate_state:
                 # Cold-start fallback: fetch comments to find gate state
                 comments = await client.fetch_comments(issue.id)
@@ -1053,6 +1148,16 @@ class Orchestrator:
                 try:
                     # Resolve workflow (cold-start recovery if needed)
                     workflow = self._resolve_gate_workflow(issue, tracking)
+
+                    # Resolve repo too — see COR-003 rationale in the
+                    # approval path above.
+                    if issue.id not in self._issue_repo:
+                        if comments is None:
+                            comments = await client.fetch_comments(issue.id)
+                            tracking = tracking or parse_latest_tracking(comments)
+                        await self._resolve_repo_for_coldstart(
+                            issue, tracking, comments,
+                        )
 
                     gate_cfg = self.cfg.states.get(gate_state)
 
@@ -1144,6 +1249,23 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Failed to fetch candidates: {e}")
             return
+
+        # Snapshot prior-tick labels BEFORE updating _last_issues. The
+        # rejection pre-pass needs the PREVIOUS tick's labels to detect a
+        # label change (see COR-001: the stale-label invalidation in
+        # _process_rejections was dead code when it compared against the
+        # freshly-updated _last_issues).
+        for issue in candidates:
+            prior = self._last_issues.get(issue.id)
+            if prior is not None:
+                self._prev_issue_labels[issue.id] = sorted(
+                    l.lower() for l in prior.labels
+                )
+            else:
+                # No prior record — either the first tick we've seen this
+                # issue, or the orchestrator just restarted. Either way,
+                # there's no change to detect.
+                self._prev_issue_labels.pop(issue.id, None)
 
         # Cache issues for retry lookup
         for issue in candidates:
@@ -1253,15 +1375,26 @@ class Orchestrator:
 
         self._issue_repo[issue.id] = resolved.name
 
-        # Post a migration notice when tracking exists but carried no repo
-        # field. This is the pre-multi-repo tracking shape — a signal that
-        # the ticket was mid-dispatch when the operator deployed v1.
-        if (
+        # Handle pre-multi-repo tracking (tracking exists but has no repo
+        # field). Two post-migration actions, in priority order:
+        #   (1) Post a one-time stokowski:migrated comment so the recovery
+        #       decision is auditable on the ticket thread.
+        #   (2) Log a warning if the issue also has a repo:* label that
+        #       didn't match any configured repo (could indicate config
+        #       drift since the issue was last dispatched).
+        #
+        # KP-06: the previous structure ran these as two independent blocks
+        # with the same guard, which made the warning in (2) dead code on
+        # the (1)-success path (because (1) added issue.id to
+        # _migrated_issues, invalidating the "not in _migrated_issues"
+        # guard in (2)). Restructured as an if/elif so both paths are
+        # reachable: warning fires when the migration comment post fails.
+        pre_migration = (
             tracking is not None
             and tracking.get("repo") is None
-            and issue.id not in self._migrated_issues
             and resolved.name == "_default"
-        ):
+        )
+        if pre_migration and issue.id not in self._migrated_issues:
             try:
                 client = self._ensure_linear_client()
                 await client.post_comment(
@@ -1273,16 +1406,12 @@ class Orchestrator:
                     f"Failed to post migrated comment for "
                     f"{issue.identifier}: {e}"
                 )
+                # Fall through to the operator-facing warning below so at
+                # least the log has a signal that we hit the migration
+                # path. The warning is cheaper than the comment and costs
+                # nothing on repeat ticks.
 
-        # If labels point to an explicit repo but we fell back to _default
-        # (because labels include a `repo:*` that doesn't match anything),
-        # that's an operator-facing situation worth surfacing. The brainstorm
-        # specified this safety check for cold-start scenarios.
-        if (
-            tracking is not None
-            and tracking.get("repo") is None
-            and resolved.name == "_default"
-        ):
+        if pre_migration:
             has_repo_label = any(
                 l.lower().startswith("repo:") for l in (issue.labels or [])
             )
@@ -1320,14 +1449,25 @@ class Orchestrator:
             current_labels = [l.lower() for l in (issue.labels or [])]
             repo_labels = [l for l in current_labels if l.startswith("repo:")]
 
-            # Clear stale markers when labels changed
-            last_issue = self._last_issues.get(issue.id)
+            # Clear stale markers when labels changed since the prior tick.
+            # _prev_issue_labels is captured at the top of _tick BEFORE
+            # _last_issues is updated, so the comparison is against the
+            # PREVIOUS tick's labels, not the current tick's (COR-001).
+            prior_labels = self._prev_issue_labels.get(issue.id)
             if (
                 issue.id in self._rejected_issues
-                and last_issue is not None
-                and sorted(l.lower() for l in last_issue.labels) != sorted(current_labels)
+                and prior_labels is not None
+                and prior_labels != sorted(current_labels)
             ):
                 self._rejected_issues.discard(issue.id)
+                self._rejection_fetch_pending.discard(issue.id)
+
+            # Re-evaluate pessimistic rejections (fetch failures from prior
+            # ticks) regardless of label change — the Linear outage may have
+            # cleared and we should re-attempt the dedup check.
+            if issue.id in self._rejection_fetch_pending:
+                self._rejected_issues.discard(issue.id)
+                self._rejection_fetch_pending.discard(issue.id)
 
             if len(repo_labels) > 1:
                 if issue.id in self._rejected_issues:
@@ -1338,10 +1478,20 @@ class Orchestrator:
                 try:
                     comments = await client.fetch_comments(issue.id)
                 except Exception as e:
-                    logger.warning(
+                    # Fail-closed (ADV-003): without knowing whether a prior
+                    # rejection comment exists, dispatching a dual-labeled
+                    # ticket would commit an arbitrary first-wins repo
+                    # routing to the tracking thread — worse than a
+                    # temporary stall. Mark rejected AND flag for retry so
+                    # the next tick re-attempts the fetch regardless of
+                    # whether labels changed.
+                    logger.error(
                         f"Rejection pre-pass: failed to fetch comments for "
-                        f"{issue.identifier}: {e}"
+                        f"{issue.identifier}: {e}. Failing closed — will "
+                        f"retry on next tick."
                     )
+                    self._rejected_issues.add(issue.id)
+                    self._rejection_fetch_pending.add(issue.id)
                     continue
 
                 if not has_pending_rejection(comments, current_labels):
@@ -1389,6 +1539,12 @@ class Orchestrator:
         # (see _process_rejections) has already done the Linear work of
         # posting a dedup'd rejection comment; we just observe the set here.
         if issue.id in self._rejected_issues:
+            return False
+
+        # Config-error block: hook template rendering failed on a prior
+        # dispatch. Retrying won't fix a config typo; _load_workflow clears
+        # this set when the operator reloads a valid workflow.yaml.
+        if issue.id in self._config_blocked:
             return False
 
         state_lower = issue.state.strip().lower()
@@ -1461,13 +1617,24 @@ class Orchestrator:
         )
 
     async def _run_worker(self, issue: Issue, attempt: RunAttempt):
-        """Worker coroutine: prepare workspace, run agent turns."""
+        """Worker coroutine: prepare workspace, run agent turns.
+
+        Hot-reload race (ADV-005): ``self.cfg`` is mutated by
+        ``_load_workflow`` at every tick. If a concurrent tick runs while
+        this coroutine is awaiting, subsequent ``self.cfg`` reads inside
+        this worker would see a fresh (possibly different) config. To pin
+        the worker to the config it was dispatched under, we snapshot
+        ``self.cfg`` into a local ``cfg`` before the first await and use
+        it for all repo/workflow lookups below. ``self.cfg`` is still
+        safe for pure state reads that tolerate hot-reload.
+        """
+        cfg = self.cfg  # snapshot — see ADV-005
         try:
             # Resolve state if not set
             if not attempt.state_name:
                 state_name, run = await self._resolve_current_state(issue)
                 attempt.state_name = state_name
-                state_cfg = self.cfg.states.get(state_name)
+                state_cfg = cfg.states.get(state_name)
                 if state_cfg and state_cfg.type == "gate":
                     # Issue should be at a gate, not running
                     await self._enter_gate(issue, state_name)
@@ -1486,11 +1653,31 @@ class Orchestrator:
                 )
                 runner_type = state_cfg.runner
 
-            ws_root = self.cfg.workspace.resolved_root()
-            # Resolve repo for this dispatch and cache the name. _resolve_repo
-            # is idempotent: calling it re-evaluates labels each dispatch and
-            # updates _issue_repo accordingly (supports mid-flight label changes).
-            repo = self._resolve_repo(issue)
+            ws_root = cfg.workspace.resolved_root()
+            # Resolve repo using the pinned cfg snapshot (ADV-005). A
+            # concurrent _load_workflow during our await could have swapped
+            # self.cfg; resolving via `cfg.resolve_repo` guarantees the
+            # repo corresponds to the config we started this dispatch
+            # against. _issue_repo cache is still updated so subsequent
+            # ticks see the resolution.
+            try:
+                repo = cfg.resolve_repo(issue)
+                self._issue_repo[issue.id] = repo.name
+            except ValueError as e:
+                # No default repo configured — config got corrupted by a
+                # hot-reload between dispatch and here, or the operator
+                # removed the default. Treat as config_error.
+                msg = (
+                    f"Repo resolution failed for {issue.identifier}: {e}. "
+                    f"No matching `repo:*` label and no default repo in "
+                    f"the current config."
+                )
+                logger.error(msg)
+                self._fire_and_forget(self._post_hook_error_comment(issue.id, msg))
+                attempt.status = "config_error"
+                attempt.error = str(e)
+                self._on_worker_exit(issue, attempt)
+                return
             docker_image = ""
             if self.cfg.docker.enabled:
                 docker_image = _resolve_docker_image(
@@ -1504,23 +1691,39 @@ class Orchestrator:
                 rendered_hooks = render_hooks_for_dispatch(
                     self.cfg.hooks, repo, self.cfg.repos_synthesized
                 )
-            except UndefinedError as render_err:
-                # Config typo in a hook template. Surface as Linear comment
-                # + log error. Cap retries at 1 — the template won't fix
-                # itself via exponential backoff.
+            except (UndefinedError, TemplateSyntaxError) as render_err:
+                # Config-level problem in a hook template:
+                # - UndefinedError: a variable reference like {{ repo.clne_url }} (typo)
+                # - TemplateSyntaxError: a `{{ ` / `{% ` that Jinja2 can't parse
+                #   (common when migrating a legacy config with Jinja2-conflicting
+                #   shell syntax from 1:1 to multi-repo mode).
+                # Surface on Linear + mark status='config_error' so _on_worker_exit
+                # routes to _config_blocked (no retry loop) instead of scheduling
+                # exponential backoff against a broken template.
+                if isinstance(render_err, UndefinedError):
+                    hint = (
+                        "This typically means a typo in a Jinja2 variable "
+                        "reference (e.g. `{{ repo.clne_url }}` instead of "
+                        "`{{ repo.clone_url }}`)."
+                    )
+                else:
+                    hint = (
+                        "Jinja2 could not parse the hook body. Common cause: "
+                        "migrating a legacy 1:1 config with shell syntax like "
+                        "`!f() {{ ...; }}; f` or literal `{{ `/`{% ` tokens to "
+                        "multi-repo mode, which activates Jinja2 rendering. "
+                        "Either escape the tokens (`{{ '{{' }}`) or rework the "
+                        "hook body."
+                    )
                 msg = (
                     f"Hook template rendering failed for "
-                    f"{issue.identifier} (repo={repo.name}): {render_err}. "
-                    f"This typically means a typo in a Jinja2 variable "
-                    f"reference (e.g. `{{{{ repo.clne_url }}}}` instead of "
-                    f"`{{{{ repo.clone_url }}}}`). Check your root hooks."
+                    f"{issue.identifier} (repo={repo.name}): "
+                    f"{type(render_err).__name__}: {render_err}. {hint}"
                 )
                 logger.error(msg)
                 self._fire_and_forget(self._post_hook_error_comment(issue.id, msg))
-                attempt.status = "failed"
+                attempt.status = "config_error"
                 attempt.error = f"hook template error: {render_err}"
-                # Mark as non-retriable by setting attempt number high
-                attempt.attempt = 999
                 self._on_worker_exit(issue, attempt)
                 return
             ws = await ensure_workspace(
@@ -1576,19 +1779,18 @@ class Orchestrator:
                             state_cfg.hooks.on_stage_enter, repo
                         )
                     )
-                except UndefinedError as render_err:
+                except (UndefinedError, TemplateSyntaxError) as render_err:
                     msg = (
                         f"on_stage_enter hook template rendering failed for "
                         f"{issue.identifier} state={state_name} repo={repo.name}: "
-                        f"{render_err}"
+                        f"{type(render_err).__name__}: {render_err}"
                     )
                     logger.error(msg)
                     self._fire_and_forget(
                         self._post_hook_error_comment(issue.id, msg)
                     )
-                    attempt.status = "failed"
+                    attempt.status = "config_error"
                     attempt.error = f"hook template error: {render_err}"
-                    attempt.attempt = 999
                     self._on_worker_exit(issue, attempt)
                     return
                 ok = await run_hook(
@@ -1628,7 +1830,6 @@ class Orchestrator:
             # specific repos don't need the full registry.
             workflow_for_env = self._get_issue_workflow_config(issue.id)
             if workflow_for_env.triage:
-                import json as _json
                 repo_list = [
                     {
                         "name": r.name,
@@ -1638,7 +1839,7 @@ class Orchestrator:
                     for r in self.cfg.repos.values()
                     if r.name != "_default"
                 ]
-                agent_env["STOKOWSKI_REPOS_JSON"] = _json.dumps(repo_list)
+                agent_env["STOKOWSKI_REPOS_JSON"] = json.dumps(repo_list)
 
             # Build log path if logging enabled
             log_path = None
@@ -1952,6 +2153,21 @@ class Orchestrator:
             else:
                 # Legacy mode
                 self._schedule_retry(issue, attempt_num=1, delay_ms=1000)
+        elif attempt.status == "config_error":
+            # Unrecoverable config problem (hook template typo, Jinja2
+            # syntax error, etc). A retry loop can't fix a config typo, so
+            # mark the issue blocked and release the claim. On successful
+            # hot-reload of workflow.yaml, _load_workflow clears
+            # _config_blocked and the issue dispatches again.
+            self._config_blocked.add(issue.id)
+            self.claimed.discard(issue.id)
+            self.running.pop(issue.id, None)
+            self._tasks.pop(issue.id, None)
+            logger.warning(
+                f"Config error blocking issue={issue.identifier}: "
+                f"{attempt.error}. Dispatch will resume after "
+                f"workflow.yaml is reloaded with a valid config."
+            )
         elif attempt.status in ("failed", "timed_out", "stalled"):
             current_attempt = (attempt.attempt or 0) + 1
             delay = min(
