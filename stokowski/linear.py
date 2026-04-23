@@ -382,7 +382,7 @@ class LinearClient:
         try:
             data = await self._graphql(COMMENTS_QUERY, {"issueId": issue_id})
             issue = data.get("issue", {})
-            nodes = issue.get("comments", {}).get("nodes", [])
+            nodes = issue.get("comments", {}).get("nodes", []) or []
             return sorted(nodes, key=lambda c: c.get("createdAt") or "")
         except Exception as e:
             logger.error(f"Failed to fetch comments for {issue_id}: {e}")
