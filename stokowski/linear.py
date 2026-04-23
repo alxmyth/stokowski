@@ -318,11 +318,19 @@ class LinearClient:
             return False
 
     async def fetch_comments(self, issue_id: str) -> list[dict]:
-        """Fetch all comments on a Linear issue. Returns list of {id, body, createdAt}."""
+        """Fetch all comments on a Linear issue, oldest-first.
+
+        ``parse_latest_tracking`` and ``get_last_tracking_timestamp`` use
+        last-match-wins semantics that require oldest-first input. Linear's
+        ``comments(orderBy: createdAt)`` defaults to descending, so we sort
+        ascending here to honor the callers' documented contract regardless
+        of Linear's default direction.
+        """
         try:
             data = await self._graphql(COMMENTS_QUERY, {"issueId": issue_id})
             issue = data.get("issue", {})
-            return issue.get("comments", {}).get("nodes", [])
+            nodes = issue.get("comments", {}).get("nodes", []) or []
+            return sorted(nodes, key=lambda c: c.get("createdAt") or "")
         except Exception as e:
             logger.error(f"Failed to fetch comments for {issue_id}: {e}")
             return []
