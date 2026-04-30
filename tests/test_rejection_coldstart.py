@@ -14,14 +14,32 @@ import pytest
 
 from stokowski.models import Issue
 from stokowski.orchestrator import Orchestrator
+import json as _json
+
 from stokowski.tracking import (
-    make_gate_comment,
     make_migrated_comment,
     make_rejection_comment,
-    make_state_comment,
     REJECTED_PATTERN,
     MIGRATED_PATTERN,
 )
+
+
+def _legacy_state_comment(
+    state: str, run: int, workflow: str | None = None,
+    repo: str | None = None,
+) -> str:
+    """Fabricate a pre-attachment-era ``stokowski:state`` comment body.
+
+    Production code no longer emits these — state lives in the Linear
+    attachment. Tests still need to seed legacy thread shapes to verify
+    ``parse_latest_tracking`` migration fallback behaviour.
+    """
+    payload: dict[str, object] = {"state": state, "run": run}
+    if workflow is not None:
+        payload["workflow"] = workflow
+    if repo is not None:
+        payload["repo"] = repo
+    return f"<!-- stokowski:state {_json.dumps(payload)} -->"
 
 
 def _run(coro):
@@ -317,8 +335,11 @@ repos:
     orch._linear = stub
 
     # Preload a state comment from the triage workflow (the ticket came out
-    # of triage, then triage labeled it with two repos — human or bug)
-    triage_state_comment = make_state_comment(
+    # of triage, then triage labeled it with two repos — human or bug).
+    # Use a legacy comment shape because ``_process_rejections`` consults
+    # ``parse_latest_tracking`` over the comment thread for triage-origin
+    # detection.
+    triage_state_comment = _legacy_state_comment(
         state="work", run=1, workflow="intake", repo="_default",
     )
     stub.preloaded["iid-1"] = [
