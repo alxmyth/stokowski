@@ -1,8 +1,14 @@
-"""Tests for multi-repo additions to tracking comments (Unit 7).
+"""Tests for multi-repo additions to tracking (Unit 7).
+
+After the attachment-tracking refactor, the repo field lives in
+attachment metadata (built via ``build_attachment_metadata``), not in
+comment bodies. ``make_state_comment`` is silent and
+``make_gate_comment`` only emits human text for rework/escalated.
 
 Covers:
-- make_state_comment / make_gate_comment carrying the repo field
-- parse_latest_tracking defensive read (.get with None default)
+- build_attachment_metadata carrying the repo field
+- parse_latest_tracking defensive read against LEGACY comment bodies
+  (still consulted as a migration fallback for pre-attachment issues)
 - make_rejection_comment payload + has_pending_rejection dedup
 - make_migrated_comment payload
 """
@@ -12,63 +18,96 @@ from __future__ import annotations
 import json
 
 from stokowski.tracking import (
-    GATE_PATTERN,
     MIGRATED_PATTERN,
     REJECTED_PATTERN,
-    STATE_PATTERN,
+    build_attachment_metadata,
     has_pending_rejection,
-    make_gate_comment,
     make_migrated_comment,
     make_rejection_comment,
-    make_state_comment,
     parse_latest_tracking,
 )
 
 
-# ── make_state_comment: repo field ──────────────────────────────────────────
+# ── Legacy comment fabricators ──────────────────────────────────────────────
+#
+# Production code no longer emits ``<!-- stokowski:state ... -->`` or
+# ``<!-- stokowski:gate ... -->`` comment payloads — state lives in the
+# Linear attachment. ``parse_latest_tracking`` is retained as a fallback
+# for pre-attachment issues during migration, so we build legacy bodies
+# by hand here to exercise the parser.
 
 
-def test_state_comment_includes_repo_field():
-    body = make_state_comment(state="plan", run=1, workflow="std", repo="api")
-    match = STATE_PATTERN.search(body)
-    assert match is not None
-    data = json.loads(match.group(1))
-    assert data["repo"] == "api"
+def _legacy_state_comment(
+    state: str, run: int, workflow: str | None = None,
+    repo: str | None = None,
+) -> str:
+    payload: dict[str, object] = {"state": state, "run": run}
+    if workflow is not None:
+        payload["workflow"] = workflow
+    if repo is not None:
+        payload["repo"] = repo
+    return f"<!-- stokowski:state {json.dumps(payload)} -->"
 
 
-def test_state_comment_omits_repo_when_none():
-    """Backward compat: repo=None omits the field entirely from the payload."""
-    body = make_state_comment(state="plan", run=1, workflow="std")
-    match = STATE_PATTERN.search(body)
-    data = json.loads(match.group(1))
-    assert "repo" not in data
+def _legacy_gate_comment(
+    state: str, status: str, run: int = 1,
+    workflow: str | None = None, repo: str | None = None,
+) -> str:
+    payload: dict[str, object] = {
+        "state": state, "status": status, "run": run,
+    }
+    if workflow is not None:
+        payload["workflow"] = workflow
+    if repo is not None:
+        payload["repo"] = repo
+    return f"<!-- stokowski:gate {json.dumps(payload)} -->"
 
 
-# ── make_gate_comment: repo field ───────────────────────────────────────────
+# ── build_attachment_metadata: repo field ───────────────────────────────────
 
 
-def test_gate_comment_includes_repo_field():
-    body = make_gate_comment(
-        state="review", status="waiting", run=1, workflow="std", repo="api",
+def test_state_metadata_includes_repo_field():
+    meta = build_attachment_metadata(
+        state="plan", type="state", run=1, workflow="std", repo="api",
     )
-    match = GATE_PATTERN.search(body)
-    data = json.loads(match.group(1))
-    assert data["repo"] == "api"
+    assert meta["repo"] == "api"
+    assert meta["type"] == "state"
 
 
-def test_gate_comment_omits_repo_when_none():
-    body = make_gate_comment(state="review", status="waiting", run=1)
-    match = GATE_PATTERN.search(body)
-    data = json.loads(match.group(1))
-    assert "repo" not in data
+def test_state_metadata_omits_repo_when_none():
+    """Backward compat: repo=None omits the field entirely from the payload."""
+    meta = build_attachment_metadata(
+        state="plan", type="state", run=1, workflow="std",
+    )
+    assert "repo" not in meta
 
 
-# ── parse_latest_tracking: defensive read ───────────────────────────────────
+# ── build_attachment_metadata: gate type carries repo ───────────────────────
+
+
+def test_gate_metadata_includes_repo_field():
+    meta = build_attachment_metadata(
+        state="review", type="gate", run=1, workflow="std",
+        status="waiting", repo="api",
+    )
+    assert meta["repo"] == "api"
+    assert meta["type"] == "gate"
+    assert meta["status"] == "waiting"
+
+
+def test_gate_metadata_omits_repo_when_none():
+    meta = build_attachment_metadata(
+        state="review", type="gate", run=1, status="waiting",
+    )
+    assert "repo" not in meta
+
+
+# ── parse_latest_tracking: legacy comment migration fallback ────────────────
 
 
 def test_parse_latest_tracking_sets_repo_none_for_legacy_state_comment():
     """Pre-migration state comments (no repo field) must not crash readers."""
-    body = make_state_comment(state="plan", run=1, workflow="std")
+    body = _legacy_state_comment(state="plan", run=1, workflow="std")
     comments = [{"body": body, "createdAt": "2026-01-01T00:00:00Z"}]
 
     tracking = parse_latest_tracking(comments)
@@ -80,7 +119,7 @@ def test_parse_latest_tracking_sets_repo_none_for_legacy_state_comment():
 
 
 def test_parse_latest_tracking_exposes_repo_when_present():
-    body = make_state_comment(
+    body = _legacy_state_comment(
         state="plan", run=1, workflow="std", repo="api",
     )
     comments = [{"body": body, "createdAt": "2026-01-01T00:00:00Z"}]
@@ -89,7 +128,9 @@ def test_parse_latest_tracking_exposes_repo_when_present():
 
 
 def test_parse_latest_tracking_legacy_gate_comment_repo_none():
-    body = make_gate_comment(state="review", status="waiting", workflow="std")
+    body = _legacy_gate_comment(
+        state="review", status="waiting", workflow="std",
+    )
     comments = [{"body": body, "createdAt": "2026-01-01T00:00:00Z"}]
     tracking = parse_latest_tracking(comments)
     assert tracking["type"] == "gate"
@@ -105,7 +146,7 @@ def test_parse_latest_tracking_get_with_default_pattern():
 
     Models the cold-start helper's access pattern.
     """
-    body = make_state_comment(state="plan", run=1, workflow="std")
+    body = _legacy_state_comment(state="plan", run=1, workflow="std")
     comments = [{"body": body, "createdAt": "2026-01-01T00:00:00Z"}]
     tracking = parse_latest_tracking(comments)
     # Direct .get() returns None (setdefault stored it):
@@ -181,8 +222,7 @@ def test_has_pending_rejection_false_when_label_set_changed():
 
 def test_has_pending_rejection_false_when_no_sentinel():
     """No rejection sentinel in comments → False."""
-    state_body = make_state_comment(state="plan", run=1, workflow="std")
-    comments = [{"body": state_body}]
+    comments = [{"body": "Some unrelated comment from a human reviewer."}]
     assert has_pending_rejection(comments, ["repo:api", "repo:web"]) is False
 
 
