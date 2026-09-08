@@ -37,8 +37,27 @@ That is what makes `git merge upstream/main` cheap from here on.
 | `test_orchestrator_multi_project.py` | Our N-file multi-project | **likely superseded** by upstream `MultiOrchestrator` |
 | `test_multi_project_integration.py` | Our N-file multi-project | **likely superseded** — see above |
 
-`DockerConfig` is already restored in `config.py`, so `workspace.py` and
-`docker_runner.py` are wired and importable; only their dispatch path is absent.
+## What is already refused, and what merely does nothing
+
+Two of these features have config that still parses, so each is rejected at
+validation rather than accepted and ignored:
+
+- `docker.enabled: true` — refused by `validate_config`. Accepting it would run
+  agents on the host while the operator believed they were contained.
+- `repos:` — refused by `validate_config` via `UNWIRED_FORK_KEYS` in
+  `config.py`. Both `workflow.multi-repo*.example.yaml` files therefore fail to
+  start, which is deliberate; the README marks them pending.
+
+Delete the corresponding guard when you re-apply the layer — its test says so.
+
+`workspace.py` and `docker_runner.py` are present and import cleanly, and
+`workspace.py` is call-compatible with upstream's orchestrator (enforced by
+`tests/test_fork_api_compat.py`). Nothing dispatches into Docker yet.
+
+An earlier version of this file called them "wired", which is what let a real
+arity break ship: our `ensure_workspace` took `repo_name` third while upstream's
+orchestrator passed `hooks` there, so every dispatch would have raised
+TypeError with the suite fully green. Describe this seam precisely or not at all.
 
 ## Re-applying one
 

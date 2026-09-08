@@ -155,6 +155,19 @@ class ServerConfig:
     host: str | None = None
 
 
+# Fork config keys whose implementing layer was removed by the upstream
+# convergence and has not been re-applied yet. The YAML still parses, so
+# without an explicit refusal the operator gets a config that validates and a
+# feature that is not there. Each entry is deleted when its layer returns.
+UNWIRED_FORK_KEYS: dict[str, str] = {
+    "repos": (
+        "multi-repo routing is not wired in this build — every repo: label "
+        "would be ignored and all work would run against a single repo "
+        "(re-apply via tests_pending/test_repos_config.py)"
+    ),
+}
+
+
 @dataclass
 class DockerConfig:
     """Docker isolation settings for agent containers."""
@@ -339,6 +352,8 @@ class ServiceConfig:
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     projects: list[ProjectConfig] = field(default_factory=list)
     workflow_dir: Path = field(default_factory=lambda: Path("."))
+    # Top-level keys present in the file that no longer have an implementation.
+    unwired_keys: list[str] = field(default_factory=list)
 
     @property
     def docker_if_enabled(self) -> "DockerConfig | None":
@@ -908,6 +923,7 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
         agent=agent,
         server=server,
         docker=docker,
+        unwired_keys=[k for k in UNWIRED_FORK_KEYS if k in config_raw],
         linear_states=p0.linear_states,
         prompts=p0.prompts,
         states=p0.states,
@@ -1084,6 +1100,9 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
     # convergence (see tests_pending/README.md). Accepting `enabled: true` and
     # doing nothing would run agents unsandboxed on the host while the operator
     # believes they are contained — refuse instead of failing open.
+    for key in cfg.unwired_keys:
+        errors.append(f"'{key}:' is set, but {UNWIRED_FORK_KEYS[key]}.")
+
     if cfg.docker.enabled:
         errors.append(
             "docker.enabled is true, but Docker isolation is not wired in this "

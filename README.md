@@ -199,6 +199,8 @@ Symphony is tightly coupled to Codex via its `app-server` JSON-RPC protocol. Sto
 
 Symphony assumes one Linear project maps to one repo. Stokowski supports the team-affine pattern where a single Linear project spans multiple repositories (common for infrastructure teams, platform teams, or teams owning N microservices):
 
+> **Temporarily unavailable.** Multi-repo routing was removed when this fork converged onto upstream and has not been re-applied yet. A `repos:` block is now **rejected at config validation** rather than silently ignored — see `tests_pending/README.md`. The section below describes the feature as it will return.
+
 - **`repos:` registry in `workflow.yaml`** — declare each repo with `{name, label, clone_url, default, docker_image?}`. See `workflow.multi-repo.example.yaml` for a complete example without triage, or `workflow.multi-repo-triage.example.yaml` for automatic classification.
 - **Label-driven routing** — tickets are routed to a repo by a `repo:<name>` Linear label, applied by a triage agent or by humans. The existing multi-workflow label convention extends naturally to the repo axis.
 - **Backward compatible** — configs without a `repos:` section continue to work unchanged. A synthetic `_default` repo is created and hooks pass through the shell verbatim (no Jinja rendering), preserving existing credential-helper shell patterns.
@@ -438,15 +440,16 @@ Stokowski ships three worked examples — pick the one matching your team's setu
 | Example file | When to use |
 |---|---|
 | `workflow.example.yaml` | **Start here.** One Linear project, one Git repo. Shortest config, no multi-repo ceremony. |
-| `workflow.multi-repo.example.yaml` | One Linear project spanning multiple repos. Operators (or agents) apply `repo:<name>` labels; unlabeled tickets go to a default repo. Demonstrates Jinja-templated hooks and the 3-level `docker_image` hybrid. |
-| `workflow.multi-repo-triage.example.yaml` | Multi-repo + automatic classification. A triage agent reads each unlabeled ticket and applies `workflow:<name>` and `repo:<name>` labels before the main pipeline runs. |
+| `workflow.multi-repo.example.yaml` | *(pending re-application — will not start)* One Linear project spanning multiple repos. Operators (or agents) apply `repo:<name>` labels; unlabeled tickets go to a default repo. Demonstrates Jinja-templated hooks and the 3-level `docker_image` hybrid. |
+| `workflow.multi-repo-triage.example.yaml` | *(pending re-application — will not start)* Multi-repo + automatic classification. A triage agent reads each unlabeled ticket and applies `workflow:<name>` and `repo:<name>` labels before the main pipeline runs. |
 
 ```bash
 # Single-repo setup (most common starting point)
 cp workflow.example.yaml workflow.yaml
 
-# Or, for a multi-repo team
-cp workflow.multi-repo.example.yaml workflow.yaml
+# Multi-repo is pending re-application after the upstream convergence;
+# copying this today gives a config that refuses to start, by design.
+# cp workflow.multi-repo.example.yaml workflow.yaml
 ```
 
 Open `workflow.yaml` and update these fields:

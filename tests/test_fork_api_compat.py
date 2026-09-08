@@ -177,3 +177,31 @@ def test_workspace_creation_uses_the_state_merged_hooks():
             f"override is dropped. If a merge just reverted this, re-apply the "
             f"fork patch and send it upstream."
         )
+
+
+def test_unwired_fork_config_keys_are_refused():
+    """A removed feature whose config key still parses is a silent downgrade.
+
+    `repos:` survived the convergence in two shipped example files and in the
+    README's copy-this instruction, while `RepoConfig` parsing did not. The
+    config validated cleanly and every `repo:` label was ignored, so a
+    multi-repo pipeline quietly ran against one repo.
+
+    Each entry is deleted from UNWIRED_FORK_KEYS when its layer is re-applied.
+    """
+    from stokowski.config import UNWIRED_FORK_KEYS, parse_workflow_file, validate_config
+
+    assert UNWIRED_FORK_KEYS, "registry is empty — delete this test with the last entry"
+
+    for name in ("workflow.multi-repo.example.yaml", "workflow.multi-repo-triage.example.yaml"):
+        path = REPO / name
+        if not path.exists():
+            continue
+        errors = validate_config(parse_workflow_file(str(path)).config)
+        assert any("repos:" in e for e in errors), (
+            f"{name} ships a repos: block but validates clean — an operator "
+            f"following README's copy instruction gets a silent single-repo run"
+        )
+
+    # Upstream's own example must stay clean, or the guard is too broad.
+    assert not validate_config(parse_workflow_file(str(REPO / "workflow.example.yaml")).config)

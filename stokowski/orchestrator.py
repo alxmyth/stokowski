@@ -1195,12 +1195,17 @@ class Orchestrator:
                     await self._announce_state(issue, state_name, run)
 
             # Run on_stage_enter hook if defined
-            if state_cfg and state_cfg.hooks and state_cfg.hooks.on_stage_enter:
+            # hooks_cfg, not state_cfg.hooks: reading the state's block directly
+            # bypassed merge_state_config, so a root-level on_stage_enter could
+            # never fire even though config.py parses and accepts one. The
+            # mirror of the after_create bug above.
+            # FORK PATCH — upstream carries the same guard; send this back.
+            if hooks_cfg.on_stage_enter:
                 from .workspace import run_hook
                 ok = await run_hook(
-                    state_cfg.hooks.on_stage_enter,
+                    hooks_cfg.on_stage_enter,
                     ws.path,
-                    (state_cfg.hooks.timeout_ms if state_cfg.hooks else self.cfg.hooks.timeout_ms),
+                    hooks_cfg.timeout_ms,
                     f"on_stage_enter:{state_name}",
                 )
                 if not ok:
