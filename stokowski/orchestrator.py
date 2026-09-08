@@ -1151,12 +1151,16 @@ class Orchestrator:
                 runner_type = state_cfg.runner
 
             ws_root = self.cfg.workspace.resolved_root()
-            # hooks_cfg, not self.cfg.hooks: merge_state_config resolved the
-            # state's hook overrides just above, and the runner already honours
-            # them at the before_run/after_run sites below. Passing the root
-            # config here silently dropped a state-level after_create override.
-            # FORK PATCH — upstream carries the same line; send this back.
-            ws = await ensure_workspace(ws_root, issue.identifier, hooks_cfg)
+            # self.cfg.hooks, deliberately, and NOT the merged hooks_cfg.
+            # merge_state_config replaces the hooks object wholesale rather than
+            # merging per field (config.py), so a state declaring any hooks block
+            # at all yields after_create=None. Passing hooks_cfg here means a
+            # state that sets only on_stage_enter loses the root's clone step:
+            # the workspace is created empty, nothing raises, and the agent is
+            # dispatched into it. Upstream's inconsistency — a state-level
+            # after_create override is ignored — is the lesser bug, and belongs
+            # upstream with the merge semantics question, not patched here.
+            ws = await ensure_workspace(ws_root, issue.identifier, self.cfg.hooks)
             attempt.workspace_path = str(ws.path)
 
             # Evidence directory, created fresh each turn and excluded from git
