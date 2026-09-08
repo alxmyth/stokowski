@@ -33,3 +33,13 @@ You MUST include this structured comment in your final message:
 - `review-required` — you found concerns that need human attention.
 
 **When in doubt, use `review-required`.** False approvals are worse than unnecessary reviews.
+
+## Reporting
+
+Write `.stokowski/report.json` with your verdict. Set `verdict` to `complete`
+once you have evaluated (use `blocked` only if you could not review the work at
+all), put your one-line recommendation in `next`, every concern a human must
+resolve in `next_steps`, and 3-5 bullets in `key_points`: what you checked, what
+you actually verified versus took on trust, and anything the next reader should
+be suspicious of. Those fields render above the fold in Linear and are what the
+gate reads first. Stokowski posts it — do not comment on the issue yourself.

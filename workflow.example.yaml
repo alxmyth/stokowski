@@ -1,24 +1,13 @@
 # =============================================================================
-# Stokowski — Example: single Linear project mapped to a single repo (1:1)
+# Stokowski — Example State Machine Workflow
 # =============================================================================
 #
-# This is the simplest Stokowski setup: one Linear project, one Git repo,
-# one state machine pipeline. No `repos:` registry, no triage, no
-# multi-repo routing. If your team operates with a single product/repo
-# per Linear project, start here.
-#
-# Other worked examples:
-#   workflow.multi-repo.example.yaml         — one project spanning N repos
-#                                              (label-driven routing, default repo)
-#   workflow.multi-repo-triage.example.yaml  — same + triage agent that
-#                                              re-labels tickets via
-#                                              `workflow:triage`
-#
+# Copy this file to workflow.yaml and customise for your project.
 # Stokowski re-reads this file on every poll tick — changes take effect
 # without restart.
 #
-# Prompt files live in the prompts/ directory. Each agent state references
-# its prompt via the `prompt` field. A global prompt (shared preamble) is
+# Prompt files live in the prompts/ directory.  Each agent state references
+# its prompt via the `prompt` field.  A global prompt (shared preamble) is
 # injected before the stage-specific prompt when set.
 #
 # Linear states mapping:
@@ -32,6 +21,51 @@
 #   agent    — Stokowski dispatches Claude Code in this state
 #   gate     — pauses for human review; approve → next, rework → rework_to
 #   terminal — issue is finished; workspace cleaned up
+#
+# -----------------------------------------------------------------------------
+# Multi-project mode (optional — single-project YAML below still works as-is)
+# -----------------------------------------------------------------------------
+#
+# To monitor multiple Linear projects from one Stokowski process, replace the
+# top-level `tracker / workspace / hooks / prompts / states` blocks with a
+# `projects:` list. Each entry has its own tracker/workspace/hooks/prompts/
+# state machine. Top-level `polling`, `agent`, `claude`, `linear_states`, and
+# `server` stay global and act as defaults each project can override.
+#
+#   agent:
+#     max_concurrent_agents: 8                  # global pool across all projects
+#     max_concurrent_per_project:               # optional fairness caps
+#       synced-sport: 6
+#       client-site:  2
+#
+#   projects:
+#     - name: synced-sport                      # required, used in dashboard + `p` menu
+#       tracker:
+#         kind: linear
+#         project_slug: "abc123def456"
+#         api_key: "$LINEAR_API_KEY"
+#       workspace:
+#         root: ~/.local/share/stokowski/workspaces/synced-sport
+#       hooks: { after_create: "git clone git@github.com:org/synced-sport.git ." }
+#       prompts: { global_prompt: prompts/synced-sport/global.md }
+#       states: { ... }                         # state machine, same as single-project
+#
+#     - name: client-site
+#       paused: true                            # start paused; toggle with `p` key
+#       tracker:
+#         kind: linear
+#         project_slug: "def456abc789"
+#         api_key: "$LINEAR_API_KEY"
+#       workspace:
+#         root: ~/.local/share/stokowski/workspaces/client-site
+#       hooks: { after_create: "git clone git@github.com:org/client-site.git ." }
+#       prompts: { global_prompt: prompts/client-site/global.md }
+#       claude: { model: claude-opus-4-7 }      # per-project override
+#       max_concurrent: 2                       # per-project cap (also via agent map above)
+#       states: { ... }
+#
+# In the terminal, `p` opens a numbered pause menu; in the web dashboard, each
+# project tile gets a Pause/Resume button and a per-project filter dropdown.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -39,7 +73,7 @@
 # ---------------------------------------------------------------------------
 tracker:
   kind: linear
-  project_slug: "abc123def456"      # hex slugId from your Linear project URL
+  project_slug: "abc123def456"    # hex slugId from your Linear project URL
   api_key: "lin_api_your_key_here"  # your Linear API key — agents inherit this
 
 # ---------------------------------------------------------------------------
@@ -77,19 +111,42 @@ workspace:
 # ---------------------------------------------------------------------------
 # Hooks — shell scripts run in the workspace directory
 # ---------------------------------------------------------------------------
-# In this 1:1 layout (no `repos:` section), hooks pass through to the shell
-# verbatim — Stokowski does NOT Jinja-render them. This means shell bodies
-# containing literal `{`/`}` (e.g., `!f() { ...; }; f` credential helpers)
-# continue to work unchanged. If you migrate to multi-repo, hooks will be
-# rendered with a `{{ repo.* }}` namespace — see the multi-repo examples.
 hooks:
+  # Runs ONCE, when a workspace is first created.
+  #
+  # Note the absence of --depth 1: the review stage runs `git diff main...HEAD`,
+  # which needs a merge base a shallow clone does not have.
+  # --filter=blob:none keeps full history while skipping file contents until
+  # they are read, so it is nearly as fast without breaking diffs.
   after_create: |
-    git clone --depth 1 git@github.com:your-org/your-repo.git .
-    npm install
+    set -e
+    git clone --filter=blob:none git@github.com:your-org/your-repo.git .
+    # Use the package manager the project actually declares. npm fails outright
+    # on a pnpm/yarn workspace ("Unsupported URL Type: workspace:").
+    npm ci
+    # pnpm:  corepack enable && pnpm install --frozen-lockfile
+    # yarn:  corepack enable && yarn install --immutable
+
+  # Runs before EVERY turn, including mid-task turns where the agent has
+  # uncommitted work in the tree.
+  #
+  # This hook must never exit non-zero. A failure here marks the turn failed
+  # before the agent launches, and the retry hits exactly the same wall — the
+  # issue then loops on backoff forever.
   before_run: |
-    git fetch origin main
-    git rebase origin/main 2>/dev/null || git rebase --abort
-  timeout_ms: 120000
+    git fetch origin main || true
+    # Rebase only from a clean tree. `git rebase` refuses on a dirty one, and
+    # the `git rebase --abort` fallback then exits 128 because no rebase is in
+    # progress — taking the turn down with it.
+    if git diff --quiet && git diff --cached --quiet; then
+      git rebase origin/main || git rebase --abort || true
+    fi
+    exit 0
+
+  # Cold clone + dependency install on a large monorepo takes minutes, not
+  # seconds. If this is too low, every workspace creation fails and the issue
+  # never starts.
+  timeout_ms: 900000
 
 # ---------------------------------------------------------------------------
 # Claude defaults (inherited by all agent states unless overridden)
@@ -97,8 +154,24 @@ hooks:
 # ---------------------------------------------------------------------------
 claude:
   permission_mode: auto
-  model: claude-sonnet-4-6
+  model: claude-opus-5
+  # NOTE: max_turns applies to LEGACY multi-turn workflows only. In a state
+  # machine (below) each dispatch is exactly one `claude -p` invocation and the
+  # state machine controls continuation, so this value does nothing. It is also
+  # NOT a runaway guard — the CLI has no --max-turns flag. A run is bounded
+  # by turn_timeout_ms and stall_timeout_ms below, which is the right axis on
+  # a subscription: there is no dollar meter to cap, only wall-clock.
   max_turns: 20
+
+  # The real runaway guard: a hard dollar ceiling per invocation.
+  #
+  # Reasoning effort: low | medium | high | xhigh | max (CLI default: high).
+  # Worth setting per state — a merge needs far less than a grounding check.
+  # effort: high
+
+  # Tried when the primary model is overloaded or unavailable. Useful when runs
+  # collide with a rate-limit window.
+  # fallback_model: claude-opus-4-8
   turn_timeout_ms: 3600000        # 1 hour per turn
   stall_timeout_ms: 300000        # 5 minutes with no output → kill
 
@@ -110,6 +183,7 @@ agent:
   max_retry_backoff_ms: 300000    # 5-minute cap on exponential backoff
   max_concurrent_agents_by_state:
     investigate: 2                # allow 2 concurrent investigations
+    ground-check: 2               # short, cheap — should not become a queue
     implement: 2
     code-review: 1                # serial reviews prevent merge conflicts
 
@@ -118,50 +192,49 @@ agent:
 # ---------------------------------------------------------------------------
 prompts:
   global_prompt: prompts/global.example.md
-  evaluator_prompt: prompts/evaluator.example.md
 
 # ---------------------------------------------------------------------------
 # Server (optional web dashboard)
 # ---------------------------------------------------------------------------
 server:
+  host: 127.0.0.1
   port: 4200
 
 # ---------------------------------------------------------------------------
-# Docker isolation (optional — agents run as sibling containers)
+# Routing — which workflow runs for which ticket
 # ---------------------------------------------------------------------------
-# docker:
-#   enabled: true
-#   default_image: "stokowski/claude-agent:latest"
-#   inherit_claude_config: true
-#   host_claude_dir: "${HOST_HOME}/.claude"
-#   # DooD shim fields — required when the orchestrator itself runs in a
-#   # container AND inherit_claude_config is true. Stokowski refuses to start
-#   # in DooD mode without these to prevent host plugin files from being
-#   # rewritten. See CLAUDE.md (Docker mode) for setup.
-#   host_claude_dir_mount: "/host-claude"           # where host_claude_dir is RO-mounted inside the orchestrator
-#   plugin_shim_host_path: "${HOST_PLUGIN_SHIM}"    # host-resolvable shim dir (e.g. ${HOME}/.stokowski-plugin-shim)
-#   plugin_shim_container_path: "/plugin-shim"      # where plugin_shim_host_path is RW-mounted inside the orchestrator
-#   extra_env:
-#     - GITHUB_TOKEN
-#     - CLAUDE_CODE_OAUTH_TOKEN    # required for Claude Code auth in containers
-#   extra_volumes:
-#     - "${HOST_HOME}/.ssh:/home/agent/.ssh:ro"
-#     - "${HOST_HOME}/.gitconfig:/home/agent/.gitconfig:ro"
 #
-# Authentication for Docker mode:
-#   Claude Code in containers cannot use interactive OAuth login. Set one of:
-#     ANTHROPIC_API_KEY           — standard API key (API plan required)
-#     CLAUDE_CODE_OAUTH_TOKEN     — long-lived token for Pro/Max users
+# Workflows live in `workflows/*.yaml`, one file per pipeline. Everything above
+# this line is runtime configuration shared by all of them: duplicating the
+# tracker, hooks and concurrency per workflow would mean three places to rotate
+# an API key.
 #
-#   Generate an OAuth token by running `claude setup-token` in your terminal,
-#   then add it to your .env file:
-#     CLAUDE_CODE_OAUTH_TOKEN=your_generated_token_here
+# Rules are evaluated in order and the FIRST match wins, so a ticket labelled
+# both `bug` and `spike` resolves the same way every time — and which way is
+# readable here rather than depending on dict ordering. `default` catches
+# anything unlabelled.
 #
-#   Add CLAUDE_CODE_OAUTH_TOKEN to extra_env so it reaches agent containers.
+# The workflow is pinned when an issue is first dispatched and recorded in its
+# tracking comment. Relabelling a ticket mid-run will not move it onto a
+# different state machine.
+routing:
+  default: feature
+  rules:
+    - label: bug
+      workflow: bug-fix
+    - label: spike
+      workflow: exploration
+    - label: exploration
+      workflow: exploration
 
 # ---------------------------------------------------------------------------
 # State machine
 # ---------------------------------------------------------------------------
+#
+# This inline block still works and becomes a workflow named `default`, so an
+# existing single-pipeline config keeps running untouched. With `workflows/`
+# files present and a routing default set, this block is redundant — delete it
+# and let the routing rules choose.
 #
 # Order matters: the first agent state is the entry state for new issues.
 #
@@ -174,20 +247,41 @@ states:
 
   # ── 1. Investigate ──────────────────────────────────────────────────────
   # Read the codebase, understand the problem, post an investigation summary.
-  # Uses Opus for deeper reasoning. Low turn count — investigation only.
+  # Uses Opus for deeper reasoning.  Low turn count — investigation only.
   investigate:
     type: agent
     prompt: prompts/investigate.example.md
     linear_state: active
-    model: claude-opus-4-6
-    max_turns: 8
+    model: claude-opus-5
+    effort: high              # investigation benefits from depth
     session: inherit
+    transitions:
+      complete: ground-check
+
+  # ── 2. Grounding Check ──────────────────────────────────────────────────
+  # Independent verification of the investigation's FACTS, before a human is
+  # asked to approve them.
+  #
+  # This is the cheapest place in the pipeline to catch the most expensive
+  # failure: an investigation that reasoned correctly from the wrong data.
+  # A reviewer at the end cannot catch it, because by then the premise has
+  # been accepted by everyone downstream.
+  #
+  # `session: fresh` is load-bearing. A continued session inherits the same
+  # assumptions it is meant to be testing, and will happily confirm them.
+  ground-check:
+    type: agent
+    prompt: prompts/ground-check.example.md
+    linear_state: active
+    model: claude-opus-5
+    effort: xhigh             # the most consequential check in the pipeline
+    session: fresh            # no prior context — cannot inherit the error
     transitions:
       complete: research-review
 
-  # ── 2. Research Review (gate) ───────────────────────────────────────────
-  # Human reviews the investigation before implementation starts.
-  # Rework loops back to investigate.
+  # ── 3. Research Review (gate) ───────────────────────────────────────────
+  # Human reviews the investigation AND the grounding check before
+  # implementation starts.  Rework loops back to investigate.
   research-review:
     type: gate
     linear_state: review
@@ -196,20 +290,20 @@ states:
     transitions:
       approve: implement
 
-  # ── 3. Implement ────────────────────────────────────────────────────────
+  # ── 4. Implement ────────────────────────────────────────────────────────
   # Write code, create branch, run tests, open PR.
-  # Uses Sonnet for fast iteration. Higher turn count for complex work.
+  # Uses Sonnet for fast iteration.  Higher turn count for complex work.
   implement:
     type: agent
     prompt: prompts/implement.example.md
     linear_state: active
-    model: claude-sonnet-4-6
-    max_turns: 30
+    model: claude-opus-5
+    effort: high
     session: inherit
     transitions:
       complete: implementation-review
 
-  # ── 4. Implementation Review (gate) ─────────────────────────────────────
+  # ── 5. Implementation Review (gate) ─────────────────────────────────────
   # Human reviews the PR before automated code review.
   # Rework loops back to implement.
   implementation-review:
@@ -220,7 +314,7 @@ states:
     transitions:
       approve: code-review
 
-  # ── 5. Code Review ─────────────────────────────────────────────────────
+  # ── 6. Code Review ─────────────────────────────────────────────────────
   # Automated adversarial review: fresh session, no prior context.
   # Opus reviews the diff and posts findings.
   # Tip: set runner: codex here to get a second-opinion from a different
@@ -230,29 +324,13 @@ states:
     prompt: prompts/review.example.md
     linear_state: active
     runner: claude              # "claude" (default) or "codex"
-    model: claude-opus-4-6
-    max_turns: 10
-    session: fresh              # no prior context — adversarial review
-    transitions:
-      complete: eval-merge
-
-  # ── 5b. Merge Evaluation (evaluator) ────────────────────────────────────
-  # Automated evaluation: fresh session reviews the diff and produces
-  # a structured verdict. If auto_approve is true and the evaluator
-  # approves, the merge-review gate is skipped.
-  eval-merge:
-    type: evaluator
-    prompt: prompts/evaluator.example.md
-    linear_state: active
-    model: claude-sonnet-4-6
-    max_turns: 5
-    session: fresh
-    auto_approve: false             # set true once you trust the evaluator
+    model: claude-opus-5
+    effort: xhigh
+    session: fresh            # no prior context — adversarial review
     transitions:
       complete: merge-review
-      approve: merge
 
-  # ── 6. Merge Review (gate) ──────────────────────────────────────────────
+  # ── 8. Merge Review (gate) ──────────────────────────────────────────────
   # Human reviews the code review findings and decides to merge or rework.
   # Rework goes back to implement (not code-review).
   merge-review:
@@ -263,18 +341,18 @@ states:
     transitions:
       approve: merge
 
-  # ── 7. Merge ────────────────────────────────────────────────────────────
-  # Merge the PR and clean up. Short turn count — just the merge.
+  # ── 8. Merge ────────────────────────────────────────────────────────────
+  # Merge the PR and clean up.  Short turn count — just the merge.
   merge:
     type: agent
     prompt: prompts/merge.example.md
     linear_state: active
-    max_turns: 5
+    effort: low               # mechanical stage, no reasoning needed
     session: inherit
     transitions:
       complete: done
 
-  # ── 8. Done (terminal) ─────────────────────────────────────────────────
+  # ── 9. Done (terminal) ─────────────────────────────────────────────────
   done:
     type: terminal
     linear_state: terminal

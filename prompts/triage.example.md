@@ -48,8 +48,13 @@ recent tickets in the project).
 1. Apply the chosen workflow label using Linear's label API.
 2. Apply the chosen repo label (if multi-repo mode) using Linear's label
    API.
-3. Post a brief comment (1-2 sentences) explaining your classification so
-   humans can verify the decision before dispatch continues.
+3. Write `.stokowski/report.json` explaining the classification so humans can
+   verify the decision before dispatch continues. Set `verdict` to `complete`
+   (or `blocked` if you could not classify), put the one-line routing decision
+   in `next`, anything a human must confirm in `next_steps`, and 3-5 bullets in
+   `key_points`: the signals you read, the workflow and repo you chose, and any
+   ticket detail that made the call ambiguous. Stokowski posts it — do not
+   comment on the issue yourself.
 
 Do not modify any other Linear state, do not create branches, do not open
 PRs. Triage is label-only.

@@ -3,16 +3,104 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+import json
+import logging
+import time
+from pathlib import Path
+from collections import deque
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .orchestrator import Orchestrator
+    from .orchestrator import MultiOrchestrator
 
 try:
     from fastapi import FastAPI
-    from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 except ImportError:
     raise ImportError("Install web extras: pip install stokowski[web]")
+
+
+class LogBuffer:
+    """Circular buffer of captured log entries with pub/sub for SSE."""
+
+    def __init__(self, maxlen: int = 500) -> None:
+        self._entries: deque[dict[str, Any]] = deque(maxlen=maxlen)
+        self._seq = 0
+        # list of (loop, queue) pairs — one per active SSE subscriber
+        self._subscribers: list[tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = []
+
+    def append(self, entry: dict[str, Any]) -> None:
+        self._seq += 1
+        entry["seq"] = self._seq
+        self._entries.append(entry)
+        for loop, q in self._subscribers:
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, entry)
+            except Exception:
+                pass
+
+    def subscribe(self) -> asyncio.Queue:
+        """Register a new SSE subscriber. Must be called from a running event loop."""
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue = asyncio.Queue()
+        self._subscribers.append((loop, q))
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self._subscribers = [(l, sq) for l, sq in self._subscribers if sq is not q]
+
+    def all_entries(self) -> list[dict[str, Any]]:
+        return list(self._entries)
+
+    @property
+    def latest_seq(self) -> int:
+        return self._seq
+
+
+class LogCaptureHandler(logging.Handler):
+    """Logging handler that feeds records into a LogBuffer.
+
+    Drops records whose message starts with 'HTTP Request' (uvicorn access noise).
+    Picks up extra= fields (e.g. capture=True, linked_to='SYN-123') as attributes.
+    """
+
+    _SKIP_PREFIXES = ("HTTP Request",)
+
+    def __init__(self, buffer: LogBuffer) -> None:
+        super().__init__()
+        self._buf = buffer
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage()
+            for prefix in self._SKIP_PREFIXES:
+                if msg.startswith(prefix):
+                    return
+
+            attrs: dict[str, Any] = {}
+            for key in ("capture", "linked_to"):
+                if hasattr(record, key):
+                    attrs[key] = getattr(record, key)
+
+            # Strip redundant "[<linked_to>] " prefix — the tag chip renders it visually
+            linked_to = attrs.get("linked_to")
+            if linked_to:
+                prefix = f"[{linked_to}] "
+                if msg.startswith(prefix):
+                    msg = msg[len(prefix):]
+
+            self._buf.append(
+                {
+                    "ts": record.created,
+                    "level": record.levelname,
+                    "logger": record.name,
+                    "msg": msg,
+                    "attrs": attrs,
+                }
+            )
+        except Exception:
+            self.handleError(record)
+
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -31,21 +119,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     --border:    #1c1c1c;
     --border-hi: #2a2a2a;
     --text:      #e8e8e0;
-    --muted:     #555550;
-    --dim:       #333330;
+    --muted:     #bbbbbb;
+    --dim:       #888880;
     --amber:     #e8b84b;
-    --amber-dim: #6b5220;
+    --amber-dim: #9b6230;
     --green:     #4cba6e;
     --red:       #d95f52;
     --blue:      #5b9cf6;
     --font:      'IBM Plex Mono', monospace;
+    --font-size: 15px;
+  }
+
+  @media (min-width: 900px) {
+    :root {
+        --font-size: 20px;
+    }
   }
 
   html, body {
     background: var(--bg);
     color: var(--text);
     font-family: var(--font);
-    font-size: 13px;
+    font-size: var(--font-size);
     line-height: 1.5;
     min-height: 100vh;
     -webkit-font-smoothing: antialiased;
@@ -90,14 +185,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   .logo-name {
-    font-size: 22px;
+    font-size: 1.5rem;
     font-weight: 600;
     letter-spacing: -0.5px;
     color: var(--text);
   }
 
   .logo-tag {
-    font-size: 11px;
+    font-size: 0.8rem;
     font-weight: 300;
     color: var(--muted);
     letter-spacing: 0.08em;
@@ -131,7 +226,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   .timestamp {
-    font-size: 11px;
+    font-size: 0.8rem;
     color: var(--muted);
     font-weight: 300;
     letter-spacing: 0.04em;
@@ -168,7 +263,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   .metric-label {
-    font-size: 10px;
+    font-size: 0.6rem;
     font-weight: 500;
     letter-spacing: 0.12em;
     text-transform: uppercase;
@@ -177,7 +272,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   .metric-value {
-    font-size: 32px;
+    font-size: 2rem;
     font-weight: 600;
     color: var(--text);
     line-height: 1;
@@ -190,7 +285,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   .metric-sub {
-    font-size: 11px;
+    font-size: 0.7rem;
     color: var(--muted);
     margin-top: 6px;
     font-weight: 300;
@@ -205,7 +300,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   .section-title {
-    font-size: 10px;
+    font-size: 0.6rem;
     font-weight: 500;
     letter-spacing: 0.14em;
     text-transform: uppercase;
@@ -219,7 +314,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   .section-count {
-    font-size: 10px;
+    font-size: 0.6rem;
     color: var(--dim);
     font-weight: 300;
   }
@@ -238,11 +333,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     background: var(--surface);
     padding: 18px 24px;
     display: grid;
-    grid-template-columns: 100px 1fr auto;
+    grid-template-columns: 100px minmax(0, 1fr) auto;
     gap: 16px;
     align-items: start;
     transition: background 0.15s;
-    cursor: pointer;
   }
 
   .agent-card:hover {
@@ -250,7 +344,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   .agent-id {
-    font-size: 13px;
+    font-size: 0.8rem;
     font-weight: 600;
     color: var(--amber);
     letter-spacing: 0.02em;
@@ -264,7 +358,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   .status-pill {
-    font-size: 10px;
+    font-size: 0.6rem;
     font-weight: 500;
     letter-spacing: 0.1em;
     text-transform: uppercase;
@@ -294,15 +388,139 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .status-pill.pending    { background: transparent;          color: var(--muted); border: 1px solid var(--border-hi); }
   .status-pill.gate { background: rgba(232, 184, 75, 0.08); color: var(--amber-dim); border: 1px solid var(--amber-dim); }
 
+  .agent-activity {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+
   .agent-msg {
-    font-size: 12px;
+    font-size: 0.9rem;
     color: var(--muted);
     font-weight: 300;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    max-width: 620px;
   }
+
+  .agent-elapsed {
+    font-size: 0.7rem;
+    color: var(--dim);
+    font-weight: 300;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .agent-card { cursor: pointer; }
+
+  .agent-card.expanded { background: #131313; }
+
+  .agent-sub {
+    font-size: 0.7rem;
+    color: var(--dim);
+    font-weight: 300;
+    margin-top: 3px;
+  }
+
+  .agent-cost {
+    font-size: 0.7rem;
+    color: var(--muted);
+    font-weight: 300;
+  }
+
+  .agent-warn { color: var(--red); }
+
+  /* Timeline — the per-agent activity trail, revealed on click. */
+  .timeline {
+    grid-column: 1 / -1;
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
+    max-height: 320px;
+    overflow-y: auto;
+  }
+
+  .tl-row {
+    display: grid;
+    grid-template-columns: 62px 118px minmax(0, 1fr);
+    gap: 12px;
+    padding: 3px 0;
+    font-size: 0.72rem;
+    line-height: 1.5;
+    border-left: 2px solid transparent;
+    padding-left: 10px;
+  }
+
+  .tl-row.tool        { border-left-color: var(--blue); }
+  .tl-row.tool_result { border-left-color: var(--red); }
+  .tl-row.text        { border-left-color: var(--amber-dim); }
+  .tl-row.thinking    { border-left-color: var(--border-hi); }
+  .tl-row.result      { border-left-color: var(--green); }
+  .tl-row.rate_limit,
+  .tl-row.warning     { border-left-color: var(--red); }
+
+  .tl-time  { color: var(--dim); }
+  .tl-label {
+    color: var(--text);
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tl-row.thinking .tl-label { color: var(--dim); font-weight: 300; font-style: italic; }
+  .tl-detail {
+    color: var(--muted);
+    font-weight: 300;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tl-row.tool_result .tl-detail,
+  .tl-row.warning .tl-detail { color: var(--red); }
+
+  .tl-empty { color: var(--dim); font-size: 0.72rem; font-weight: 300; }
+
+  .tl-tools {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 10px;
+  }
+
+  .tl-chip {
+    font-size: 0.62rem;
+    color: var(--muted);
+    border: 1px solid var(--border-hi);
+    border-radius: 2px;
+    padding: 1px 6px;
+    font-weight: 300;
+  }
+
+  .rl-chip {
+    font-size: 0.62rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border-radius: 2px;
+    border: 1px solid var(--border-hi);
+    color: var(--dim);
+    font-weight: 400;
+  }
+  .rl-chip.warn { color: var(--red); border-color: rgba(217,95,82,.4); }
+
+  .wf-bar { display:flex; flex-wrap:wrap; align-items:center; gap:8px;
+            padding:14px 24px; background:var(--surface);
+            border:1px solid var(--border); margin-bottom:20px; }
+  .wf-tab { padding:5px 12px; border:1px solid var(--border-hi); border-radius:2px;
+            font-size:.72rem; color:var(--muted); cursor:pointer; background:none;
+            font-family:var(--font); }
+  .wf-tab:hover { color:var(--text); }
+  .wf-tab.on { color:var(--amber); border-color:var(--amber); }
+  .wf-tab .wf-def { font-size:.55rem; color:var(--dim); margin-left:6px;
+                    text-transform:uppercase; letter-spacing:.08em; }
+  .wf-routes { font-size:.65rem; color:var(--dim); margin-left:auto; text-align:right;
+               line-height:1.7; }
+  .wf-routes code { color:var(--muted); }
 
   .agent-meta {
     text-align: right;
@@ -310,135 +528,180 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   .agent-tokens {
-    font-size: 12px;
+    font-size: 0.9rem;
     color: var(--text);
     font-weight: 500;
     margin-bottom: 3px;
   }
 
   .agent-turns {
-    font-size: 11px;
+    font-size: 0.7rem;
     color: var(--muted);
     font-weight: 300;
   }
 
-  /* ── Workflow progress ── */
-  .workflow-steps {
+  /* ── Projects tiles ── */
+  .projects-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    margin-bottom: 32px;
+  }
+
+  .project-tile {
+    background: var(--surface);
+    padding: 16px 18px;
     display: flex;
+    flex-direction: column;
+    gap: 10px;
+    transition: background 0.15s;
+  }
+
+  .project-tile:hover {
+    background: #141414;
+  }
+
+  .project-tile.paused {
+    opacity: 0.55;
+  }
+
+  .project-tile-head {
+    display: flex;
+    justify-content: space-between;
     align-items: center;
-    gap: 0;
-    margin-top: 8px;
-    font-size: 10px;
-    font-weight: 400;
-    letter-spacing: 0.04em;
   }
 
-  .wf-step {
-    color: var(--dim);
-    padding: 1px 6px;
-    border-radius: 2px;
-    white-space: nowrap;
-  }
-
-  .wf-step.current {
-    color: var(--amber);
-    background: rgba(232, 184, 75, 0.1);
+  .project-tile-name {
+    font-size: 0.8rem;
     font-weight: 600;
+    color: var(--amber);
+    letter-spacing: 0.02em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 140px;
   }
 
-  .wf-step.done {
+  .pause-btn {
+    background: transparent;
+    border: 1px solid var(--border-hi);
     color: var(--muted);
-  }
-
-  .wf-arrow {
-    color: var(--border-hi);
-    font-size: 9px;
-    margin: 0 2px;
-  }
-
-  /* ── Docker badge ── */
-  .docker-badge {
-    display: inline-block;
-    font-size: 9px;
+    font-family: var(--font);
+    font-size: 0.6rem;
     font-weight: 500;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: var(--blue);
-    border: 1px solid rgba(91,156,246,.2);
-    background: rgba(91,156,246,.06);
-    padding: 1px 5px;
+    padding: 3px 8px;
     border-radius: 2px;
-    margin-left: 8px;
+    cursor: pointer;
+    transition: all 0.15s;
   }
 
-  /* ── Accordion detail ── */
-  .agent-detail {
-    display: none;
-    grid-column: 1 / -1;
-    padding: 16px 0 4px;
-    border-top: 1px solid var(--border);
-    margin-top: 12px;
+  .pause-btn:hover {
+    border-color: var(--amber-dim);
+    color: var(--amber);
   }
 
-  .agent-card.expanded .agent-detail {
-    display: block;
+  .pause-btn.paused {
+    border-color: var(--red);
+    color: var(--red);
   }
 
-  .detail-grid {
+  .project-tile-stats {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 12px 32px;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+    font-size: 0.7rem;
   }
 
-  .detail-item {
+  .project-stat {
     display: flex;
     flex-direction: column;
     gap: 2px;
   }
 
-  .detail-label {
-    font-size: 9px;
-    font-weight: 500;
-    letter-spacing: 0.12em;
+  .project-stat-label {
+    font-size: 0.6rem;
+    color: var(--muted);
+    letter-spacing: 0.1em;
     text-transform: uppercase;
-    color: var(--muted);
   }
 
-  .detail-value {
-    font-size: 12px;
+  .project-stat-value {
     color: var(--text);
-    font-weight: 400;
-    word-break: break-all;
+    font-weight: 500;
+    font-size: 0.8rem;
   }
 
-  .detail-value.dim {
-    color: var(--muted);
-    font-weight: 300;
-  }
-
-  .detail-message {
-    grid-column: 1 / -1;
-    margin-top: 4px;
-  }
-
-  .detail-message-text {
-    font-size: 12px;
+  /* ── Filter dropdown ── */
+  .filter-select {
+    background: var(--surface);
+    border: 1px solid var(--border-hi);
     color: var(--text);
-    font-weight: 300;
-    line-height: 1.6;
-    white-space: pre-wrap;
-    word-break: break-word;
-    max-height: 200px;
-    overflow-y: auto;
-    background: var(--bg);
-    padding: 10px 14px;
+    font-family: var(--font);
+    font-size: 0.7rem;
+    padding: 4px 8px;
     border-radius: 2px;
-    border: 1px solid var(--border);
+    cursor: pointer;
   }
 
-  .detail-error {
+  .filter-select:focus {
+    outline: none;
+    border-color: var(--amber-dim);
+  }
+
+  /* ── Queue panel ── */
+  .queue-card {
+    background: var(--surface);
+    padding: 12px 18px;
+    display: grid;
+    grid-template-columns: 100px 1fr auto;
+    gap: 14px;
+    align-items: center;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.9rem;
+  }
+
+  .queue-card:last-child {
+    border-bottom: none;
+  }
+
+  .queue-id {
+    color: var(--amber);
+    font-weight: 600;
+    font-size: 0.9rem;
+  }
+
+  .queue-title {
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 600px;
+  }
+
+  .queue-reason {
+    font-size: 0.6rem;
+    color: var(--muted);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border: 1px solid var(--border-hi);
+    border-radius: 2px;
+  }
+
+  .queue-reason.paused {
     color: var(--red);
-    font-weight: 400;
+    border-color: var(--red);
+  }
+
+  .agent-project {
+    font-size: 0.6rem;
+    color: var(--muted);
+    letter-spacing: 0.05em;
+    margin-top: 2px;
   }
 
   /* ── Empty state ── */
@@ -451,7 +714,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   .empty-title {
-    font-size: 13px;
+    font-size: 0.8rem;
     color: var(--dim);
     margin-bottom: 6px;
     font-weight: 300;
@@ -459,7 +722,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   .empty-sub {
-    font-size: 11px;
+    font-size: 0.7rem;
     color: var(--border-hi);
     font-weight: 300;
   }
@@ -481,7 +744,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   .stat-label {
-    font-size: 10px;
+    font-size: 0.6rem;
     color: var(--muted);
     font-weight: 300;
     letter-spacing: 0.1em;
@@ -489,7 +752,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   .stat-value {
-    font-size: 12px;
+    font-size: 0.9rem;
     color: var(--text);
     font-weight: 500;
   }
@@ -522,6 +785,135 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     100% { transform: scaleX(0) translateX(100%); }
   }
 
+  /* ── Log panel ── */
+  .log-panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    margin-bottom: 32px;
+  }
+
+  .log-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .log-filter {
+    background: var(--surface);
+    border: 1px solid var(--border-hi);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 0.65rem;
+    padding: 3px 8px;
+    border-radius: 2px;
+    cursor: pointer;
+    min-width: 160px;
+  }
+
+  .log-filter:focus { outline: none; border-color: var(--amber-dim); }
+
+  .log-clear-btn {
+    background: transparent;
+    border: 1px solid var(--border-hi);
+    color: var(--muted);
+    font-family: var(--font);
+    font-size: 0.6rem;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 3px 10px;
+    border-radius: 2px;
+    cursor: pointer;
+    transition: all 0.15s;
+    margin-left: auto;
+  }
+
+  .log-clear-btn:hover { border-color: var(--amber-dim); color: var(--amber); }
+
+  .log-scroll {
+    height: 260px;
+    overflow-y: auto;
+    font-size: 0.72rem;
+    line-height: 1.6;
+    padding: 8px 0;
+    scroll-behavior: smooth;
+  }
+
+  .log-scroll::-webkit-scrollbar { width: 4px; }
+  .log-scroll::-webkit-scrollbar-track { background: var(--surface); }
+  .log-scroll::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 2px; }
+
+  .log-entry {
+    display: grid;
+    grid-template-columns: 76px 52px 1fr;
+    gap: 12px;
+    padding: 2px 16px;
+    transition: background 0.1s;
+  }
+
+  .log-entry:hover { background: #141414; }
+
+  .log-ts { color: var(--dim); font-weight: 300; white-space: nowrap; }
+
+  .log-lvl {
+    font-weight: 500;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    font-size: 0.6rem;
+    padding-top: 2px;
+  }
+
+  .log-lvl.DEBUG    { color: var(--dim); }
+  .log-lvl.INFO     { color: var(--blue); }
+  .log-lvl.WARNING  { color: var(--amber); }
+  .log-lvl.ERROR    { color: var(--red); }
+  .log-lvl.CRITICAL { color: var(--red); font-weight: 600; }
+
+  .log-msg { color: var(--muted); word-break: break-all; }
+
+  .log-tag {
+    display: inline-block;
+    font-size: 0.55rem;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 0 5px;
+    border-radius: 2px;
+    margin-right: 6px;
+    border: 1px solid var(--amber-dim);
+    color: var(--amber);
+    vertical-align: middle;
+    line-height: 1.6;
+  }
+
+  .log-empty {
+    padding: 32px;
+    text-align: center;
+    font-size: 0.7rem;
+    color: var(--dim);
+    font-weight: 300;
+  }
+
+  .log-autoscroll-btn {
+    background: transparent;
+    border: 1px solid var(--border-hi);
+    color: var(--muted);
+    font-family: var(--font);
+    font-size: 0.6rem;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 3px 10px;
+    border-radius: 2px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .log-autoscroll-btn.on { border-color: var(--amber-dim); color: var(--amber); }
+  .log-autoscroll-btn:hover { border-color: var(--amber-dim); color: var(--amber); }
+
   /* ── Footer ── */
   footer {
     display: flex;
@@ -533,13 +925,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   .footer-left {
-    font-size: 11px;
+    font-size: 0.7rem;
     color: var(--dim);
     font-weight: 300;
   }
 
   .footer-right {
-    font-size: 11px;
+    font-size: 0.7rem;
     color: var(--dim);
     font-weight: 300;
   }
@@ -554,6 +946,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <span class="logo-tag">Claude Code Orchestrator</span>
     </div>
     <div class="header-right">
+      <a href="/studio" class="rl-chip" style="text-decoration:none">workflow &rarr;</a>
+      <span id="rate-limit" class="rl-chip" style="display:none">—</span>
       <div id="status-dot" class="status-dot idle"></div>
       <span id="ts" class="timestamp">—</span>
     </div>
@@ -582,13 +976,34 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div id="projects-section" style="display:none">
+    <div class="section-header">
+      <span class="section-title">Projects</span>
+      <div class="section-line"></div>
+      <span class="section-count" id="project-count">0</span>
+    </div>
+    <div id="projects-grid" class="projects-grid"></div>
+  </div>
+
   <div class="section-header">
     <span class="section-title">Active Agents</span>
     <div class="section-line"></div>
+    <select id="project-filter" class="filter-select" onchange="window.__stokowskiSetFilter(this.value)">
+      <option value="">All projects</option>
+    </select>
     <span class="section-count" id="agent-count">0</span>
   </div>
 
   <div id="agents-container"></div>
+
+  <div id="queue-section" style="display:none">
+    <div class="section-header">
+      <span class="section-title">Queued (eligible, waiting)</span>
+      <div class="section-line"></div>
+      <span class="section-count" id="queue-count">0</span>
+    </div>
+    <div id="queue-container"></div>
+  </div>
 
   <div class="stats-bar">
     <div class="stat-item">
@@ -601,9 +1016,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <span class="stat-value" id="s-out">—</span>
     </div>
     <div class="stat-divider"></div>
+    <div class="stat-item">
+      <span class="stat-label">Cache r/w</span>
+      <span class="stat-value" id="s-cache">—</span>
+    </div>
+    <div class="stat-divider"></div>
     <div id="progress-container" style="display:none; flex:1; align-items:center; gap:12px;">
       <span class="stat-label">Working</span>
       <div class="progress-wrap"><div class="progress-bar"></div></div>
+    </div>
+  </div>
+
+
+  <div class="section-header" style="margin-top:8px">
+    <span class="section-title">Log</span>
+    <div class="section-line"></div>
+    <span class="section-count" id="log-count">0</span>
+  </div>
+  <div class="log-panel">
+    <div class="log-toolbar">
+      <select id="log-issue-filter" class="log-filter" onchange="window.__logSetFilter(this.value)">
+        <option value="">All issues</option>
+      </select>
+      <button class="log-autoscroll-btn on" id="log-autoscroll-btn" onclick="window.__logToggleAutoscroll()">&#8593; Auto-scroll</button>
+      <button class="log-clear-btn" onclick="window.__logClear()">Clear</button>
+    </div>
+    <div class="log-scroll" id="log-scroll">
+      <div class="log-empty" id="log-empty">No log entries yet</div>
     </div>
   </div>
 
@@ -635,157 +1074,242 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
   }
 
+  function fmtElapsed(isoStr) {
+    if (!isoStr) return '';
+    const diffMs = Date.now() - new Date(isoStr).getTime();
+    const s = Math.floor(diffMs / 1000);
+    if (s < 5)  return 'just now';
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    return Math.floor(s / 3600) + 'h ago';
+  }
+
   function statusPill(status) {
     const cls = ['streaming','succeeded','failed','retrying','pending','gate'].includes(status) ? status : 'pending';
     const label = status === 'streaming' ? 'live' : status === 'gate' ? 'awaiting gate' : status;
     return `<span class="status-pill ${cls}">${label}</span>`;
   }
 
-  // Track which cards are expanded across refreshes
-  const expandedCards = new Set();
+  // Filter state — null means "all projects". Persisted across refreshes.
+  let activeFilter = '';
+  window.__stokowskiSetFilter = (val) => { activeFilter = val || ''; refresh(); };
 
-  function toggleCard(id) {
-    if (expandedCards.has(id)) expandedCards.delete(id);
-    else expandedCards.add(id);
-    const el = document.getElementById('card-' + id);
-    if (el) el.classList.toggle('expanded');
+  function projectMatches(item) {
+    if (!activeFilter) return true;
+    return (item.project_name || '') === activeFilter;
   }
 
-  function renderWorkflow(stateName, workflowName, workflows) {
-    if (!workflowName || !workflows || !workflows[workflowName]) return '';
-    const path = workflows[workflowName].path || [];
-    if (path.length === 0) return '';
-    const currentIdx = path.indexOf(stateName);
-    const allSteps = path;
-    const steps = allSteps.map((s, i) => {
-      let cls = 'wf-step';
-      if (i === currentIdx) cls += ' current';
-      else if (currentIdx >= 0 && i < currentIdx) cls += ' done';
-      return '<span class="' + cls + '">' + esc(s) + '</span>';
-    }).join('<span class="wf-arrow">&#x203A;</span>');
-    return '<div class="workflow-steps">' + steps + '</div>';
+  async function togglePause(name) {
+    try {
+      await fetch('/api/v1/projects/' + encodeURIComponent(name) + '/toggle', { method: 'POST' });
+      refresh();
+    } catch (e) { /* ignore */ }
+  }
+  window.__stokowskiTogglePause = togglePause;
+
+  function renderProjects(data) {
+    const projects = data.projects || [];
+    const section = document.getElementById('projects-section');
+    if (projects.length <= 1) {
+      // Hide the projects section for single-project setups — keeps the
+      // dashboard clean when there's no multi-project context to surface.
+      section.style.display = 'none';
+    } else {
+      section.style.display = '';
+    }
+    document.getElementById('project-count').textContent = projects.length;
+
+    // Update filter dropdown options (preserve current selection)
+    const sel = document.getElementById('project-filter');
+    const current = sel.value;
+    const wantedNames = projects.map(p => p.name);
+    const existingOpts = Array.from(sel.options).map(o => o.value);
+    const same = wantedNames.length === existingOpts.length - 1 &&
+      wantedNames.every((n, i) => existingOpts[i + 1] === n);
+    if (!same) {
+      sel.innerHTML = '<option value="">All projects</option>' +
+        wantedNames.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+      sel.value = wantedNames.includes(current) ? current : '';
+      activeFilter = sel.value;
+    }
+
+    document.getElementById('projects-grid').innerHTML = projects.map(p => {
+      const tokens = p.totals?.total_tokens || 0;
+      const pauseLabel = p.paused ? 'Resume' : 'Pause';
+      const pauseClass = p.paused ? 'pause-btn paused' : 'pause-btn';
+      return `
+        <div class="project-tile ${p.paused ? 'paused' : ''}">
+          <div class="project-tile-head">
+            <span class="project-tile-name" title="${esc(p.name)}">${esc(p.name)}</span>
+            <button class="${pauseClass}" onclick="window.__stokowskiTogglePause('${esc(p.name)}')">${pauseLabel}</button>
+          </div>
+          <div class="project-tile-stats">
+            <div class="project-stat">
+              <span class="project-stat-label">Run</span>
+              <span class="project-stat-value">${p.counts?.running || 0}</span>
+            </div>
+            <div class="project-stat">
+              <span class="project-stat-label">Gates</span>
+              <span class="project-stat-value">${p.counts?.gates || 0}</span>
+            </div>
+            <div class="project-stat">
+              <span class="project-stat-label">Queue</span>
+              <span class="project-stat-value">${p.counts?.queued || 0}</span>
+            </div>
+            <div class="project-stat">
+              <span class="project-stat-label">Tokens</span>
+              <span class="project-stat-value">${fmt(tokens)}</span>
+            </div>
+          </div>
+        </div>`;
+    }).join('');
   }
 
-  function fmtElapsed(isoStr) {
-    if (!isoStr) return '—';
-    const s = (Date.now() - new Date(isoStr).getTime()) / 1000;
-    return fmtSecs(Math.max(0, s));
+  function renderQueue(data) {
+    const queue = (data.queued || []).filter(projectMatches);
+    const section = document.getElementById('queue-section');
+    if (queue.length === 0) {
+      section.style.display = 'none';
+      return;
+    }
+    section.style.display = '';
+    document.getElementById('queue-count').textContent = queue.length;
+    document.getElementById('queue-container').innerHTML =
+      `<div class="agents">` + queue.map(q => {
+        const pausedReason = (q.reason || '').toLowerCase().includes('paused');
+        return `
+          <div class="queue-card">
+            <div>
+              <div class="queue-id">${esc(q.issue_identifier)}</div>
+              ${q.project_name ? `<div class="agent-project">${esc(q.project_name)}</div>` : ''}
+            </div>
+            <div class="queue-title">${esc(q.title || '—')}</div>
+            <div class="queue-reason ${pausedReason ? 'paused' : ''}">${esc(q.reason || '')}</div>
+          </div>`;
+      }).join('') + `</div>`;
   }
 
-  function renderDetail(r, dockerEnabled) {
-    const tokIn = r.tokens?.input_tokens || 0;
-    const tokOut = r.tokens?.output_tokens || 0;
-    const items = [
-      ['Tokens In', fmt(tokIn)],
-      ['Tokens Out', fmt(tokOut)],
-      ['Elapsed', fmtElapsed(r.started_at)],
-      ['Turns', String(r.turn_count || 0)],
-    ];
-    if (r.session_id)
-      items.push(['Session', esc(r.session_id)]);
-    if (dockerEnabled && r.container_name)
-      items.push(['Container', esc(r.container_name)]);
+  // Which agent cards are expanded. Kept outside the render so a card stays
+  // open across the 3s poll.
+  const expandedAgents = new Set();
 
-    let grid = '';
-    for (const [l,v] of items) {
-      grid += '<div class="detail-item"><span class="detail-label">'
-        + l + '</span><span class="detail-value">' + v + '</span></div>';
+  window.__toggleAgent = function (key) {
+    if (expandedAgents.has(key)) expandedAgents.delete(key);
+    else expandedAgents.add(key);
+    if (window.__lastData) renderAgents(window.__lastData);
+  };
+
+  function renderTimeline(r) {
+    const acts = r.activity || [];
+    const counts = r.tool_counts || {};
+    const chips = Object.keys(counts)
+      .sort((a, b) => counts[b] - counts[a])
+      .map(k => `<span class="tl-chip">${esc(k)} ${counts[k]}</span>`)
+      .join('');
+
+    if (!acts.length) {
+      return `<div class="timeline">${chips ? `<div class="tl-tools">${chips}</div>` : ''}<div class="tl-empty">No activity recorded yet</div></div>`;
     }
 
-    if (r.error) {
-      grid += '<div class="detail-item"><span class="detail-label">Error</span>'
-        + '<span class="detail-value detail-error">' + esc(r.error) + '</span></div>';
-    }
+    // Newest last, matching the order the agent did the work.
+    const rows = acts.map(a => {
+      const t = a.at ? new Date(a.at).toLocaleTimeString('en-GB', { hour12: false }) : '';
+      const mark = a.status === 'error' ? '\u2717 ' : (a.status === 'warn' ? '\u26a0 ' : '');
+      return `<div class="tl-row ${esc(a.kind)}">
+        <span class="tl-time">${esc(t)}</span>
+        <span class="tl-label" title="${esc(a.label)}">${mark}${esc(a.label)}</span>
+        <span class="tl-detail" title="${esc(a.detail || '')}">${esc(a.detail || '')}</span>
+      </div>`;
+    }).join('');
 
-    if (r.last_message) {
-      grid += '<div class="detail-message"><span class="detail-label">Last Message</span>'
-        + '<div class="detail-message-text">' + esc(r.last_message) + '</div></div>';
-    }
-
-    return '<div class="agent-detail"><div class="detail-grid">' + grid + '</div></div>';
+    return `<div class="timeline">${chips ? `<div class="tl-tools">${chips}</div>` : ''}${rows}</div>`;
   }
 
   function renderAgents(data) {
-    const workflows = data.workflows || {};
-    const dockerEnabled = data.docker_enabled || false;
-    const container = document.getElementById('agents-container');
-
     const all = [
       ...(data.running || []),
-      ...(data.retrying || []).map(function(r) { return {
+      ...(data.retrying || []).map(r => ({
         issue_identifier: r.issue_identifier,
-        issue_id: r.issue_id,
+        project_name: r.project_name,
         status: 'retrying',
         turn_count: r.attempt,
-        tokens: { total_tokens: 0, input_tokens: 0, output_tokens: 0 },
+        tokens: { total_tokens: 0 },
         last_message: r.error || 'waiting to retry...',
         session_id: null,
-        container_name: null,
-        state_name: null,
-        workflow: null,
-        started_at: null,
-        error: null,
-      }}),
-      ...(data.gates || []).map(function(g) { return {
+      })),
+      ...(data.gates || []).map(g => ({
         issue_identifier: g.issue_identifier,
-        issue_id: g.issue_id,
+        project_name: g.project_name,
         status: 'gate',
         state_name: g.gate_state,
         turn_count: g.run,
-        tokens: { total_tokens: 0, input_tokens: 0, output_tokens: 0 },
+        tokens: { total_tokens: 0 },
         last_message: 'Awaiting human review',
         session_id: null,
-        container_name: null,
-        workflow: g.workflow,
-        started_at: null,
-        error: null,
-      }}),
-    ];
+      })),
+    ].filter(projectMatches);
 
     document.getElementById('agent-count').textContent = all.length;
 
     if (all.length === 0) {
-      container.textContent = '';
-      var emptyDiv = document.createElement('div');
-      emptyDiv.className = 'empty';
-      emptyDiv.innerHTML = '<div class="empty-title">No active agents</div>'
-        + '<div class="empty-sub">Move a Linear issue to Todo or In Progress to start</div>';
-      container.appendChild(emptyDiv);
+      document.getElementById('agents-container').innerHTML = `
+        <div class="empty">
+          <div class="empty-title">No active agents</div>
+          <div class="empty-sub">Move a Linear issue to Todo or In Progress to start</div>
+        </div>`;
       return;
     }
 
-    var rows = '';
-    for (const r of all) {
-      const cardId = (r.issue_identifier || '').replace(/[^a-zA-Z0-9_-]/g, '_');
-      const expanded = expandedCards.has(cardId) ? ' expanded' : '';
-      const dockerBadge = dockerEnabled && r.container_name
-        ? '<span class="docker-badge">docker</span>' : '';
-      const wfHtml = renderWorkflow(r.state_name, r.workflow, workflows);
+    const rows = all.map(r => {
+      const stateInfo = r.state_name ? `<span style="color:var(--muted);font-size:11px;margin-left:8px">${esc(r.state_name)}</span>` : '';
+      const projTag = r.project_name ? `<div class="agent-project">${esc(r.project_name)}</div>` : '';
+      const key = (r.project_name || '') + '/' + r.issue_identifier;
+      const open = expandedAgents.has(key);
 
-      rows += '<div class="agent-card' + expanded + '" id="card-' + cardId
-        + '" onclick="toggleCard(\'' + cardId + '\')">'
-        + '<div><div class="agent-id">' + esc(r.issue_identifier) + '</div></div>'
-        + '<div>'
-        + '<div class="agent-status-row">' + statusPill(r.status) + dockerBadge + '</div>'
-        + '<div class="agent-msg">' + esc(r.last_message || '—') + '</div>'
-        + wfHtml
-        + '</div>'
-        + '<div class="agent-meta">'
-        + '<div class="agent-tokens">' + fmt(r.tokens?.total_tokens || 0) + ' tok</div>'
-        + '<div class="agent-turns">turn ' + (r.turn_count || 0) + '</div>'
-        + '</div>'
-        + renderDetail(r, dockerEnabled)
-        + '</div>';
-    }
+      // Tool count and error count give an at-a-glance sense of whether the
+      // agent is making progress or thrashing.
+      const toolBits = [];
+      if (r.tool_call_count) toolBits.push(`${r.tool_call_count} tools`);
+      if (r.tool_error_count) toolBits.push(`<span class="agent-warn">${r.tool_error_count} err</span>`);
+      if (r.compaction_count) toolBits.push(`${r.compaction_count}\u00d7 compact`);
+      if (r.artifact_count) toolBits.push(`${r.artifact_count} artifacts`);
+      const sub = toolBits.length ? `<div class="agent-sub">${toolBits.join(' \u00b7 ')}</div>` : '';
+      const cost = r.cost_usd ? `<div class="agent-cost">$${r.cost_usd.toFixed(2)}</div>` : '';
 
-    // All values passed through esc() — data is from orchestrator internal state
-    container.innerHTML = '<div class="agents">' + rows + '</div>';
+      return `
+      <div class="agent-card ${open ? 'expanded' : ''}" onclick="window.__toggleAgent('${esc(key)}')">
+        <div>
+          <div class="agent-id">${esc(r.issue_identifier)}</div>
+          ${projTag}
+        </div>
+        <div>
+          <div class="agent-status-row">
+            ${statusPill(r.status)}${stateInfo}
+          </div>
+          <div class="agent-activity">
+            <span class="agent-msg">${esc(r.last_message || '\u2014')}</span>
+            ${r.last_event_at ? `<span class="agent-elapsed">${fmtElapsed(r.last_event_at)}</span>` : ''}
+          </div>
+          ${sub}
+        </div>
+        <div class="agent-meta">
+          <div class="agent-tokens">${fmt(r.tokens?.total_tokens || 0)} tok</div>
+          <div class="agent-turns">turn ${r.turn_count || 0}</div>
+          ${cost}
+        </div>
+        ${open ? renderTimeline(r) : ''}
+      </div>`;
+    }).join('');
+
+    document.getElementById('agents-container').innerHTML =
+      `<div class="agents">${rows}</div>`;
   }
 
   async function refresh() {
     try {
       const res = await fetch('/api/v1/state');
       const data = await res.json();
+      window.__lastData = data;
 
       const running  = data.counts?.running  || 0;
       const retrying = data.counts?.retrying || 0;
@@ -798,12 +1322,44 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById('v-tokens').textContent   = fmt(data.totals?.total_tokens || 0);
       document.getElementById('v-runtime').textContent  = fmtSecs(data.totals?.seconds_running || 0);
 
+      // Cost is the number that actually tells you what a run was worth, so it
+      // rides alongside the token count rather than being buried.
+      const cost = data.totals?.cost_usd || 0;
+      const toolCalls = data.totals?.tool_calls || 0;
+      document.getElementById('v-tokens-sub').textContent =
+        '$' + cost.toFixed(2) + (toolCalls ? ' \u00b7 ' + fmt(toolCalls) + ' tool calls' : '');
+
       document.getElementById('m-running').className  = 'metric' + (active ? ' active' : '');
       document.getElementById('m-tokens').className   = 'metric' + (data.totals?.total_tokens > 0 ? ' active' : '');
 
-      // Stats bar
+      // Stats bar. Cache reads are shown separately because they typically
+      // dwarf fresh input and are billed at a tenth of the rate — collapsing
+      // them into one figure hides where the spend actually goes.
       document.getElementById('s-in').textContent  = fmt(data.totals?.input_tokens  || 0);
       document.getElementById('s-out').textContent = fmt(data.totals?.output_tokens || 0);
+      const sCache = document.getElementById('s-cache');
+      if (sCache) {
+        const cw = data.totals?.cache_creation_tokens || 0;
+        const cr = data.totals?.cache_read_tokens || 0;
+        sCache.textContent = fmt(cr) + ' / ' + fmt(cw);
+      }
+
+      // Rate-limit window
+      const rl = data.rate_limit;
+      const rlEl = document.getElementById('rate-limit');
+      if (rl && rl.status) {
+        const ok = rl.status === 'allowed';
+        let label = (rl.type || 'limit').replace('_', '-') + ' ' + rl.status;
+        if (rl.resets_at) {
+          const mins = Math.max(0, Math.round((rl.resets_at * 1000 - Date.now()) / 60000));
+          label += mins > 90 ? ' \u00b7 ' + Math.round(mins / 60) + 'h' : ' \u00b7 ' + mins + 'm';
+        }
+        rlEl.textContent = label;
+        rlEl.className = 'rl-chip' + (ok ? '' : ' warn');
+        rlEl.style.display = '';
+      } else {
+        rlEl.style.display = 'none';
+      }
 
       // Progress bar
       const pc = document.getElementById('progress-container');
@@ -820,7 +1376,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById('footer-gen').textContent =
         'last sync ' + now.toLocaleTimeString('en-US', { hour12: false });
 
+      renderProjects(data);
       renderAgents(data);
+      renderQueue(data);
     } catch(e) {
       document.getElementById('status-dot').className = 'status-dot idle';
     }
@@ -828,14 +1386,501 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   refresh();
   setInterval(refresh, 3000);
+
+  // ── Log panel ──────────────────────────────────────────────────────────────
+  let logEntries = [];
+  let logFilter = '';
+  let logAutoScroll = true;
+  let logKnownIssues = new Set();
+  let logClearedSeq = 0;
+  let logLastRenderedFilter = null;
+
+  window.__logSetFilter = (val) => { logFilter = val || ''; renderLog(); };
+  window.__logClear = () => {
+    const last = logEntries.length > 0 ? logEntries[logEntries.length - 1].seq : 0;
+    logClearedSeq = last;
+    logEntries = [];
+    renderLog();
+  };
+  window.__logToggleAutoscroll = () => {
+    logAutoScroll = !logAutoScroll;
+    const btn = document.getElementById('log-autoscroll-btn');
+    btn.className = 'log-autoscroll-btn' + (logAutoScroll ? ' on' : '');
+    if (logAutoScroll) scrollLogToTop();
+  };
+
+  function fmtLogTs(epochSecs) {
+    const d = new Date(epochSecs * 1000);
+    return String(d.getHours()).padStart(2,'0') + ':' +
+           String(d.getMinutes()).padStart(2,'0') + ':' +
+           String(d.getSeconds()).padStart(2,'0');
+  }
+
+  function scrollLogToTop() {
+    const el = document.getElementById('log-scroll');
+    el.scrollTop = 0;
+  }
+
+  function makeLogRow(e) {
+    const row = document.createElement('div');
+    row.className = 'log-entry';
+    const tag = (e.attrs && e.attrs.linked_to)
+      ? `<span class="log-tag">${esc(e.attrs.linked_to)}</span>` : '';
+    row.innerHTML =
+      `<span class="log-ts">${fmtLogTs(e.ts)}</span>` +
+      `<span class="log-lvl ${esc(e.level)}">${esc(e.level)}</span>` +
+      `<span class="log-msg">${tag}${esc(e.msg)}</span>`;
+    return row;
+  }
+
+  function renderLog() {
+    const visible = logFilter
+      ? logEntries.filter(e => e.attrs && e.attrs.linked_to === logFilter)
+      : logEntries;
+
+    document.getElementById('log-count').textContent = visible.length;
+
+    const scroll = document.getElementById('log-scroll');
+    const empty  = document.getElementById('log-empty');
+
+    if (visible.length === 0) {
+      empty.style.display = '';
+      Array.from(scroll.children).forEach(c => { if (c !== empty) c.remove(); });
+      return;
+    }
+    empty.style.display = 'none';
+
+    const filterChanged = logLastRenderedFilter !== logFilter;
+    if (filterChanged) {
+      Array.from(scroll.children).forEach(c => { if (c !== empty) c.remove(); });
+    }
+    logLastRenderedFilter = logFilter;
+
+    const renderedCount = scroll.querySelectorAll('.log-entry').length;
+    if (visible.length - renderedCount <= 0) return;
+
+    // Newest entries at end of visible[] — prepend in reverse so most recent is at top
+    const firstEntry = scroll.querySelector('.log-entry');
+    for (let i = visible.length - 1; i >= renderedCount; i--) {
+      scroll.insertBefore(makeLogRow(visible[i]), firstEntry);
+    }
+
+    if (logAutoScroll) scrollLogToTop();
+  }
+
+  function ingestEntry(entry) {
+    if (entry.seq <= logClearedSeq) return;
+    logEntries.push(entry);
+    if (logEntries.length > 1000) logEntries = logEntries.slice(-1000);
+
+    if (entry.attrs && entry.attrs.linked_to) {
+      const id = entry.attrs.linked_to;
+      if (!logKnownIssues.has(id)) {
+        logKnownIssues.add(id);
+        const sel = document.getElementById('log-issue-filter');
+        const opt = document.createElement('option');
+        opt.value = id;
+        opt.textContent = id;
+        sel.appendChild(opt);
+      }
+    }
+
+    if (!logFilter || (entry.attrs && entry.attrs.linked_to === logFilter)) {
+      renderLog();
+    }
+  }
+
+  function connectLogStream() {
+    const es = new EventSource('/api/v1/logs/stream');
+    es.onmessage = (ev) => {
+      try { ingestEntry(JSON.parse(ev.data)); } catch(e) {}
+    };
+    es.onerror = () => {
+      es.close();
+      setTimeout(connectLogStream, 3000);
+    };
+  }
+
+  connectLogStream();
 </script>
 </body>
 </html>
 """
 
 
-def create_app(orchestrator: Orchestrator) -> FastAPI:
+
+# ── Studio page ──────────────────────────────────────────────────────────────
+# Same shell and palette as the dashboard, no build step, no dependencies —
+# the config file remains the source of truth and this is a view onto it.
+
+STUDIO_HTML = DASHBOARD_HTML.split("<body>")[0] + """<body>
+<div class="shell">
+  <div class="header">
+    <div class="logo">
+      <span class="logo-mark">STOKOWSKI</span>
+      <span class="logo-sub">WORKFLOW STUDIO</span>
+    </div>
+    <div class="header-right">
+      <a href="/" class="rl-chip" style="text-decoration:none">&larr; dashboard</a>
+      <span id="wf-path" class="timestamp">—</span>
+    </div>
+  </div>
+
+  <div id="banner" style="display:none"></div>
+
+  <div id="workflow-bar"></div>
+
+  <div class="section-header">
+    <span class="section-title">PIPELINE</span>
+    <div class="section-line"></div>
+    <span class="section-count" id="stage-count">0</span>
+  </div>
+  <div id="pipeline"></div>
+
+  <div class="section-header" style="margin-top:8px">
+    <span class="section-title">STAGES</span>
+    <div class="section-line"></div>
+  </div>
+  <div id="action-bar"></div>
+  <div id="stages"></div>
+
+  <div class="section-header" style="margin-top:8px">
+    <span class="section-title">GLOBAL</span>
+    <div class="section-line"></div>
+  </div>
+  <div id="root-fields" class="agents"></div>
+
+  <div class="section-header" style="margin-top:8px">
+    <span class="section-title">PROMPTS</span>
+    <div class="section-line"></div>
+    <span class="section-count" id="prompt-count">0</span>
+  </div>
+  <div id="prompts"></div>
+
+  <div class="footer">
+    <span>Edits are validated before they are written &mdash; an invalid config is never saved</span>
+    <span class="footer-right" id="saved">—</span>
+  </div>
+</div>
+
+<style>
+  .flow { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:18px 24px;
+          background:var(--surface); border:1px solid var(--border); margin-bottom:28px; }
+  .node { padding:6px 12px; border:1px solid var(--border-hi); border-radius:2px;
+          font-size:.75rem; white-space:nowrap; }
+  .node.agent    { color:var(--text);  border-color:var(--blue); }
+  .node.gate     { color:var(--amber); border-color:var(--amber-dim); }
+  .node.terminal { color:var(--green); border-color:rgba(76,186,110,.4); }
+  .node-sub { display:block; font-size:.6rem; color:var(--dim); margin-top:2px; }
+  .arrow { color:var(--dim); font-size:.8rem; }
+
+  .stage { background:var(--surface); border:1px solid var(--border); margin-bottom:1px;
+           padding:16px 24px; }
+  .stage-head { display:flex; align-items:baseline; gap:10px; margin-bottom:12px; }
+  .stage-name { color:var(--amber); font-weight:600; font-size:.85rem; }
+  .stage-kind { font-size:.6rem; text-transform:uppercase; letter-spacing:.1em;
+                color:var(--dim); border:1px solid var(--border-hi); padding:1px 6px; }
+  .stage-flow { font-size:.7rem; color:var(--dim); margin-left:auto; }
+
+  .fields { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:12px; }
+  .field label { display:block; font-size:.6rem; text-transform:uppercase;
+                 letter-spacing:.08em; color:var(--dim); margin-bottom:4px; }
+  .field input, .field select {
+    width:100%; background:var(--bg); color:var(--text); font-family:var(--font);
+    font-size:.75rem; border:1px solid var(--border-hi); border-radius:2px; padding:5px 7px; }
+  .field input:focus, .field select:focus { outline:none; border-color:var(--amber); }
+  .field.dirty input, .field.dirty select { border-color:var(--amber); }
+  .field .inherited { font-size:.55rem; color:var(--dim); margin-top:3px; }
+
+  .bar { display:flex; gap:10px; align-items:center; padding:14px 24px;
+         background:var(--surface); border:1px solid var(--border); margin-bottom:28px; }
+  button.act { background:var(--amber); color:#111; border:none; border-radius:2px;
+               padding:6px 14px; font-family:var(--font); font-size:.7rem; font-weight:600;
+               cursor:pointer; }
+  button.act[disabled] { background:var(--border-hi); color:var(--dim); cursor:default; }
+  button.ghost { background:transparent; color:var(--muted); border:1px solid var(--border-hi); }
+
+  .banner { padding:12px 24px; margin-bottom:20px; font-size:.75rem; border:1px solid; }
+  .banner.err { color:var(--red); border-color:rgba(217,95,82,.4); background:rgba(217,95,82,.07); }
+  .banner.ok  { color:var(--green); border-color:rgba(76,186,110,.4); background:rgba(76,186,110,.07); }
+
+  .prompt-row { display:flex; align-items:center; gap:12px; padding:10px 24px;
+                background:var(--surface); border:1px solid var(--border); margin-bottom:1px;
+                cursor:pointer; font-size:.75rem; }
+  .prompt-row:hover { background:#141414; }
+  .prompt-row .p-name { color:var(--text); }
+  .prompt-row .p-size { margin-left:auto; color:var(--dim); font-size:.65rem; }
+  .editor { width:100%; min-height:420px; background:var(--bg); color:var(--text);
+            font-family:var(--font); font-size:.75rem; line-height:1.6; padding:14px;
+            border:1px solid var(--border-hi); border-radius:2px; resize:vertical; }
+</style>
+
+<script>
+  const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+  let DATA = null;
+  const pending = new Map();   // key -> update object
+
+  function banner(msg, kind) {
+    const el = document.getElementById('banner');
+    if (!msg) { el.style.display = 'none'; return; }
+    el.className = 'banner ' + kind;
+    el.textContent = msg;
+    el.style.display = '';
+    if (kind === 'ok') setTimeout(() => { el.style.display = 'none'; }, 4000);
+  }
+
+  // ── Pipeline strip: the "what does this actually do" view ───────────────
+  function renderFlow(d) {
+    const order = [];
+    const seen = new Set();
+    let cur = d.entry_state;
+    while (cur && !seen.has(cur)) {
+      seen.add(cur); order.push(cur);
+      const s = d.states.find(x => x.name === cur);
+      cur = s && (s.transitions.complete || s.transitions.approve);
+    }
+    // Anything unreachable still deserves showing — silently hiding a state
+    // is how an orphaned stage goes unnoticed.
+    d.states.forEach(s => { if (!seen.has(s.name)) order.push(s.name); });
+
+    document.getElementById('stage-count').textContent = d.states.length;
+    document.getElementById('pipeline').innerHTML = '<div class="flow">' +
+      order.map((name, i) => {
+        const s = d.states.find(x => x.name === name);
+        if (!s) return '';
+        const detail = s.type === 'agent'
+          ? [s.model, s.effort, s.session, s.runner].filter(Boolean).join(' · ')
+          : (s.type === 'gate' ? 'human · rework → ' + esc(s.rework_to || '?') : 'end');
+        const orphan = seen.has(name) ? '' : ' (unreachable)';
+        return (i ? '<span class="arrow">→</span>' : '') +
+          `<span class="node ${esc(s.type)}">${esc(name)}${orphan}
+             <span class="node-sub">${esc(detail)}</span></span>`;
+      }).join('') + '</div>';
+  }
+
+  function fieldHtml(scope, state, key, value, spec, inherited) {
+    const id = `${scope}:${state || ''}:${key}`;
+    const label = key.split('.').pop().replace(/_/g, ' ');
+    let control;
+    if (spec.type === 'model') {
+      // A real select, grouped by provider — a datalist only reveals its
+      // options once you start typing, which is not a dropdown. The catalogue
+      // will always lag real model lineups, so "Custom…" swaps the control for
+      // a text input rather than making an unlisted model unreachable.
+      const groups = (DATA && DATA.model_catalogue) || [];
+      const known = groups.some(g => g.models.includes(value));
+      const opts = groups.map(g =>
+        `<optgroup label="${esc(g.label)}">` +
+        g.models.map(m =>
+          `<option value="${esc(m)}"${m === value ? ' selected' : ''}>${esc(m)}</option>`
+        ).join('') + `</optgroup>`
+      ).join('');
+      control = `<select data-id="${esc(id)}" onchange="window.__modelChanged(this)">
+          <option value=""${value ? '' : ' selected'}>${esc(inherited ? 'inherit — ' + inherited : '—')}</option>
+          ${opts}
+          <option value="__custom__">Custom…</option>
+        </select>`;
+      if (value && !known) {
+        // A model already in the config but outside the catalogue is shown as
+        // text so it is visible and editable rather than silently dropped.
+        control = `<input data-id="${esc(id)}" value="${esc(value)}"
+                     placeholder="${esc(inherited ?? '')}">`;
+      }
+    } else if (spec.choices) {
+      control = `<select data-id="${esc(id)}">` +
+        ['', ...spec.choices].map(c =>
+          `<option value="${esc(c)}"${String(value ?? '') === c ? ' selected' : ''}>${esc(c || '—')}</option>`
+        ).join('') + '</select>';
+    } else {
+      control = `<input data-id="${esc(id)}" value="${esc(value ?? '')}"
+                   placeholder="${esc(inherited ?? '')}">`;
+    }
+    const note = (value == null && inherited != null)
+      ? `<div class="inherited">inherits ${esc(inherited)}</div>` : '';
+    return `<div class="field" id="f-${esc(id)}"><label>${esc(label)}</label>${control}${note}</div>`;
+  }
+
+  function renderStages(d) {
+    document.getElementById('stages').innerHTML = d.states.map(s => {
+      const applicable = Object.entries(d.state_fields).filter(([k]) => {
+        if (s.type === 'gate') return ['rework_to', 'max_rework'].includes(k);
+        if (s.type === 'terminal') return false;
+        return !['rework_to', 'max_rework'].includes(k);
+      });
+      const fields = applicable.map(([k, spec]) =>
+        fieldHtml('state', s.name, k, s[k], spec,
+                  k === 'model' ? d.root['claude.model']
+                  : k === 'effort' ? (d.root['claude.effort'] || 'high (CLI default)')
+                  : null)
+      ).join('');
+      const flow = Object.entries(s.transitions)
+        .map(([t, target]) => `${esc(t)} → ${esc(target)}`).join('  ·  ');
+      const conc = s.concurrency != null ? ` · max ${s.concurrency} at once` : '';
+      return `<div class="stage">
+        <div class="stage-head">
+          <span class="stage-name">${esc(s.name)}</span>
+          <span class="stage-kind">${esc(s.type)}</span>
+          <span class="stage-flow">${flow}${esc(conc)}</span>
+        </div>
+        ${fields ? `<div class="fields">${fields}</div>` : ''}
+      </div>`;
+    }).join('');
+  }
+
+  function renderRoot(d) {
+    document.getElementById('root-fields').innerHTML =
+      '<div class="stage"><div class="fields">' +
+      Object.entries(d.root_fields).map(([k, spec]) =>
+        fieldHtml('root', null, k, d.root[k], spec, null)).join('') +
+      '</div></div>';
+  }
+
+  function renderWorkflows(d) {
+    const host = document.getElementById('workflow-bar');
+    if (!d.workflows || d.workflows.length < 2) { host.innerHTML = ''; return; }
+
+    const tabs = d.workflows.map(w =>
+      `<button class="wf-tab ${w === d.selected_workflow ? 'on' : ''}"
+               onclick="window.__selectWorkflow('${esc(w)}')">${esc(w)}${
+        w === (d.routing && d.routing.default) ? '<span class="wf-def">default</span>' : ''
+      }</button>`).join('');
+
+    // The routing table is the answer to "why did this ticket run that
+    // pipeline", so it belongs next to the pipeline itself.
+    const rules = ((d.routing && d.routing.rules) || [])
+      .map(r => `<code>${esc(r.label)}</code> &rarr; ${esc(r.workflow)}`).join('<br>');
+    const fallback = d.routing && d.routing.default
+      ? `<code>anything else</code> &rarr; ${esc(d.routing.default)}` : '';
+
+    host.innerHTML = `<div class="wf-bar">${tabs}
+      <div class="wf-routes">${rules}${rules && fallback ? '<br>' : ''}${fallback}</div>
+    </div>`;
+  }
+
+  window.__selectWorkflow = function (name) { load(name); };
+
+  // "Custom…" turns the dropdown into a free-text field, so a model newer than
+  // the catalogue is always reachable without shipping a release.
+  window.__modelChanged = function (select) {
+    if (select.value !== '__custom__') return;
+    const input = document.createElement('input');
+    input.dataset.id = select.dataset.id;
+    input.placeholder = 'model id';
+    select.replaceWith(input);
+    input.focus();
+  };
+
+  function renderPrompts(d) {
+    document.getElementById('prompt-count').textContent = d.prompts.length;
+    document.getElementById('prompts').innerHTML = d.prompts.map(p =>
+      `<div class="prompt-row" onclick="openPrompt('${esc(p.path)}')">
+         <span class="p-name">${esc(p.path)}</span>
+         <span class="p-size">${(p.bytes / 1024).toFixed(1)} KB</span>
+       </div>`).join('');
+  }
+
+  document.addEventListener('input', e => {
+    const id = e.target.dataset && e.target.dataset.id;
+    if (!id) return;
+    const [scope, state, ...rest] = id.split(':');
+    const field = rest.join(':');
+    pending.set(id, { scope, state: state || null, field, value: e.target.value });
+    const box = document.getElementById('f-' + id);
+    if (box) box.classList.add('dirty');
+    document.getElementById('save').disabled = false;
+    document.getElementById('save').textContent = `Save ${pending.size} change${pending.size > 1 ? 's' : ''}`;
+  });
+
+  async function save() {
+    const btn = document.getElementById('save');
+    btn.disabled = true; btn.textContent = 'Saving…';
+    try {
+      const res = await fetch('/api/v1/studio/apply', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          updates: [...pending.values()],
+          workflow: DATA && DATA.selected_workflow,
+        }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error ? body.error.message : 'save failed');
+      const showing = DATA && DATA.selected_workflow;
+      pending.clear();
+      banner('Saved. Stokowski re-reads config on the next poll tick.', 'ok');
+      document.getElementById('saved').textContent =
+        'saved ' + new Date().toLocaleTimeString('en-GB', { hour12: false });
+      await load(showing);
+    } catch (err) {
+      // The config on disk is untouched when a save is rejected.
+      banner(String(err.message || err), 'err');
+      btn.disabled = false;
+      btn.textContent = `Save ${pending.size} change${pending.size > 1 ? 's' : ''}`;
+    }
+  }
+
+  window.openPrompt = async function (path) {
+    const res = await fetch('/api/v1/studio/prompt?path=' + encodeURIComponent(path));
+    const body = await res.json();
+    if (!res.ok) return banner(body.error.message, 'err');
+    const host = document.getElementById('prompts');
+    host.innerHTML = `
+      <div class="bar">
+        <strong style="font-size:.75rem">${esc(path)}</strong>
+        <span style="flex:1"></span>
+        <button class="act" onclick="savePrompt('${esc(path)}')">Save prompt</button>
+        <button class="act ghost" onclick="load()">Back</button>
+      </div>
+      <textarea class="editor" id="prompt-body"></textarea>`;
+    document.getElementById('prompt-body').value = body.body;
+  };
+
+  window.savePrompt = async function (path) {
+    const res = await fetch('/api/v1/studio/prompt', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path, body: document.getElementById('prompt-body').value }),
+    });
+    const body = await res.json();
+    if (!res.ok) return banner(body.error.message, 'err');
+    banner('Prompt saved. It applies to the next run that uses it.', 'ok');
+  };
+
+  async function load(workflow) {
+    const url = '/api/v1/studio' + (workflow ? '?workflow=' + encodeURIComponent(workflow) : '');
+    const res = await fetch(url);
+    const d = await res.json();
+    if (!res.ok) return banner(d.error.message, 'err');
+    DATA = d;
+    pending.clear();
+    document.getElementById('wf-path').textContent = d.workflow_path;
+    renderWorkflows(d); renderFlow(d); renderStages(d); renderRoot(d); renderPrompts(d);
+    const scope = d.selected_workflow ? ` in <strong>${esc(d.selected_workflow)}</strong>` : '';
+    document.getElementById('action-bar').innerHTML = `<div class="bar">
+        <button class="act" id="save" disabled onclick="save()">No changes</button>
+        <button class="act ghost" onclick="load(DATA && DATA.selected_workflow)">Reload from disk</button>
+        <span style="color:var(--dim);font-size:.65rem">
+          Editing${scope}. Structural changes — adding states, rewiring
+          transitions — stay in the file.
+        </span>
+      </div>`;
+  }
+
+  window.save = save;
+  window.load = load;
+  load();
+</script>
+</body>
+</html>
+"""
+
+def create_app(orchestrator: "MultiOrchestrator") -> FastAPI:
     app = FastAPI(title="Stokowski", version="0.1.0")
+
+    log_buffer = LogBuffer(maxlen=500)
+    _handler = LogCaptureHandler(log_buffer)
+    _handler.setLevel(logging.DEBUG)
+    logging.getLogger().addHandler(_handler)
 
     @app.get("/", response_class=HTMLResponse)
     async def dashboard():
@@ -844,6 +1889,105 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
     @app.get("/api/v1/state")
     async def api_state():
         return JSONResponse(orchestrator.get_state_snapshot())
+
+    @app.get("/api/v1/logs/stream")
+    async def api_logs_stream():
+        async def generate():
+            # Drain buffered entries first
+            for entry in log_buffer.all_entries():
+                yield f"data: {json.dumps(entry)}\n\n"
+
+            q = log_buffer.subscribe()
+            try:
+                while True:
+                    try:
+                        entry = await asyncio.wait_for(q.get(), timeout=25)
+                        yield f"data: {json.dumps(entry)}\n\n"
+                    except asyncio.TimeoutError:
+                        yield ": keepalive\n\n"
+            finally:
+                log_buffer.unsubscribe(q)
+
+        return StreamingResponse(generate(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    # ── Studio: read and edit the workflow config ────────────────────────
+    #
+    # The config file stays the source of truth; this is a view onto it that
+    # can write back. Every write is validated before it lands (see
+    # studio.py), so the UI cannot leave the orchestrator unable to start.
+
+    def _studio() -> "Studio":
+        from .studio import Studio
+        return Studio(Path(orchestrator.workflow_path))
+
+    def _studio_error(e: Exception, status: int = 400) -> JSONResponse:
+        return JSONResponse(
+            {"error": {"code": "studio_error", "message": str(e)}},
+            status_code=status,
+        )
+
+    @app.get("/studio", response_class=HTMLResponse)
+    async def studio_page():
+        return HTMLResponse(STUDIO_HTML)
+
+    @app.get("/api/v1/studio")
+    async def api_studio(workflow: str | None = None):
+        from .studio import StudioError
+        try:
+            return JSONResponse(_studio().describe(workflow))
+        except (StudioError, OSError) as e:
+            return _studio_error(e, 500)
+
+    @app.post("/api/v1/studio/default-workflow")
+    async def api_studio_default_workflow(payload: dict):
+        from .studio import StudioError
+        try:
+            return JSONResponse(_studio().set_default_workflow(payload.get("workflow") or ""))
+        except (StudioError, OSError) as e:
+            return _studio_error(e)
+
+    @app.get("/api/v1/studio/raw")
+    async def api_studio_raw():
+        try:
+            return JSONResponse({"text": _studio().raw()})
+        except OSError as e:
+            return _studio_error(e, 500)
+
+    @app.post("/api/v1/studio/raw")
+    async def api_studio_write_raw(payload: dict):
+        from .studio import StudioError
+        try:
+            return JSONResponse(_studio().write_raw(payload.get("text") or ""))
+        except (StudioError, OSError) as e:
+            return _studio_error(e)
+
+    @app.post("/api/v1/studio/apply")
+    async def api_studio_apply(payload: dict):
+        from .studio import StudioError
+        try:
+            return JSONResponse(_studio().apply(
+                payload.get("updates") or [], workflow=payload.get("workflow")
+            ))
+        except (StudioError, OSError) as e:
+            return _studio_error(e)
+
+    @app.get("/api/v1/studio/prompt")
+    async def api_studio_prompt(path: str):
+        from .studio import StudioError
+        try:
+            return JSONResponse({"path": path, "body": _studio().read_prompt(path)})
+        except (StudioError, OSError) as e:
+            return _studio_error(e)
+
+    @app.post("/api/v1/studio/prompt")
+    async def api_studio_write_prompt(payload: dict):
+        from .studio import StudioError
+        try:
+            _studio().write_prompt(payload.get("path") or "", payload.get("body") or "")
+            return JSONResponse({"ok": True})
+        except (StudioError, OSError) as e:
+            return _studio_error(e)
 
     @app.get("/api/v1/{issue_identifier}")
     async def api_issue(issue_identifier: str):
@@ -854,6 +1998,9 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         for r in snap["retrying"]:
             if r["issue_identifier"] == issue_identifier:
                 return JSONResponse(r)
+        for g in snap["gates"]:
+            if g["issue_identifier"] == issue_identifier:
+                return JSONResponse(g)
         return JSONResponse(
             {"error": {"code": "issue_not_found", "message": f"Unknown: {issue_identifier}"}},
             status_code=404,
@@ -861,7 +2008,35 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
 
     @app.post("/api/v1/refresh")
     async def api_refresh():
-        asyncio.create_task(orchestrator._tick())
+        asyncio.create_task(orchestrator.force_tick())
         return JSONResponse({"ok": True})
+
+    @app.post("/api/v1/projects/{project_name}/pause")
+    async def api_project_pause(project_name: str):
+        if not orchestrator.pause(project_name):
+            return JSONResponse(
+                {"error": {"code": "project_not_found", "message": project_name}},
+                status_code=404,
+            )
+        return JSONResponse({"ok": True, "project": project_name, "paused": True})
+
+    @app.post("/api/v1/projects/{project_name}/resume")
+    async def api_project_resume(project_name: str):
+        if not orchestrator.resume(project_name):
+            return JSONResponse(
+                {"error": {"code": "project_not_found", "message": project_name}},
+                status_code=404,
+            )
+        return JSONResponse({"ok": True, "project": project_name, "paused": False})
+
+    @app.post("/api/v1/projects/{project_name}/toggle")
+    async def api_project_toggle(project_name: str):
+        if project_name not in orchestrator.project_names:
+            return JSONResponse(
+                {"error": {"code": "project_not_found", "message": project_name}},
+                status_code=404,
+            )
+        now_paused = orchestrator.toggle(project_name)
+        return JSONResponse({"ok": True, "project": project_name, "paused": now_paused})
 
     return app

@@ -5,80 +5,42 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
-from .config import ClaudeConfig, DockerConfig, HooksConfig
-from .docker_runner import build_docker_run_args, container_name_for, kill_container
+from .config import ClaudeConfig, HooksConfig
+from .events import EventCallback, process_event
 from .models import Issue, RunAttempt
 
 logger = logging.getLogger("stokowski.runner")
 
-# Prevent GC of fire-and-forget asyncio tasks (e.g. container kills on timeout)
-_background_tasks: set[asyncio.Task] = set()
-
-
-def _fire_and_forget(coro) -> None:
-    """Schedule a coroutine without awaiting it. Prevents GC of the task."""
-    task = asyncio.create_task(coro)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-
-
-# Pattern for agent-requested transition directives in result text
-TRANSITION_PATTERN = re.compile(r"<!--\s*transition:(\w[\w-]*)\s*-->")
-
-# Callback type for events from the runner to the orchestrator
-EventCallback = Callable[[str, str, dict[str, Any]], None]
 # Callback for registering/unregistering child PIDs
 PidCallback = Callable[[int, bool], None]  # (pid, is_register)
 
-
-def _prepare_docker_args(
-    docker_cfg: DockerConfig | None,
-    args: list[str],
-    workspace_path: Path,
-    workspace_key: str,
-    issue: Issue,
-    attempt: RunAttempt,
-    env: dict[str, str] | None,
-    docker_image: str = "",
-    needs_plugin_config: bool = False,
-) -> tuple[list[str], str | None, str | None, dict[str, str] | None]:
-    """Wrap CLI args in docker run if Docker is enabled.
-
-    Returns (args, container_name, cwd, env) -- when Docker is enabled,
-    cwd and env are None (handled by docker run args).
-
-    ``needs_plugin_config`` is forwarded to ``build_docker_run_args``. Only
-    ``run_agent_turn`` (Claude Code) should set it to True.
-    """
-    if not (docker_cfg and docker_cfg.enabled):
-        return args, None, str(workspace_path), env
-
-    container_name = container_name_for(
-        issue.identifier, attempt.turn_count + 1, attempt.attempt
-    )
-    attempt.container_name = container_name
-    image = docker_image or docker_cfg.default_image
-    docker_args = build_docker_run_args(
-        docker_cfg=docker_cfg,
-        image=image,
-        command=args,
-        workspace_key=workspace_key,
-        env=env or {},
-        container_name=container_name,
-        needs_plugin_config=needs_plugin_config,
-    )
-    return docker_args, container_name, None, None
-
-
-SCOPE_RESTRICTION_SYSTEM = (
-    "Do NOT use Linear tools to modify, comment on, or transition any Linear issue "
-    "other than {issue_identifier}. You may read other issues for context, but do "
-    "not take any write action on them."
+# Appended to the system prompt on the first turn of every run.
+#
+# The constraint here is *interactivity*, not tooling. Slash commands and
+# skills run fine headlessly (a project command invoked via `claude -p
+# "/review-changes"` returns normally), and for most repos they are the best
+# work available — banning them outright cuts the agent off from the project's
+# own review, doc and codegen tooling. What actually breaks an unattended run
+# is anything that stops to wait for a human.
+HEADLESS_CONTEXT = (
+    "You are running unattended via the Stokowski orchestrator. No human will "
+    "see your output until you finish, and nothing can answer a question "
+    "mid-run.\n"
+    "You MAY use slash commands, skills and subagents — they work normally "
+    "here, and the project's own commands are usually the best way to do a "
+    "job.\n"
+    "You MUST NOT use anything that waits for a human: plan mode, "
+    "brainstorming or other clarification-first workflows, or any prompt that "
+    "asks the user to choose, confirm or approve. Never end a turn waiting for "
+    "an answer.\n"
+    "When you hit an ambiguity, decide it yourself using the best available "
+    "evidence, state the assumption you made in your final summary, and keep "
+    "going. Stop early only for a true blocker you cannot work around, such as "
+    "missing credentials — and say exactly what is missing."
 )
 
 
@@ -87,7 +49,6 @@ def build_claude_args(
     prompt: str,
     workspace_path: Path,
     session_id: str | None = None,
-    issue_identifier: str | None = None,
 ) -> list[str]:
     """Build the claude CLI argument list."""
     args = [claude_cfg.command]
@@ -111,23 +72,20 @@ def build_claude_args(
     if claude_cfg.model:
         args.extend(["--model", claude_cfg.model])
 
+    # Fall back to another model when the primary is overloaded or unavailable.
+    # Worth setting when runs collide with a rate-limit window.
+    if claude_cfg.fallback_model:
+        args.extend(["--fallback-model", claude_cfg.fallback_model])
+
+    # Reasoning effort. Cheap stages (a merge) rarely need more than low;
+    # a grounding check earns high or above.
+    if claude_cfg.effort:
+        args.extend(["--effort", claude_cfg.effort])
+
     # System prompt - always include headless context, plus any user additions
     if not session_id:
-        headless_context = (
-            "You are running in headless/unattended mode via Stokowski orchestrator. "
-            "Do NOT use plan mode or wait for human input. "
-            "You MAY use the Skill tool and Agent tool — when invoking skills, "
-            "operate in pipeline mode and skip all interactive prompts."
-        )
-        # Scope restriction guardrail — prohibit writing to other Linear issues
-        if issue_identifier:
-            guardrail = SCOPE_RESTRICTION_SYSTEM.format(
-                issue_identifier=issue_identifier
-            )
-            headless_context = f"{headless_context}\n{guardrail}"
-
         extra = claude_cfg.append_system_prompt or ""
-        combined = f"{headless_context}\n{extra}".strip()
+        combined = f"{HEADLESS_CONTEXT}\n{extra}".strip()
         args.extend(["--append-system-prompt", combined])
 
     return args
@@ -157,10 +115,6 @@ async def run_codex_turn(
     turn_timeout_ms: int = 3_600_000,
     stall_timeout_ms: int = 300_000,
     env: dict[str, str] | None = None,
-    docker_cfg: DockerConfig | None = None,
-    workspace_key: str = "",
-    docker_image: str = "",
-    log_path: Path | None = None,
 ) -> RunAttempt:
     """Run a single Codex turn. Returns updated RunAttempt.
 
@@ -169,14 +123,10 @@ async def run_codex_turn(
     """
     args = build_codex_args(model, prompt, workspace_path)
 
-    # Docker wrapping
-    args, container_name, sub_cwd, sub_env = _prepare_docker_args(
-        docker_cfg, args, workspace_path, workspace_key, issue, attempt, env, docker_image
-    )
-
     logger.info(
         f"Launching codex issue={issue.identifier} "
-        f"turn={attempt.turn_count + 1}"
+        f"turn={attempt.turn_count + 1}",
+        extra={"linked_to": issue.identifier},
     )
 
     # Run before_run hook
@@ -184,8 +134,7 @@ async def run_codex_turn(
         from .workspace import run_hook
 
         ok = await run_hook(
-            hooks_cfg.before_run, workspace_path, hooks_cfg.timeout_ms, "before_run",
-            docker_cfg=docker_cfg, docker_image=docker_image, workspace_key=workspace_key,
+            hooks_cfg.before_run, workspace_path, hooks_cfg.timeout_ms, "before_run"
         )
         if not ok:
             attempt.status = "failed"
@@ -200,36 +149,25 @@ async def run_codex_turn(
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
-            cwd=sub_cwd,
+            cwd=str(workspace_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
             limit=10 * 1024 * 1024,  # 10MB line buffer (default 64KB)
-            env=sub_env,
+            env=env,
         )
         if on_pid and proc.pid:
             on_pid(proc.pid, True)
-        attempt.pid = proc.pid
     except FileNotFoundError:
         attempt.status = "failed"
-        attempt.error = "Docker command not found" if container_name else "Codex command not found: codex"
-        logger.error(attempt.error)
+        attempt.error = "Codex command not found: codex"
+        logger.error(attempt.error, extra={"linked_to": issue.identifier})
         return attempt
 
     loop = asyncio.get_running_loop()
     last_activity = loop.time()
     stall_timeout_s = stall_timeout_ms / 1000
     turn_timeout_s = turn_timeout_ms / 1000
-
-    # Open log file for raw stdout capture (best-effort).
-    # Opened after subprocess creation to avoid file handle leak on launch failure.
-    log_file = None
-    if log_path:
-        try:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_file = open(log_path, "wb")
-        except OSError as e:
-            logger.warning(f"Failed to open log file {log_path}: {e}")
 
     async def read_stream():
         nonlocal last_activity
@@ -238,13 +176,6 @@ async def run_codex_turn(
             line = await proc.stdout.readline()
             if not line:
                 break
-            # Write raw bytes to log file before any processing
-            if log_file:
-                try:
-                    log_file.write(line)
-                    log_file.flush()
-                except OSError:
-                    pass
             last_activity = loop.time()
             attempt.last_event_at = datetime.now(timezone.utc)
             line_str = line.decode().strip()
@@ -260,11 +191,10 @@ async def run_codex_turn(
             if stall_timeout_s > 0 and elapsed > stall_timeout_s:
                 logger.warning(
                     f"Codex stall detected issue={issue.identifier} "
-                    f"elapsed={elapsed:.0f}s"
+                    f"elapsed={elapsed:.0f}s",
+                    extra={"linked_to": issue.identifier},
                 )
                 proc.kill()
-                if container_name:
-                    _fire_and_forget(kill_container(container_name))
                 attempt.status = "stalled"
                 attempt.error = f"No output for {elapsed:.0f}s"
                 return
@@ -280,10 +210,8 @@ async def run_codex_turn(
         )
 
         if not done:
-            logger.warning(f"Codex turn timeout issue={issue.identifier}")
+            logger.warning(f"Codex turn timeout issue={issue.identifier}", extra={"linked_to": issue.identifier})
             proc.kill()
-            if container_name:
-                _fire_and_forget(kill_container(container_name))
             attempt.status = "timed_out"
             attempt.error = f"Turn exceeded {turn_timeout_s}s"
         else:
@@ -297,18 +225,11 @@ async def run_codex_turn(
                 pass
 
     except Exception as e:
-        logger.error(f"Codex runner error issue={issue.identifier}: {e}")
+        logger.error(f"Codex runner error issue={issue.identifier}: {e}", extra={"linked_to": issue.identifier})
         proc.kill()
         attempt.status = "failed"
         attempt.error = str(e)
         # Still need to run after_run hook and unregister PID below
-    finally:
-        # Close log file on all exit paths
-        if log_file:
-            try:
-                log_file.close()
-            except OSError:
-                pass
 
     # Determine final status from exit code if not already set
     if attempt.status == "streaming":
@@ -330,8 +251,7 @@ async def run_codex_turn(
         from .workspace import run_hook
 
         await run_hook(
-            hooks_cfg.after_run, workspace_path, hooks_cfg.timeout_ms, "after_run",
-            docker_cfg=docker_cfg, docker_image=docker_image, workspace_key=workspace_key,
+            hooks_cfg.after_run, workspace_path, hooks_cfg.timeout_ms, "after_run"
         )
 
     # Unregister PID
@@ -340,7 +260,8 @@ async def run_codex_turn(
 
     logger.info(
         f"Codex turn complete issue={issue.identifier} "
-        f"status={attempt.status}"
+        f"status={attempt.status}",
+        extra={"linked_to": issue.identifier},
     )
 
     return attempt
@@ -356,27 +277,17 @@ async def run_agent_turn(
     on_event: EventCallback | None = None,
     on_pid: PidCallback | None = None,
     env: dict[str, str] | None = None,
-    docker_cfg: DockerConfig | None = None,
-    workspace_key: str = "",
-    docker_image: str = "",
-    log_path: Path | None = None,
 ) -> RunAttempt:
     """Run a single Claude Code turn. Returns updated RunAttempt."""
     args = build_claude_args(
-        claude_cfg, prompt, workspace_path, attempt.session_id,
-        issue_identifier=issue.identifier,
-    )
-
-    # Docker wrapping — Claude Code needs plugin config rewriting
-    args, container_name, sub_cwd, sub_env = _prepare_docker_args(
-        docker_cfg, args, workspace_path, workspace_key, issue, attempt, env, docker_image,
-        needs_plugin_config=True,
+        claude_cfg, prompt, workspace_path, attempt.session_id
     )
 
     logger.info(
         f"Launching claude issue={issue.identifier} "
         f"session={attempt.session_id or 'new'} "
-        f"turn={attempt.turn_count + 1}"
+        f"turn={attempt.turn_count + 1}",
+        extra={"linked_to": issue.identifier},
     )
 
     # Run before_run hook
@@ -384,8 +295,7 @@ async def run_agent_turn(
         from .workspace import run_hook
 
         ok = await run_hook(
-            hooks_cfg.before_run, workspace_path, hooks_cfg.timeout_ms, "before_run",
-            docker_cfg=docker_cfg, docker_image=docker_image, workspace_key=workspace_key,
+            hooks_cfg.before_run, workspace_path, hooks_cfg.timeout_ms, "before_run"
         )
         if not ok:
             attempt.status = "failed"
@@ -400,20 +310,19 @@ async def run_agent_turn(
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
-            cwd=sub_cwd,
+            cwd=str(workspace_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
             limit=10 * 1024 * 1024,  # 10MB line buffer (default 64KB)
-            env=sub_env,
+            env=env,
         )
         if on_pid and proc.pid:
             on_pid(proc.pid, True)
-        attempt.pid = proc.pid
     except FileNotFoundError:
         attempt.status = "failed"
-        attempt.error = "Docker command not found" if container_name else f"Claude command not found: {claude_cfg.command}"
-        logger.error(attempt.error)
+        attempt.error = f"Claude command not found: {claude_cfg.command}"
+        logger.error(attempt.error, extra={"linked_to": issue.identifier})
         return attempt
 
     # Stream stdout (NDJSON events)
@@ -422,29 +331,12 @@ async def run_agent_turn(
     stall_timeout_s = claude_cfg.stall_timeout_ms / 1000
     turn_timeout_s = claude_cfg.turn_timeout_ms / 1000
 
-    # Open log file for raw stdout capture (best-effort).
-    # Opened after subprocess creation to avoid file handle leak on launch failure.
-    log_file = None
-    if log_path:
-        try:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_file = open(log_path, "wb")
-        except OSError as e:
-            logger.warning(f"Failed to open log file {log_path}: {e}")
-
     async def read_stream():
         nonlocal last_activity
         while True:
             line = await proc.stdout.readline()
             if not line:
                 break
-            # Write raw bytes to log file before any processing
-            if log_file:
-                try:
-                    log_file.write(line)
-                    log_file.flush()
-                except OSError:
-                    pass
             last_activity = loop.time()
             attempt.last_event_at = datetime.now(timezone.utc)
 
@@ -457,7 +349,7 @@ async def run_agent_turn(
             except json.JSONDecodeError:
                 continue
 
-            _process_event(event, attempt, on_event, issue.identifier)
+            process_event(event, attempt, on_event, issue.identifier)
 
     async def stall_monitor():
         while proc.returncode is None:
@@ -466,11 +358,10 @@ async def run_agent_turn(
             if stall_timeout_s > 0 and elapsed > stall_timeout_s:
                 logger.warning(
                     f"Stall detected issue={issue.identifier} "
-                    f"elapsed={elapsed:.0f}s"
+                    f"elapsed={elapsed:.0f}s",
+                    extra={"linked_to": issue.identifier},
                 )
                 proc.kill()
-                if container_name:
-                    _fire_and_forget(kill_container(container_name))
                 attempt.status = "stalled"
                 attempt.error = f"No output for {elapsed:.0f}s"
                 return
@@ -488,10 +379,8 @@ async def run_agent_turn(
 
         if not done:
             # Turn timeout
-            logger.warning(f"Turn timeout issue={issue.identifier}")
+            logger.warning(f"Turn timeout issue={issue.identifier}", extra={"linked_to": issue.identifier})
             proc.kill()
-            if container_name:
-                _fire_and_forget(kill_container(container_name))
             attempt.status = "timed_out"
             attempt.error = f"Turn exceeded {turn_timeout_s}s"
         else:
@@ -506,18 +395,11 @@ async def run_agent_turn(
                 pass
 
     except Exception as e:
-        logger.error(f"Runner error issue={issue.identifier}: {e}")
+        logger.error(f"Runner error issue={issue.identifier}: {e}", extra={"linked_to": issue.identifier})
         proc.kill()
         attempt.status = "failed"
         attempt.error = str(e)
-        # Still need to run after_run hook and unregister PID below
-    finally:
-        # Close log file on all exit paths (normal, stall, timeout, CancelledError)
-        if log_file:
-            try:
-                log_file.close()
-            except OSError:
-                pass
+        return attempt
 
     # Determine final status from exit code if not already set by stall/timeout
     if attempt.status == "streaming":
@@ -539,8 +421,7 @@ async def run_agent_turn(
         from .workspace import run_hook
 
         await run_hook(
-            hooks_cfg.after_run, workspace_path, hooks_cfg.timeout_ms, "after_run",
-            docker_cfg=docker_cfg, docker_image=docker_image, workspace_key=workspace_key,
+            hooks_cfg.after_run, workspace_path, hooks_cfg.timeout_ms, "after_run"
         )
 
     # Unregister PID
@@ -550,70 +431,13 @@ async def run_agent_turn(
     logger.info(
         f"Turn complete issue={issue.identifier} "
         f"status={attempt.status} "
-        f"tokens={attempt.total_tokens}"
+        f"tokens={attempt.total_tokens:,} "
+        f"cost=${attempt.cost_usd:.2f} "
+        f"tools={attempt.tool_call_count}",
+        extra={"linked_to": issue.identifier},
     )
 
     return attempt
-
-
-def _process_event(
-    event: dict,
-    attempt: RunAttempt,
-    on_event: EventCallback | None,
-    identifier: str,
-):
-    """Process a single NDJSON event from Claude Code stream-json output."""
-    event_type = event.get("type", "")
-    attempt.last_event = event_type
-
-    # Extract session_id from result events
-    if event_type == "result":
-        if "session_id" in event:
-            attempt.session_id = event["session_id"]
-        # Extract token usage
-        usage = event.get("usage", {})
-        if usage:
-            attempt.input_tokens = usage.get("input_tokens", attempt.input_tokens)
-            attempt.output_tokens = usage.get("output_tokens", attempt.output_tokens)
-            attempt.total_tokens = (
-                usage.get("total_tokens", 0)
-                or attempt.input_tokens + attempt.output_tokens
-            )
-        # Extract result text for last_message
-        result_text = event.get("result", "")
-        if isinstance(result_text, str) and result_text:
-            attempt.last_message = result_text[:200]
-            attempt.result_text = result_text[:10_000]  # full text for evaluator parsing
-
-            # Parse agent-requested transition directive (use LAST match
-            # to avoid capturing quoted directives from earlier output)
-            matches = TRANSITION_PATTERN.findall(result_text)
-            if matches:
-                attempt.requested_transition = matches[-1]
-                logger.info(
-                    f"Transition directive parsed issue={identifier} "
-                    f"transition={matches[-1]}"
-                )
-
-    elif event_type == "assistant":
-        # Assistant message content
-        msg = event.get("message", {})
-        content = msg.get("content", "")
-        if isinstance(content, str) and content:
-            attempt.last_message = content[:200]
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    attempt.last_message = block.get("text", "")[:200]
-                    break
-
-    elif event_type == "tool_use":
-        tool_name = event.get("name", event.get("tool", ""))
-        attempt.last_message = f"Using tool: {tool_name}"
-
-    # Forward to orchestrator callback
-    if on_event:
-        on_event(identifier, event_type, event)
 
 
 async def run_turn(
@@ -627,10 +451,6 @@ async def run_turn(
     on_event: EventCallback | None = None,
     on_pid: PidCallback | None = None,
     env: dict[str, str] | None = None,
-    docker_cfg: DockerConfig | None = None,
-    workspace_key: str = "",
-    docker_image: str = "",
-    log_path: Path | None = None,
 ) -> RunAttempt:
     """Route to the correct runner based on runner_type."""
     if runner_type == "codex":
@@ -645,10 +465,6 @@ async def run_turn(
             turn_timeout_ms=claude_cfg.turn_timeout_ms,
             stall_timeout_ms=claude_cfg.stall_timeout_ms,
             env=env,
-            docker_cfg=docker_cfg,
-            workspace_key=workspace_key,
-            docker_image=docker_image,
-            log_path=log_path,
         )
     elif runner_type == "claude":
         return await run_agent_turn(
@@ -661,10 +477,6 @@ async def run_turn(
             on_event=on_event,
             on_pid=on_pid,
             env=env,
-            docker_cfg=docker_cfg,
-            workspace_key=workspace_key,
-            docker_image=docker_image,
-            log_path=log_path,
         )
     else:
         raise ValueError(f"Unknown runner type: {runner_type}")

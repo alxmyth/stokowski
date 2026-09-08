@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import glob as _glob
 import logging
 import os
 import select
@@ -14,16 +13,11 @@ import termios
 import threading
 import tty
 from pathlib import Path
-from typing import Sequence
 
 
-def _load_dotenv(directory: Path | None = None):
-    """Load .env file from a directory if it exists.
-
-    Args:
-        directory: Directory to search for .env. Defaults to cwd.
-    """
-    env_file = (directory / ".env") if directory else Path(".env")
+def _load_dotenv():
+    """Load .env file from cwd if it exists."""
+    env_file = Path(".env")
     if not env_file.exists():
         return
     for line in env_file.read_text().splitlines():
@@ -43,9 +37,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .orchestrator import Orchestrator
+from .orchestrator import MultiOrchestrator
 
-logger = logging.getLogger(__name__)
 console = Console()
 
 # Module-level update message, set once at startup
@@ -101,61 +94,128 @@ HELP_TEXT = """
 
   [bold yellow]q[/bold yellow]   Quit — graceful shutdown, kills all agents
   [bold yellow]s[/bold yellow]   Status — show running agents and token usage
+  [bold yellow]p[/bold yellow]   Pause/resume a project (toggle dispatch for one project)
   [bold yellow]h[/bold yellow]   Help — show this message
   [bold yellow]r[/bold yellow]   Refresh — force an immediate Linear poll
 """
 
 
-def print_status(orch: Orchestrator):
+def _fmt_elapsed(iso: str | None) -> str:
+    if not iso:
+        return "—"
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(iso)
+        s = int((datetime.now(timezone.utc) - dt).total_seconds())
+        if s < 5:   return "just now"
+        if s < 60:  return f"{s}s ago"
+        if s < 3600: return f"{s // 60}m ago"
+        return f"{s // 3600}h ago"
+    except Exception:
+        return "—"
+
+
+def print_status(orch: MultiOrchestrator):
     snap = orch.get_state_snapshot()
     running  = snap["counts"]["running"]
     retrying = snap["counts"]["retrying"]
+    queued   = snap["counts"]["queued"]
     total_tok = snap["totals"]["total_tokens"]
     secs = snap["totals"]["seconds_running"]
 
+    # Per-project summary
+    proj_table = Table(box=None, padding=(0, 2), show_header=True, header_style="dim")
+    proj_table.add_column("Project", style="cyan")
+    proj_table.add_column("Pause", justify="center", width=8)
+    proj_table.add_column("Run", justify="right", width=5)
+    proj_table.add_column("Gates", justify="right", width=6)
+    proj_table.add_column("Queue", justify="right", width=6)
+    proj_table.add_column("Tokens", justify="right", width=10)
+    for p in snap["projects"]:
+        paused = "[red]●[/red]" if p["paused"] else "[green]○[/green]"
+        proj_table.add_row(
+            p["name"],
+            paused,
+            str(p["counts"]["running"]),
+            str(p["counts"]["gates"]),
+            str(p["counts"].get("queued", 0)),
+            f"{p['totals']['total_tokens']:,}",
+        )
+
+    # Per-issue table
     table = Table(box=None, padding=(0, 2), show_header=True, header_style="dim")
+    table.add_column("Project", style="cyan")
     table.add_column("Issue",  style="cyan",  width=12)
     table.add_column("Status", style="green", width=12)
     table.add_column("Turns",  justify="right", width=6)
     table.add_column("Tokens", justify="right", width=10)
-    table.add_column("Last activity", style="dim")
+    table.add_column("Last activity", style="dim", width=10)
+    table.add_column("Message", style="dim")
 
     for r in snap["running"]:
         table.add_row(
+            r.get("project_name", "—"),
             r["issue_identifier"],
             r["status"],
             str(r["turn_count"]),
             f"{r['tokens']['total_tokens']:,}",
+            _fmt_elapsed(r.get("last_event_at")),
             r["last_message"][:60] if r["last_message"] else "—",
         )
     for r in snap["retrying"]:
         table.add_row(
+            r.get("project_name", "—"),
             r["issue_identifier"],
             f"[blue]retry #{r['attempt']}[/blue]",
-            "—", "—",
+            "—", "—", "—",
             r["error"] or "waiting",
         )
     if not snap["running"] and not snap["retrying"]:
-        table.add_row("—", "idle", "—", "—", "no active agents")
+        table.add_row("—", "—", "idle", "—", "—", "—", "no active agents")
 
     console.print()
+    console.print(Panel(
+        proj_table,
+        title=f"[bold]Projects[/bold]  "
+              f"[dim]global_cap={snap['pool']['global_cap']}  "
+              f"in_use={snap['pool']['global_running']}[/dim]",
+        border_style="yellow",
+    ))
     console.print(Panel(
         table,
         title=f"[bold]Stokowski Status[/bold]  "
               f"[dim]running={running}  retrying={retrying}  "
+              f"queued={queued}  "
               f"tokens={total_tok:,}  uptime={secs:.0f}s[/dim]",
         border_style="yellow",
     ))
     console.print()
 
 
+def print_pause_menu(orch: MultiOrchestrator):
+    """Show numbered list of projects with current pause state."""
+    names = orch.project_names
+    if not names:
+        console.print("[dim]No projects loaded.[/dim]")
+        return
+    console.print()
+    console.print("[bold]Toggle pause for project[/bold] [dim](press number, any other key cancels)[/dim]")
+    for i, name in enumerate(names, start=1):
+        marker = "[red]paused[/red]" if orch.is_paused(name) else "[green]running[/green]"
+        console.print(f"  [bold yellow]{i}[/bold yellow]  {name}  {marker}")
+    console.print()
+
+
 class KeyboardHandler:
     """Reads single keypresses from stdin in a background thread."""
 
-    def __init__(self, orch: Orchestrator, loop: asyncio.AbstractEventLoop):
+    def __init__(self, orch: MultiOrchestrator, loop: asyncio.AbstractEventLoop):
         self._orch = orch
         self._loop = loop
         self._stop = threading.Event()
+        # When non-None, the next keypress is consumed as a pause-menu choice
+        # rather than a top-level command.
+        self._pause_menu_active: bool = False
 
     def start(self):
         t = threading.Thread(target=self._run, daemon=True)
@@ -163,7 +223,6 @@ class KeyboardHandler:
 
     def _run(self):
         if not sys.stdin.isatty():
-            logger.info("Non-interactive mode: keyboard handler disabled, use web dashboard")
             return
 
         fd = sys.stdin.fileno()
@@ -181,21 +240,42 @@ class KeyboardHandler:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
     def _handle(self, ch: str):
+        if self._pause_menu_active:
+            self._pause_menu_active = False
+            self._handle_pause_choice(ch)
+            return
+
         if ch == "q":
             console.print("\n[yellow]Shutting down...[/yellow]")
             asyncio.run_coroutine_threadsafe(self._orch.stop(), self._loop)
             self._stop.set()
         elif ch == "s":
             print_status(self._orch)
+        elif ch == "p":
+            print_pause_menu(self._orch)
+            self._pause_menu_active = True
         elif ch == "h":
             console.print(HELP_TEXT)
         elif ch == "r":
-            console.print("[dim]Forcing poll...[/dim]")
-            if hasattr(self._orch, '_stop_event'):
-                # Wake the poll loop early
-                self._loop.call_soon_threadsafe(
-                    lambda: self._loop.create_task(self._orch._tick())
-                )
+            console.print("[dim]Forcing poll on all projects...[/dim]")
+            self._loop.call_soon_threadsafe(
+                lambda: self._loop.create_task(self._orch.force_tick())
+            )
+
+    def _handle_pause_choice(self, ch: str):
+        names = self._orch.project_names
+        try:
+            idx = int(ch) - 1
+        except ValueError:
+            console.print("[dim]Cancelled.[/dim]")
+            return
+        if idx < 0 or idx >= len(names):
+            console.print("[dim]Cancelled (out of range).[/dim]")
+            return
+        name = names[idx]
+        now_paused = self._orch.toggle(name)
+        state = "[red]paused[/red]" if now_paused else "[green]resumed[/green]"
+        console.print(f"Project [cyan]{name}[/cyan] is now {state}")
 
     def stop(self):
         self._stop.set()
@@ -203,12 +283,13 @@ class KeyboardHandler:
 
 # ── Main orchestrator runner ─────────────────────────────────────────────────
 
-def _make_footer(orch: Orchestrator) -> Text:
+def _make_footer(orch: MultiOrchestrator) -> Text:
     """Build the persistent footer line."""
     try:
         snap = orch.get_state_snapshot()
         running = snap["counts"]["running"]
         retrying = snap["counts"]["retrying"]
+        queued = snap["counts"].get("queued", 0)
         tokens = snap["totals"]["total_tokens"]
         if running:
             status = f"[green]●[/green] {running} running"
@@ -216,7 +297,20 @@ def _make_footer(orch: Orchestrator) -> Text:
             status = f"[blue]●[/blue] {retrying} retrying"
         else:
             status = "[dim]● idle[/dim]"
-        meta = f"  [dim]tokens={tokens:,}[/dim]" if tokens else ""
+        # Surface paused projects in the footer so it's obvious at a glance.
+        paused = [p["name"] for p in snap.get("projects", []) if p.get("paused")]
+        paused_meta = f"  [red]⏸ {','.join(paused)}[/red]" if paused else ""
+        queue_meta = f"  [dim]queued={queued}[/dim]" if queued else ""
+        token_meta = f"  [dim]tokens={tokens:,}[/dim]" if tokens else ""
+        cost = snap["totals"].get("cost_usd", 0)
+        cost_meta = f"  [dim]${cost:,.2f}[/dim]" if cost else ""
+        # A throttled or exhausted window is the single most useful thing to
+        # know at a glance, so it gets colour rather than dim text.
+        rl = snap.get("rate_limit") or {}
+        rl_meta = ""
+        if rl.get("status") and rl["status"] != "allowed":
+            rl_meta = f"  [red]⚠ {rl.get('type', 'rate')} {rl['status']}[/red]"
+        meta = paused_meta + queue_meta + token_meta + cost_meta + rl_meta
     except Exception:
         status = "[dim]● idle[/dim]"
         meta = ""
@@ -226,154 +320,58 @@ def _make_footer(orch: Orchestrator) -> Text:
     return Text.from_markup(
         f"  [bold yellow]q[/bold yellow] quit  "
         f"[bold yellow]s[/bold yellow] status  "
+        f"[bold yellow]p[/bold yellow] pause  "
         f"[bold yellow]r[/bold yellow] refresh  "
         f"[bold yellow]h[/bold yellow] help"
         f"     {status}{meta}{update}"
     )
 
 
-_GLOB_META_CHARS = frozenset("*?[")
-
-# Env var that lets operators specify the workflow path (file, directory, or
-# glob — same semantics as a single positional CLI arg) without threading it
-# through a wrapper script. CLI args take precedence when both are set.
-_WORKFLOW_PATH_ENV = "STOKOWSKI_WORKFLOW_PATH"
-
-
-def resolve_workflow_paths(args: Sequence[str]) -> list[Path]:
-    """Resolve CLI workflow arguments to a sorted, deduplicated list of Paths.
-
-    Semantics (see plan Unit 1):
-    - 0 args AND ``STOKOWSKI_WORKFLOW_PATH`` set: treat the env value as the
-      single positional arg (so a file, directory, or glob all work).
-    - 0 args, env unset: auto-detect ``./workflow.yaml`` / ``./workflow.yml`` /
-      ``./WORKFLOW.md`` (legacy one-entry behavior).
-    - 1 arg that is an existing directory: enumerate ``*.yaml`` + ``*.yml`` inside,
-      sort case-insensitively.
-    - 1 arg containing glob metacharacters: expand via ``glob.glob``.
-    - 1 arg that is an existing file: one-entry list (byte-for-byte legacy behavior).
-    - N>=2 args: treat all as explicit list (caller may have shell-expanded already).
-
-    Precedence: CLI args > ``STOKOWSKI_WORKFLOW_PATH`` env var > auto-detect.
-
-    All resolved paths are deduplicated by resolved absolute path and sorted
-    case-insensitively, so the first-loaded ("primary") file is deterministic
-    across platforms with mixed case conventions.
-    """
-    paths: list[Path]
-
-    # Env fallback: if the operator didn't pass a CLI arg, use the env var.
-    # Works for all three shapes (file / directory / glob) because we route
-    # it through the single-arg branch below.
-    if len(args) == 0:
-        env_value = os.environ.get(_WORKFLOW_PATH_ENV, "").strip()
-        if env_value:
-            args = [env_value]
-
-    if len(args) == 0:
-        if Path("workflow.yaml").exists():
-            paths = [Path("./workflow.yaml")]
-        elif Path("workflow.yml").exists():
-            paths = [Path("./workflow.yml")]
-        elif Path("WORKFLOW.md").exists():
-            paths = [Path("./WORKFLOW.md")]
-        else:
-            raise FileNotFoundError(
-                "No workflow file found. Create workflow.yaml / workflow.yml / "
-                "WORKFLOW.md, set STOKOWSKI_WORKFLOW_PATH, or specify a path "
-                "explicitly."
-            )
-    elif len(args) == 1:
-        only = args[0]
-        p = Path(only)
-        if p.is_dir():
-            collected = sorted(p.iterdir())
-            paths = [
-                q for q in collected
-                if q.is_file() and q.suffix.lower() in (".yaml", ".yml")
-            ]
-            if not paths:
-                raise FileNotFoundError(
-                    f"Directory {p} contains no .yaml or .yml files"
-                )
-        elif any(ch in only for ch in _GLOB_META_CHARS):
-            matches = _glob.glob(only)
-            if not matches:
-                raise FileNotFoundError(
-                    f"Glob pattern {only!r} matched no files"
-                )
-            paths = [Path(m) for m in matches]
-        elif p.is_file():
-            paths = [p]
-        else:
-            raise FileNotFoundError(f"Workflow path not found: {p}")
-    else:
-        paths = [Path(a) for a in args]
-
-    # Dedup by resolved absolute path; keep first occurrence for deterministic
-    # ordering before the final sort.
-    seen: set[str] = set()
-    unique: list[Path] = []
-    for p in paths:
-        try:
-            key = str(p.resolve())
-        except OSError:
-            key = str(p.absolute())
-        if key not in seen:
-            seen.add(key)
-            unique.append(p)
-
-    # Case-insensitive sort — ensures platform-stable primary-file selection.
-    unique.sort(key=lambda q: str(q).casefold())
-    return unique
-
-
-async def run_orchestrator(workflow_paths: Sequence[Path] | Path | str, port: int | None = None):
-    orch = Orchestrator(workflow_paths)
+async def run_orchestrator(workflow_path: str, host_ip: str | None = None, port: int | None = None):
+    orch = MultiOrchestrator(workflow_path)
     loop = asyncio.get_running_loop()
 
     # Start keyboard handler
     kb = KeyboardHandler(orch, loop)
     kb.start()
 
+    # Resolve effective port: CLI flag overrides config; config alone also starts server
+    config_port: int | None = orch.config.server.port if orch.config else None
+    effective_port = port if port is not None else config_port
+    # Resolve host: explicit CLI flag > config server.host > 127.0.0.1
+    config_host: str | None = orch.config.server.host if orch.config else None
+    effective_host_ip = host_ip or config_host or "127.0.0.1"
+
     # Optional web server
     _uvicorn_server = None
     _uvicorn_task = None
-    if port is not None:
+    if effective_port is not None:
         try:
             from .web import create_app
             import uvicorn
 
             app = create_app(orch)
-            # Bind 0.0.0.0 in containers so the port forward works on macOS Docker
-            bind_host = "0.0.0.0" if not sys.stdin.isatty() else "127.0.0.1"
             server_config = uvicorn.Config(
-                app, host=bind_host, port=port, log_level="warning",
+                app, host=effective_host_ip, port=effective_port, log_level="warning",
             )
             _uvicorn_server = uvicorn.Server(server_config)
             _uvicorn_server.install_signal_handlers = lambda: None
             _uvicorn_task = asyncio.create_task(_uvicorn_server.serve())
-            console.print(f"[green]Web dashboard →[/green] http://127.0.0.1:{port}")
+            logging.getLogger("stokowski").info(
+                f"Web dashboard started on http://{effective_host_ip}:{effective_port} "
+                f"(source={'--port' if port is not None else 'config'})"
+            )
+            console.print(f"[green]Web dashboard →[/green] http://{effective_host_ip}:{effective_port}")
         except ImportError:
             console.print(
                 "[yellow]Install web extras for dashboard: pip install stokowski[web][/yellow]"
             )
 
-    if not sys.stdin.isatty() and not port:
-        logger.warning(
-            "Running non-interactively without web dashboard — consider using --port"
-        )
-
     await check_for_updates()
 
-    _paths_display = (
-        str(workflow_paths)
-        if isinstance(workflow_paths, (str, Path))
-        else ", ".join(str(p) for p in workflow_paths)
-    )
     console.print(Panel(
         f"[bold]Stokowski[/bold]  [dim]Claude Code Orchestrator[/dim]\n"
-        f"[dim]workflow:[/dim] {_paths_display}",
+        f"[dim]workflow:[/dim] {workflow_path}",
         border_style="dim",
     ))
 
@@ -413,17 +411,18 @@ def cli():
     )
     parser.add_argument(
         "workflow",
-        nargs="*",
-        default=[],
-        help=(
-            "Paths to workflow file(s). Accepts a single file, a directory "
-            "containing workflow files, a glob, or multiple paths. "
-            "Auto-detected if not specified."
-        ),
+        nargs="?",
+        default=None,
+        help="Path to workflow.yaml or WORKFLOW.md (auto-detected if not specified)",
+    )
+    parser.add_argument(
+        "--host",
+        default=None,
+        help="Web dashboard host IP (overrides server.host in config; default 127.0.0.1)",
     )
     parser.add_argument(
         "--port", type=int, default=None,
-        help="Enable web dashboard on this port",
+        help="Web dashboard port (overrides server.port in config; server would not start unless port is configured in either way)",
     )
     parser.add_argument(
         "--verbose", "-v", action="store_true",
@@ -433,45 +432,127 @@ def cli():
         "--dry-run", action="store_true",
         help="Validate config and show candidates without dispatching",
     )
+    parser.add_argument(
+        "--stats", action="store_true",
+        help="Show approval rates and cost from the run ledger, then exit",
+    )
 
     args = parser.parse_args()
 
-    # Load .env BEFORE workflow-path resolution so STOKOWSKI_WORKFLOW_PATH
-    # from .env is visible to resolve_workflow_paths.
+    if args.workflow is None:
+        if Path("workflow.yaml").exists():
+            args.workflow = "./workflow.yaml"
+        elif Path("workflow.yml").exists():
+            args.workflow = "./workflow.yml"
+        elif Path("WORKFLOW.md").exists():
+            args.workflow = "./WORKFLOW.md"
+        else:
+            console.print(
+                "[red]No workflow file found. Create workflow.yaml or WORKFLOW.md, "
+                "or specify a path: stokowski <path>[/red]"
+            )
+            sys.exit(1)
+
     _load_dotenv()
-
-    try:
-        workflow_paths = resolve_workflow_paths(args.workflow)
-    except FileNotFoundError as e:
-        console.print(f"[red]{e}[/red]")
-        sys.exit(1)
-
-    # Load .env from each workflow file's directory (later wins via direct
-    # assignment). Enables `stokowski /path/to/workflow.yaml` to pick up a
-    # project-local .env regardless of cwd.
-    cwd = Path.cwd().resolve()
-    seen_dirs: set[Path] = set()
-    for wpath in workflow_paths:
-        wdir = wpath.resolve().parent
-        if wdir != cwd and wdir not in seen_dirs:
-            _load_dotenv(wdir)
-            seen_dirs.add(wdir)
-
     setup_logging(args.verbose)
 
-    if args.dry_run:
-        asyncio.run(dry_run(workflow_paths))
+    if args.stats:
+        show_stats(args.workflow)
+    elif args.dry_run:
+        asyncio.run(dry_run(args.workflow))
     else:
         try:
-            asyncio.run(run_orchestrator(workflow_paths, args.port))
+            asyncio.run(run_orchestrator(args.workflow, args.host, args.port))
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted — killing all agents...[/yellow]")
             _force_kill_children()
             console.print("[green]Done.[/green]")
 
 
+def show_stats(workflow_path: str) -> None:
+    """Print what the ledger knows about how runs have been judged.
+
+    The question this answers: does the agent's own confidence mean anything,
+    and which kinds of work land without a fight? Those two numbers decide how
+    much review a class of ticket actually needs.
+    """
+    from .ledger import Ledger
+
+    ledger = Ledger.for_workflow(Path(workflow_path))
+    if not ledger.path.is_file():
+        console.print(f"[yellow]No ledger yet at {ledger.path}[/yellow]")
+        console.print("[dim]It fills up as runs complete and gates are decided.[/dim]")
+        return
+
+    s = ledger.summarise()
+
+    console.print()
+    console.print(f"[bold]Run ledger[/bold] [dim]{ledger.path}[/dim]")
+    console.print(
+        f"  {s['stages']} stages across {s['issues']} issues · "
+        f"{s['gate_decisions']} human decisions"
+    )
+    cost_line = f"  ${s['total_cost_usd']:,.2f} · {s['total_tokens']:,} tokens"
+    if s["cost_per_stage"]:
+        cost_line += f" · ${s['cost_per_stage']:.2f}/stage"
+    console.print(cost_line)
+
+    # Quality-of-reporting signals. Both should trend toward zero; if they do
+    # not, the prompts are being ignored and the reports are worth less than
+    # they look.
+    warnings = []
+    if s["stages_without_report"]:
+        warnings.append(f"{s['stages_without_report']} stages produced no report")
+    if s["unsourced_claims"]:
+        warnings.append(f"{s['unsourced_claims']} unsourced claims")
+    if warnings:
+        console.print(f"  [red]{' · '.join(warnings)}[/red]")
+
+    if not s["gate_decisions"]:
+        console.print()
+        console.print("[dim]No gate decisions yet — approval rates appear once "
+                      "work has been approved or sent back.[/dim]")
+        return
+
+    for title, key, first_col in (
+        ("Approval rate by workflow", "by_workflow", "Workflow"),
+        ("Approval rate by type", "by_classification", "Classification"),
+        ("Approval rate by the agent's stated confidence", "by_confidence", "Confidence"),
+    ):
+        rows = s[key]
+        if not rows:
+            continue
+        table = Table(title=title, title_justify="left", header_style="bold")
+        table.add_column(first_col)
+        table.add_column("Approved", justify="right")
+        table.add_column("Rework", justify="right")
+        table.add_column("Rate", justify="right")
+        for name, bucket in rows.items():
+            rate = bucket["approval_rate"]
+            # Below ~10 decisions a rate is noise, so say so rather than
+            # letting a 1-for-1 read as 100%.
+            if rate is None:
+                shown = "—"
+            elif bucket["total"] < 10:
+                shown = f"[dim]{rate:.0%} (n={bucket['total']})[/dim]"
+            else:
+                colour = "green" if rate >= 0.8 else "yellow" if rate >= 0.5 else "red"
+                shown = f"[{colour}]{rate:.0%}[/{colour}]"
+            table.add_row(name, str(bucket["approved"]), str(bucket["rework"]), shown)
+        console.print()
+        console.print(table)
+
+    if s["terminal"]:
+        console.print()
+        console.print("  Finished: " + " · ".join(
+            f"{k} {v}" for k, v in sorted(s["terminal"].items())
+        ))
+    console.print()
+
+
+
 def _force_kill_children():
-    """Kill any lingering claude -p processes and Docker containers."""
+    """Kill any lingering claude -p processes."""
     import subprocess
     try:
         result = subprocess.run(
@@ -491,127 +572,97 @@ def _force_kill_children():
     except Exception:
         pass
 
-    # Kill Docker containers
-    try:
-        result = subprocess.run(
-            ["docker", "ps", "-q", "--filter", "label=stokowski=true"],
-            capture_output=True, text=True,
-        )
-        for cid in result.stdout.strip().split("\n"):
-            if cid.strip():
-                subprocess.run(
-                    ["docker", "kill", cid.strip()], capture_output=True
-                )
-    except Exception:
-        pass
-
 
 # ── Dry run ───────────────────────────────────────────────────────────────────
 
-async def dry_run(workflow_paths: Sequence[Path] | Path | str):
+async def dry_run(workflow_path: str):
     from .config import parse_workflow_file, validate_config
-    from .linear import LinearClient
-
-    if isinstance(workflow_paths, (str, Path)):
-        paths = [Path(workflow_paths)]
-    else:
-        paths = list(workflow_paths)
 
     console.print("[bold]Dry run mode[/bold]\n")
 
-    any_errors = False
-    seen_slugs: dict[str, Path] = {}
+    try:
+        workflow = parse_workflow_file(workflow_path)
+    except Exception as e:
+        console.print(f"[red]Failed to load workflow: {e}[/red]")
+        sys.exit(1)
 
-    for idx, path in enumerate(paths):
-        console.print(f"[bold cyan]── Project file {idx + 1}/{len(paths)}: {path}[/bold cyan]")
-        try:
-            workflow = parse_workflow_file(str(path))
-        except Exception as e:
-            console.print(f"[red]Failed to load workflow: {e}[/red]\n")
-            any_errors = True
-            continue
+    errors = validate_config(workflow.config)
+    if errors:
+        for e in errors:
+            console.print(f"[red]Config error: {e}[/red]")
+        sys.exit(1)
 
-        errors = validate_config(workflow.config)
-        if errors:
-            for e in errors:
-                console.print(f"[red]  Config error: {e}[/red]")
-            any_errors = True
-            console.print()
-            continue
+    cfg = workflow.config
+    server_port = cfg.server.port
+    server_host = cfg.server.host or "127.0.0.1"
+    server_info = f"http://{server_host}:{server_port}" if server_port else "disabled"
+    console.print("[green]Config valid[/green]")
+    console.print(f"  Global max_concurrent_agents: {cfg.agent.max_concurrent_agents}")
+    console.print(f"  Polling interval: {cfg.polling.interval_ms}ms")
+    console.print(f"  Web dashboard: {server_info}")
+    console.print(f"  Projects: {len(cfg.projects)}")
+    console.print()
 
-        cfg = workflow.config
+    from .linear import LinearClient
 
-        # Cross-file duplicate slug check.
-        slug = cfg.tracker.project_slug
-        if slug in seen_slugs:
+    for project in cfg.projects:
+        per_project_cap = (
+            project.max_concurrent
+            if project.max_concurrent is not None
+            else cfg.agent.max_concurrent_per_project.get(project.name)
+        )
+        cap_str = f", per-project cap: {per_project_cap}" if per_project_cap else ""
+        console.print(f"[bold cyan]Project '{project.name}'[/bold cyan]")
+        console.print(f"  Tracker: {project.tracker.kind}  slug={project.tracker.project_slug}{cap_str}")
+        console.print(f"  Claude model: {project.claude.model or 'default'}  permission={project.claude.permission_mode}")
+        console.print(f"  Workspace root: {project.workspace.resolved_root()}")
+        if project.paused:
+            console.print(f"  [red]Paused at startup[/red]")
+
+        if project.states:
+            console.print(f"  [bold]State machine[/bold] ({len(project.states)} states):")
+            console.print(f"    Entry state: {project.entry_state}")
             console.print(
-                f"[red]  Duplicate project_slug={slug!r} — also declared in "
-                f"{seen_slugs[slug]}[/red]\n"
+                f"    Linear states: active={project.linear_states.active}, "
+                f"review={project.linear_states.review}"
             )
-            any_errors = True
-            continue
-        seen_slugs[slug] = path
-
-        console.print("[green]  Config valid[/green]")
-        console.print(f"    Tracker: {cfg.tracker.kind}")
-        console.print(f"    Project: {cfg.tracker.project_slug}")
-        console.print(f"    Max agents: {cfg.agent.max_concurrent_agents}")
-        console.print(f"    Claude model: {cfg.claude.model or 'default'}")
-        console.print(f"    Permission mode: {cfg.claude.permission_mode}")
-        console.print(f"    Workspace root: {cfg.workspace.resolved_root(path.parent)}")
-
-        if cfg.states:
-            console.print(f"    [bold]State machine[/bold] ({len(cfg.states)} states):")
-            console.print(f"      Entry state: {cfg.entry_state}")
-            console.print(
-                f"      Linear states: active={cfg.linear_states.active}, "
-                f"review={cfg.linear_states.review}"
-            )
-            for name, state in cfg.states.items():
+            for name, state in project.states.items():
                 transitions = ", ".join(f"{k}->{v}" for k, v in state.transitions.items())
-                console.print(f"      {name} ({state.type}) -> {transitions or 'terminal'}")
-        else:
-            console.print(f"    [dim]Legacy mode (no state machine)[/dim]")
+                console.print(f"    {name} ({state.type}) -> {transitions or 'terminal'}")
 
         client = LinearClient(
-            endpoint=cfg.tracker.endpoint,
-            api_key=cfg.resolved_api_key(),
+            endpoint=project.tracker.endpoint,
+            api_key=project.resolved_api_key(),
         )
-
         try:
             candidates = await client.fetch_candidate_issues(
-                cfg.tracker.project_slug,
-                cfg.active_linear_states(),
+                project.tracker.project_slug,
+                project.active_linear_states(),
             )
         except Exception as e:
-            console.print(f"[red]    Failed to fetch candidates: {e}[/red]\n")
+            console.print(f"  [red]Failed to fetch candidates: {e}[/red]")
             await client.close()
-            any_errors = True
             continue
 
-        console.print(f"    [bold]{len(candidates)} candidate issues[/bold]")
-        table = Table()
-        table.add_column("ID", style="cyan")
-        table.add_column("State", style="green")
-        table.add_column("Priority")
-        table.add_column("Title")
-        table.add_column("Labels", style="dim")
-
-        for issue in candidates:
-            table.add_row(
-                issue.identifier,
-                issue.state,
-                str(issue.priority or "—"),
-                issue.title[:60],
-                ", ".join(issue.labels) if issue.labels else "",
-            )
-
-        console.print(table)
+        console.print(f"  [bold]{len(candidates)} candidate issue(s):[/bold]")
+        if candidates:
+            table = Table()
+            table.add_column("ID", style="cyan")
+            table.add_column("State", style="green")
+            table.add_column("Priority")
+            table.add_column("Title")
+            table.add_column("Labels", style="dim")
+            for issue in candidates:
+                table.add_row(
+                    issue.identifier,
+                    issue.state,
+                    str(issue.priority or "—"),
+                    issue.title[:60],
+                    ", ".join(issue.labels) if issue.labels else "",
+                )
+            console.print(table)
         await client.close()
         console.print()
-
-    if any_errors:
-        sys.exit(1)
 
 
 if __name__ == "__main__":
