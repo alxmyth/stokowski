@@ -1,0 +1,69 @@
+name: Upstream drift
+
+# This fork tracks Sugar-Coffee/stokowski deliberately, not accidentally.
+# It previously drifted 26 commits and 131 days behind before anyone noticed,
+# and reconciling that cost a full architectural convergence. Automation that
+# only tags a backup does not catch this; a job that fails does.
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"   # Mondays, 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Measure distance from upstream
+        run: |
+          git remote add upstream https://github.com/Sugar-Coffee/stokowski.git
+          git fetch --quiet upstream main
+
+          behind=$(git rev-list --count HEAD..upstream/main)
+          ahead=$(git rev-list --count upstream/main..HEAD)
+          echo "Behind upstream/main: $behind"
+          echo "Ahead of upstream/main: $ahead"
+
+          {
+            echo "### Upstream drift"
+            echo ""
+            echo "| | commits |"
+            echo "|---|---|"
+            echo "| Behind \`upstream/main\` | $behind |"
+            echo "| Ahead of \`upstream/main\` | $ahead |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$behind" -gt 0 ]; then
+            echo ""
+            echo "Commits we do not have:"
+            git log --oneline --no-decorate HEAD..upstream/main | tail -40
+          fi
+
+          # 15 is about six weeks at upstream's historical rate. Past that,
+          # a merge stops being routine and starts being a project again.
+          if [ "$behind" -gt 15 ]; then
+            echo "::error::$behind commits behind upstream. Sync now — beyond ~15 the merge stops being routine."
+            exit 1
+          fi
+          if [ "$behind" -gt 0 ]; then
+            echo "::notice::$behind commit(s) behind upstream. Run: git fetch upstream && git merge upstream/main"
+          fi
+
+      - name: Report convergence debt
+        run: |
+          pending=$(ls tests_pending/test_*.py 2>/dev/null | wc -l | tr -d ' ')
+          echo "Fork features awaiting re-application: $pending"
+          {
+            echo ""
+            echo "| Fork features awaiting re-application | $pending |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$pending" -gt 0 ]; then
+            echo "::notice::$pending fork feature test file(s) still in tests_pending/ — see its README."
+          fi
