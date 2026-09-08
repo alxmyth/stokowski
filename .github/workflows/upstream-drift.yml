@@ -41,9 +41,16 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$behind" -gt 0 ]; then
-            echo ""
-            echo "Commits we do not have:"
-            git log --oneline --no-decorate HEAD..upstream/main | tail -40
+            {
+              echo ""
+              echo "<details><summary>Commits we do not have</summary>"
+              echo ""
+              echo '```'
+              git log --oneline --no-decorate HEAD..upstream/main | tail -40
+              echo '```'
+              echo ""
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
           # 15 is about six weeks at upstream's historical rate. Past that,

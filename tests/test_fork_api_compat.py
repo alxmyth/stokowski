@@ -79,12 +79,34 @@ def _cross_seam_calls():
                     imported[alias.asname or alias.name] = (node.module, alias.name)
         if not imported:
             continue
+        # `import x.workspace as ws` / `from . import workspace` -> ws.fn(...)
+        module_aliases = {}
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                ident = getattr(node.func, "id", None)
-                if ident in imported:
-                    module, real = imported[ident]
-                    found.append((path.name, node.lineno, module, real, node))
+            if isinstance(node, ast.ImportFrom) and node.module is None:
+                for alias in node.names:
+                    if alias.name in FORK_MODULES:
+                        module_aliases[alias.asname or alias.name] = alias.name
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    tail = alias.name.rsplit(".", 1)[-1]
+                    if tail in FORK_MODULES:
+                        module_aliases[alias.asname or tail] = tail
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            # bare name: `ensure_workspace(...)` after `from .workspace import ...`
+            ident = getattr(func, "id", None)
+            if ident in imported:
+                module, real = imported[ident]
+                found.append((path.name, node.lineno, module, real, node))
+                continue
+            # attribute: `workspace.ensure_workspace(...)`
+            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+                module = module_aliases.get(func.value.id)
+                if module:
+                    found.append((path.name, node.lineno, module, func.attr, node))
     return found
 
 
@@ -108,7 +130,11 @@ def test_every_upstream_call_into_fork_code_binds(caller, lineno, module, name, 
     Binding the real call sites against the real signatures is what stands in
     for the integration test neither side has.
     """
-    fn = getattr(importlib.import_module(f"stokowski.{module}"), name)
+    mod = importlib.import_module(f"stokowski.{module}")
+    fn = getattr(mod, name, None)
+    assert fn is not None, (
+        f"{caller}:{lineno} calls {module}.{name}, which {module}.py does not define"
+    )
     kwargs = {kw.arg: None for kw in call.keywords if kw.arg}
     try:
         inspect.signature(fn).bind(*([None] * len(call.args)), **kwargs)
