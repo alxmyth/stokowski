@@ -1,4 +1,16 @@
-"""Tests for Linear attachment API methods."""
+"""Tests for Linear attachment API methods — which currently have no caller.
+
+These pass, and passing means less than it looks: convergence onto upstream
+restored comment-based state tracking, so nothing in `stokowski/` calls
+`upsert_`/`fetch_`/`delete_stokowski_attachment`. What they certify is that
+the API layer still works for when `tests_pending/test_attachment_tracking.py`
+is re-applied — not that any of it runs today.
+
+Kept deliberately rather than parked alongside that test: moving these would
+leave ninety lines of live, uncalled, uncovered code in `linear.py`, which is
+the one combination worth avoiding. See the block comment above
+ATTACHMENT_CREATE_MUTATION in linear.py for why the code stays at all.
+"""
 
 from __future__ import annotations
 

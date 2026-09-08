@@ -50,6 +50,12 @@ validation rather than accepted and ignored:
 
 Delete the corresponding guard when you re-apply the layer — its test says so.
 
+`linear.py` also still carries the attachment API (`upsert_`/`fetch_`/
+`delete_stokowski_attachment`) with passing tests in `tests/test_attachment_api.py`,
+even though nothing calls it — it encodes Linear API details that are expensive
+to re-derive. Both ends are labelled. If attachment tracking is abandoned rather
+than re-applied, delete the code and its tests together.
+
 `workspace.py` and `docker_runner.py` are present and import cleanly, and
 `workspace.py` is call-compatible with upstream's orchestrator (enforced by
 `tests/test_fork_api_compat.py`). Nothing dispatches into Docker yet.
