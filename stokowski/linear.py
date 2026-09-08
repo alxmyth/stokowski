@@ -182,6 +182,16 @@ query($issueId: String!) {
 }
 """
 
+# ── Attachment API — parked, no caller in this build ───────────────────────
+# The orchestrator tracked state in a Linear attachment rather than a comment;
+# convergence onto upstream restored comment-based tracking, so nothing below
+# is called today. It is kept, not deleted, because it encodes API knowledge
+# that is expensive to re-derive and invisible in a git tag: Linear upserts an
+# attachment by URL rather than by id, `attachmentsForURL` is the read path,
+# and `stokowski://state/` is the key space this fork chose.
+# Re-wired by tests_pending/test_attachment_tracking.py. If that work is
+# abandoned, delete this block and tests/test_attachment_api.py together.
+
 ATTACHMENT_CREATE_MUTATION = """
 mutation AttachmentCreate(
     $issueId: String!, $url: String!, $title: String!,
