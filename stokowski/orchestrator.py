@@ -1151,7 +1151,12 @@ class Orchestrator:
                 runner_type = state_cfg.runner
 
             ws_root = self.cfg.workspace.resolved_root()
-            ws = await ensure_workspace(ws_root, issue.identifier, self.cfg.hooks)
+            # hooks_cfg, not self.cfg.hooks: merge_state_config resolved the
+            # state's hook overrides just above, and the runner already honours
+            # them at the before_run/after_run sites below. Passing the root
+            # config here silently dropped a state-level after_create override.
+            # FORK PATCH — upstream carries the same line; send this back.
+            ws = await ensure_workspace(ws_root, issue.identifier, hooks_cfg)
             attempt.workspace_path = str(ws.path)
 
             # Evidence directory, created fresh each turn and excluded from git
