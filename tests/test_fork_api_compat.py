@@ -17,6 +17,7 @@ parameter it adds must stay keyword-optional or these fail.
 from __future__ import annotations
 
 import ast
+import importlib
 import inspect
 from pathlib import Path
 
@@ -55,37 +56,67 @@ def test_fork_extras_are_keyword_optional(fn):
     )
 
 
-def _calls_to(module_path: Path, names: set[str]) -> list[ast.Call]:
-    tree = ast.parse(module_path.read_text())
-    out = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            fn = node.func
-            ident = getattr(fn, "id", None) or getattr(fn, "attr", None)
-            if ident in names:
-                out.append(node)
-    return out
+# Modules this fork owns outright; every other module is upstream's and may be
+# replaced wholesale by the next merge.
+FORK_MODULES = {"workspace", "docker_runner"}
 
 
-@pytest.mark.parametrize("name", ["ensure_workspace", "remove_workspace"])
-def test_every_orchestrator_call_site_binds(name):
-    """Bind each real call in orchestrator.py, not just the shape we assume.
+def _cross_seam_calls():
+    """Every call from an upstream-owned module into a fork-owned one.
 
-    Guards against upstream changing its call site during a future merge.
+    Discovered by parsing, not listed by hand, so a call site upstream adds or
+    moves in a future merge is covered the moment it lands.
     """
-    fn = {"ensure_workspace": ensure_workspace, "remove_workspace": remove_workspace}[name]
-    sig = inspect.signature(fn)
-    calls = _calls_to(ORCHESTRATOR, {name})
-    assert calls, f"no call to {name} found in orchestrator.py — did the seam move?"
-    for call in calls:
-        kwargs = {kw.arg: None for kw in call.keywords if kw.arg}
-        try:
-            sig.bind(*([None] * len(call.args)), **kwargs)
-        except TypeError as exc:
-            pytest.fail(
-                f"orchestrator.py:{call.lineno} calls {name} with "
-                f"{len(call.args)} positional + {sorted(kwargs)} — {exc}"
-            )
+    found = []
+    for path in sorted((REPO / "stokowski").glob("*.py")):
+        if path.stem in FORK_MODULES:
+            continue
+        tree = ast.parse(path.read_text())
+        imported = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module in FORK_MODULES:
+                for alias in node.names:
+                    imported[alias.asname or alias.name] = (node.module, alias.name)
+        if not imported:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                ident = getattr(node.func, "id", None)
+                if ident in imported:
+                    module, real = imported[ident]
+                    found.append((path.name, node.lineno, module, real, node))
+    return found
+
+
+def test_the_seam_is_actually_covered():
+    """A discovery test that finds nothing is a test that guarantees nothing."""
+    calls = _cross_seam_calls()
+    assert len(calls) >= 5, (
+        f"only {len(calls)} upstream->fork call sites found; the seam moved or "
+        f"the import style changed, so the binding test below is now vacuous"
+    )
+
+
+@pytest.mark.parametrize(
+    "caller,lineno,module,name,call",
+    _cross_seam_calls(),
+    ids=lambda v: f"{v}" if isinstance(v, (str, int)) else "",
+)
+def test_every_upstream_call_into_fork_code_binds(caller, lineno, module, name, call):
+    """Upstream calls our modules; nothing in either suite drives that path.
+
+    Binding the real call sites against the real signatures is what stands in
+    for the integration test neither side has.
+    """
+    fn = getattr(importlib.import_module(f"stokowski.{module}"), name)
+    kwargs = {kw.arg: None for kw in call.keywords if kw.arg}
+    try:
+        inspect.signature(fn).bind(*([None] * len(call.args)), **kwargs)
+    except TypeError as exc:
+        pytest.fail(
+            f"{caller}:{lineno} calls {module}.{name} with {len(call.args)} "
+            f"positional + {sorted(kwargs)} — {exc}"
+        )
 
 
 def test_docker_config_survived_convergence():
