@@ -33,3 +33,6 @@ workflows/*.yml
 
 # Run ledger (operator-local)
 .stokowski/
+
+# Agent worktrees (isolated runs); never part of the tree
+.claude/worktrees/

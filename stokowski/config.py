@@ -804,6 +804,24 @@ def _legacy_project_name(tracker_raw: dict[str, Any], workflow_path: Path) -> st
     return "default"
 
 
+def _find_unwired_keys(config_raw: dict[str, Any]) -> list[str]:
+    """Locate unwired fork keys wherever a config may legitimately carry them.
+
+    Scanning only the top level missed the shape upstream documents: `repos:`
+    nested inside a `projects:` entry validated completely clean, which is the
+    same silent single-repo downgrade the guard exists to prevent.
+    """
+    found: list[str] = []
+    scopes = [config_raw]
+    projects = config_raw.get("projects")
+    if isinstance(projects, list):
+        scopes.extend(p for p in projects if isinstance(p, dict))
+    for key in UNWIRED_FORK_KEYS:
+        if any(key in scope for scope in scopes):
+            found.append(key)
+    return found
+
+
 def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
     """Parse a workflow file (.yaml/.yml or .md with front matter) into config."""
     path = Path(path)
@@ -923,7 +941,7 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
         agent=agent,
         server=server,
         docker=docker,
-        unwired_keys=[k for k in UNWIRED_FORK_KEYS if k in config_raw],
+        unwired_keys=_find_unwired_keys(config_raw),
         linear_states=p0.linear_states,
         prompts=p0.prompts,
         states=p0.states,

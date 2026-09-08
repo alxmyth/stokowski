@@ -150,11 +150,29 @@ def test_every_upstream_call_into_fork_code_binds(caller, lineno, module, name, 
 
 
 def test_docker_config_survived_convergence():
-    """DockerConfig is a fork addition re-applied onto upstream's ServiceConfig."""
+    """DockerConfig is a fork addition re-applied onto upstream's ServiceConfig.
+
+    Both branches of `docker_if_enabled` are asserted deliberately. An earlier
+    version checked only the disabled branch, so replacing the whole property
+    with `return None` left the suite green — mutation testing caught it. A
+    property with two branches needs two assertions or it is not pinned.
+    """
+    from stokowski.config import DockerConfig  # noqa: PLC0415
+
     cfg = ServiceConfig()
     assert hasattr(cfg, "docker"), "ServiceConfig lost the fork's docker field"
     assert cfg.docker.enabled is False, "docker must default off for upstream configs"
     assert cfg.docker_if_enabled is None, "disabled docker must resolve to None"
+
+    cfg.docker = DockerConfig(enabled=True, default_image="python:3.12")
+    resolved = cfg.docker_if_enabled
+    assert resolved is not None, (
+        "docker_if_enabled returns None even when docker is enabled — the "
+        "property is not reading self.docker.enabled"
+    )
+    assert resolved.default_image == "python:3.12", (
+        "docker_if_enabled returned something other than the live config"
+    )
 
 
 def test_enabling_docker_while_unwired_is_refused():
@@ -301,3 +319,43 @@ def test_the_scanner_ignores_unrelated_modules(tmp_path):
         "import json\ndef go():\n    return json.dumps({})\n"
     )
     assert _cross_seam_calls(package_dir=tmp_path) == []
+
+
+def test_unwired_keys_are_found_inside_project_blocks():
+    """`projects:` is upstream's documented multi-project shape.
+
+    The guard originally scanned only the top level, so a `repos:` block nested
+    under a project entry validated completely clean — the same silent
+    single-repo downgrade the guard exists to prevent, reached by the shape the
+    docs steer operators toward.
+    """
+    import textwrap
+
+    from stokowski.config import parse_workflow_file, validate_config  # noqa: PLC0415
+
+    import tempfile
+    from pathlib import Path as _Path
+
+    body = textwrap.dedent("""
+        polling: {interval_ms: 15000}
+        projects:
+          - name: alpha
+            tracker: {kind: linear, api_key: "$LINEAR_API_KEY", project_slug: abc}
+            repos:
+              - {name: api, label: "repo:api", clone_url: "git@x:a.git", default: true}
+            prompts: {global: g.md}
+            linear_states: {todo: Todo, active: Doing, review: Review, done: Done}
+            states:
+              implement: {type: agent, prompt: p.md, transitions: {complete: done}}
+              done: {type: terminal}
+    """)
+    with tempfile.TemporaryDirectory() as d:
+        f = _Path(d) / "nested.yaml"
+        f.write_text(body)
+        cfg = parse_workflow_file(str(f)).config
+        assert "repos" in cfg.unwired_keys, (
+            "a repos: block nested under projects: was not detected; the guard "
+            "is scanning only the top level and can be bypassed by the shape "
+            "the multi-project docs recommend"
+        )
+        assert any("repos:" in e for e in validate_config(cfg))

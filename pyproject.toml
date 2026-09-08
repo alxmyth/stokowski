@@ -15,6 +15,11 @@ dependencies = [
 
 [project.optional-dependencies]
 web = ["fastapi>=0.115", "uvicorn>=0.32", "ruamel.yaml>=0.18"]
+# Declared because CI installs from this file, not from anyone's venv.
+# tests/test_attachment_api.py uses @pytest.mark.asyncio; without the plugin
+# its seven tests fail on a clean checkout while passing for every developer
+# who happens to have pytest-asyncio installed.
+test = ["pytest>=8.0", "pytest-asyncio>=0.24"]
 
 [project.urls]
 Homepage = "https://github.com/Sugar-Coffee/stokowski"
@@ -25,3 +30,8 @@ include = ["stokowski*"]
 
 [project.scripts]
 stokowski = "stokowski.main:cli"
+
+[tool.pytest.ini_options]
+# The suite marks its async tests explicitly; pin the mode so a pytest-asyncio
+# major bump cannot silently change collection behaviour.
+asyncio_mode = "strict"

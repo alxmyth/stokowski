@@ -23,7 +23,7 @@ jobs:
           cache: pip
 
       - name: Install
-        run: pip install -e ".[web]" pytest
+        run: pip install -e ".[web,test]"
 
       - name: Run tests
         run: python -m pytest tests/ -q
