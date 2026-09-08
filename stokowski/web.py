@@ -337,7 +337,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     gap: 16px;
     align-items: start;
     transition: background 0.15s;
-    cursor: pointer;
   }
 
   .agent-card:hover {
@@ -703,125 +702,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     color: var(--muted);
     letter-spacing: 0.05em;
     margin-top: 2px;
-  }
-
-  /* ── Workflow progress ── */
-  .workflow-steps {
-    display: flex;
-    align-items: center;
-    gap: 0;
-    margin-top: 8px;
-    font-size: 10px;
-    font-weight: 400;
-    letter-spacing: 0.04em;
-  }
-
-  .wf-step {
-    color: var(--dim);
-    padding: 1px 6px;
-    border-radius: 2px;
-    white-space: nowrap;
-  }
-
-  .wf-step.current {
-    color: var(--amber);
-    background: rgba(232, 184, 75, 0.1);
-    font-weight: 600;
-  }
-
-  .wf-step.done {
-    color: var(--muted);
-  }
-
-  .wf-arrow {
-    color: var(--border-hi);
-    font-size: 9px;
-    margin: 0 2px;
-  }
-
-  /* ── Docker badge ── */
-  .docker-badge {
-    display: inline-block;
-    font-size: 9px;
-    font-weight: 500;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--blue);
-    border: 1px solid rgba(91,156,246,.2);
-    background: rgba(91,156,246,.06);
-    padding: 1px 5px;
-    border-radius: 2px;
-    margin-left: 8px;
-  }
-
-  /* ── Accordion detail ── */
-  .agent-detail {
-    display: none;
-    grid-column: 1 / -1;
-    padding: 16px 0 4px;
-    border-top: 1px solid var(--border);
-    margin-top: 12px;
-  }
-
-  .agent-card.expanded .agent-detail {
-    display: block;
-  }
-
-  .detail-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 12px 32px;
-  }
-
-  .detail-item {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-
-  .detail-label {
-    font-size: 9px;
-    font-weight: 500;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: var(--muted);
-  }
-
-  .detail-value {
-    font-size: 12px;
-    color: var(--text);
-    font-weight: 400;
-    word-break: break-all;
-  }
-
-  .detail-value.dim {
-    color: var(--muted);
-    font-weight: 300;
-  }
-
-  .detail-message {
-    grid-column: 1 / -1;
-    margin-top: 4px;
-  }
-
-  .detail-message-text {
-    font-size: 12px;
-    color: var(--text);
-    font-weight: 300;
-    line-height: 1.6;
-    white-space: pre-wrap;
-    word-break: break-word;
-    max-height: 200px;
-    overflow-y: auto;
-    background: var(--bg);
-    padding: 10px 14px;
-    border-radius: 2px;
-    border: 1px solid var(--border);
-  }
-
-  .detail-error {
-    color: var(--red);
-    font-weight: 400;
   }
 
   /* ── Empty state ── */
@@ -1345,147 +1225,84 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     return `<div class="timeline">${chips ? `<div class="tl-tools">${chips}</div>` : ''}${rows}</div>`;
   }
 
-  // Track which cards are expanded across refreshes
-  const expandedCards = new Set();
-
-  function toggleCard(id) {
-    if (expandedCards.has(id)) expandedCards.delete(id);
-    else expandedCards.add(id);
-    const el = document.getElementById('card-' + id);
-    if (el) el.classList.toggle('expanded');
-  }
-
-  function renderWorkflow(stateName, workflowName, workflows) {
-    if (!workflowName || !workflows || !workflows[workflowName]) return '';
-    const path = workflows[workflowName].path || [];
-    if (path.length === 0) return '';
-    const currentIdx = path.indexOf(stateName);
-    const allSteps = path;
-    const steps = allSteps.map((s, i) => {
-      let cls = 'wf-step';
-      if (i === currentIdx) cls += ' current';
-      else if (currentIdx >= 0 && i < currentIdx) cls += ' done';
-      return '<span class="' + cls + '">' + esc(s) + '</span>';
-    }).join('<span class="wf-arrow">&#x203A;</span>');
-    return '<div class="workflow-steps">' + steps + '</div>';
-  }
-
-  function fmtElapsed(isoStr) {
-    if (!isoStr) return '—';
-    const s = (Date.now() - new Date(isoStr).getTime()) / 1000;
-    return fmtSecs(Math.max(0, s));
-  }
-
-  function renderDetail(r, dockerEnabled) {
-    const tokIn = r.tokens?.input_tokens || 0;
-    const tokOut = r.tokens?.output_tokens || 0;
-    const items = [
-      ['Tokens In', fmt(tokIn)],
-      ['Tokens Out', fmt(tokOut)],
-      ['Elapsed', fmtElapsed(r.started_at)],
-      ['Turns', String(r.turn_count || 0)],
-    ];
-    if (r.session_id)
-      items.push(['Session', esc(r.session_id)]);
-    if (dockerEnabled && r.container_name)
-      items.push(['Container', esc(r.container_name)]);
-
-    let grid = '';
-    for (const [l,v] of items) {
-      grid += '<div class="detail-item"><span class="detail-label">'
-        + l + '</span><span class="detail-value">' + v + '</span></div>';
-    }
-
-    if (r.error) {
-      grid += '<div class="detail-item"><span class="detail-label">Error</span>'
-        + '<span class="detail-value detail-error">' + esc(r.error) + '</span></div>';
-    }
-
-    if (r.last_message) {
-      grid += '<div class="detail-message"><span class="detail-label">Last Message</span>'
-        + '<div class="detail-message-text">' + esc(r.last_message) + '</div></div>';
-    }
-
-    return '<div class="agent-detail"><div class="detail-grid">' + grid + '</div></div>';
-  }
-
   function renderAgents(data) {
-    const workflows = data.workflows || {};
-    const dockerEnabled = data.docker_enabled || false;
-    const container = document.getElementById('agents-container');
-
     const all = [
       ...(data.running || []),
-      ...(data.retrying || []).map(function(r) { return {
+      ...(data.retrying || []).map(r => ({
         issue_identifier: r.issue_identifier,
         project_name: r.project_name,
-        issue_id: r.issue_id,
         status: 'retrying',
         turn_count: r.attempt,
-        tokens: { total_tokens: 0, input_tokens: 0, output_tokens: 0 },
+        tokens: { total_tokens: 0 },
         last_message: r.error || 'waiting to retry...',
         session_id: null,
-        container_name: null,
-        state_name: null,
-        workflow: null,
-        started_at: null,
-        error: null,
-      }}),
-      ...(data.gates || []).map(function(g) { return {
+      })),
+      ...(data.gates || []).map(g => ({
         issue_identifier: g.issue_identifier,
         project_name: g.project_name,
-        issue_id: g.issue_id,
         status: 'gate',
         state_name: g.gate_state,
         turn_count: g.run,
-        tokens: { total_tokens: 0, input_tokens: 0, output_tokens: 0 },
+        tokens: { total_tokens: 0 },
         last_message: 'Awaiting human review',
         session_id: null,
-        container_name: null,
-        workflow: g.workflow,
-        started_at: null,
-        error: null,
-      }}),
+      })),
     ].filter(projectMatches);
 
     document.getElementById('agent-count').textContent = all.length;
 
     if (all.length === 0) {
-      container.textContent = '';
-      var emptyDiv = document.createElement('div');
-      emptyDiv.className = 'empty';
-      emptyDiv.innerHTML = '<div class="empty-title">No active agents</div>'
-        + '<div class="empty-sub">Move a Linear issue to Todo or In Progress to start</div>';
-      container.appendChild(emptyDiv);
+      document.getElementById('agents-container').innerHTML = `
+        <div class="empty">
+          <div class="empty-title">No active agents</div>
+          <div class="empty-sub">Move a Linear issue to Todo or In Progress to start</div>
+        </div>`;
       return;
     }
 
-    var rows = '';
-    for (const r of all) {
-      const cardId = (r.issue_identifier || '').replace(/[^a-zA-Z0-9_-]/g, '_');
-      const expanded = expandedCards.has(cardId) ? ' expanded' : '';
-      const dockerBadge = dockerEnabled && r.container_name
-        ? '<span class="docker-badge">docker</span>' : '';
-      const wfHtml = renderWorkflow(r.state_name, r.workflow, workflows);
+    const rows = all.map(r => {
+      const stateInfo = r.state_name ? `<span style="color:var(--muted);font-size:11px;margin-left:8px">${esc(r.state_name)}</span>` : '';
+      const projTag = r.project_name ? `<div class="agent-project">${esc(r.project_name)}</div>` : '';
+      const key = (r.project_name || '') + '/' + r.issue_identifier;
+      const open = expandedAgents.has(key);
 
-      rows += '<div class="agent-card' + expanded + '" id="card-' + cardId
-        + '" onclick="toggleCard(\'' + cardId + '\')">'
-        + '<div><div class="agent-id">' + esc(r.issue_identifier) + '</div></div>'
-        + '<div>'
-        + '<div class="agent-status-row">' + statusPill(r.status) + dockerBadge + '</div>'
-        + '<div class="agent-msg">' + esc(r.last_message || '—') + '</div>'
-        + wfHtml
-        + '</div>'
-        + '<div class="agent-meta">'
-        + '<div class="agent-tokens">' + fmt(r.tokens?.total_tokens || 0) + ' tok</div>'
-        + '<div class="agent-turns">turn ' + (r.turn_count || 0) + '</div>'
-        + '</div>'
-        + renderDetail(r, dockerEnabled)
-        + '</div>';
-    }
+      // Tool count and error count give an at-a-glance sense of whether the
+      // agent is making progress or thrashing.
+      const toolBits = [];
+      if (r.tool_call_count) toolBits.push(`${r.tool_call_count} tools`);
+      if (r.tool_error_count) toolBits.push(`<span class="agent-warn">${r.tool_error_count} err</span>`);
+      if (r.compaction_count) toolBits.push(`${r.compaction_count}\u00d7 compact`);
+      if (r.artifact_count) toolBits.push(`${r.artifact_count} artifacts`);
+      const sub = toolBits.length ? `<div class="agent-sub">${toolBits.join(' \u00b7 ')}</div>` : '';
+      const cost = r.cost_usd ? `<div class="agent-cost">$${r.cost_usd.toFixed(2)}</div>` : '';
 
-    // All values passed through esc() — data is from orchestrator internal state
-    container.innerHTML = '<div class="agents">' + rows + '</div>';
+      return `
+      <div class="agent-card ${open ? 'expanded' : ''}" onclick="window.__toggleAgent('${esc(key)}')">
+        <div>
+          <div class="agent-id">${esc(r.issue_identifier)}</div>
+          ${projTag}
+        </div>
+        <div>
+          <div class="agent-status-row">
+            ${statusPill(r.status)}${stateInfo}
+          </div>
+          <div class="agent-activity">
+            <span class="agent-msg">${esc(r.last_message || '\u2014')}</span>
+            ${r.last_event_at ? `<span class="agent-elapsed">${fmtElapsed(r.last_event_at)}</span>` : ''}
+          </div>
+          ${sub}
+        </div>
+        <div class="agent-meta">
+          <div class="agent-tokens">${fmt(r.tokens?.total_tokens || 0)} tok</div>
+          <div class="agent-turns">turn ${r.turn_count || 0}</div>
+          ${cost}
+        </div>
+        ${open ? renderTimeline(r) : ''}
+      </div>`;
+    }).join('');
+
+    document.getElementById('agents-container').innerHTML =
+      `<div class="agents">${rows}</div>`;
   }
 
   async function refresh() {

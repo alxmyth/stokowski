@@ -1,24 +1,13 @@
 # =============================================================================
-# Stokowski — Example: single Linear project mapped to a single repo (1:1)
+# Stokowski — Example State Machine Workflow
 # =============================================================================
 #
-# This is the simplest Stokowski setup: one Linear project, one Git repo,
-# one state machine pipeline. No `repos:` registry, no triage, no
-# multi-repo routing. If your team operates with a single product/repo
-# per Linear project, start here.
-#
-# Other worked examples:
-#   workflow.multi-repo.example.yaml         — one project spanning N repos
-#                                              (label-driven routing, default repo)
-#   workflow.multi-repo-triage.example.yaml  — same + triage agent that
-#                                              re-labels tickets via
-#                                              `workflow:triage`
-#
+# Copy this file to workflow.yaml and customise for your project.
 # Stokowski re-reads this file on every poll tick — changes take effect
 # without restart.
 #
-# Prompt files live in the prompts/ directory. Each agent state references
-# its prompt via the `prompt` field. A global prompt (shared preamble) is
+# Prompt files live in the prompts/ directory.  Each agent state references
+# its prompt via the `prompt` field.  A global prompt (shared preamble) is
 # injected before the stage-specific prompt when set.
 #
 # Linear states mapping:
@@ -84,7 +73,7 @@
 # ---------------------------------------------------------------------------
 tracker:
   kind: linear
-  project_slug: "abc123def456"      # hex slugId from your Linear project URL
+  project_slug: "abc123def456"    # hex slugId from your Linear project URL
   api_key: "lin_api_your_key_here"  # your Linear API key — agents inherit this
 
 # ---------------------------------------------------------------------------
@@ -122,11 +111,6 @@ workspace:
 # ---------------------------------------------------------------------------
 # Hooks — shell scripts run in the workspace directory
 # ---------------------------------------------------------------------------
-# In this 1:1 layout (no `repos:` section), hooks pass through to the shell
-# verbatim — Stokowski does NOT Jinja-render them. This means shell bodies
-# containing literal `{`/`}` (e.g., `!f() { ...; }; f` credential helpers)
-# continue to work unchanged. If you migrate to multi-repo, hooks will be
-# rendered with a `{{ repo.* }}` namespace — see the multi-repo examples.
 hooks:
   # Runs ONCE, when a workspace is first created.
   #
@@ -208,7 +192,6 @@ agent:
 # ---------------------------------------------------------------------------
 prompts:
   global_prompt: prompts/global.example.md
-  evaluator_prompt: prompts/evaluator.example.md
 
 # ---------------------------------------------------------------------------
 # Server (optional web dashboard)
@@ -245,39 +228,6 @@ routing:
       workflow: exploration
 
 # ---------------------------------------------------------------------------
-# Docker isolation (optional — agents run as sibling containers)
-# ---------------------------------------------------------------------------
-# docker:
-#   enabled: true
-#   default_image: "stokowski/claude-agent:latest"
-#   inherit_claude_config: true
-#   host_claude_dir: "${HOST_HOME}/.claude"
-#   # DooD shim fields — required when the orchestrator itself runs in a
-#   # container AND inherit_claude_config is true. Stokowski refuses to start
-#   # in DooD mode without these to prevent host plugin files from being
-#   # rewritten. See CLAUDE.md (Docker mode) for setup.
-#   host_claude_dir_mount: "/host-claude"           # where host_claude_dir is RO-mounted inside the orchestrator
-#   plugin_shim_host_path: "${HOST_PLUGIN_SHIM}"    # host-resolvable shim dir (e.g. ${HOME}/.stokowski-plugin-shim)
-#   plugin_shim_container_path: "/plugin-shim"      # where plugin_shim_host_path is RW-mounted inside the orchestrator
-#   extra_env:
-#     - GITHUB_TOKEN
-#     - CLAUDE_CODE_OAUTH_TOKEN    # required for Claude Code auth in containers
-#   extra_volumes:
-#     - "${HOST_HOME}/.ssh:/home/agent/.ssh:ro"
-#     - "${HOST_HOME}/.gitconfig:/home/agent/.gitconfig:ro"
-#
-# Authentication for Docker mode:
-#   Claude Code in containers cannot use interactive OAuth login. Set one of:
-#     ANTHROPIC_API_KEY           — standard API key (API plan required)
-#     CLAUDE_CODE_OAUTH_TOKEN     — long-lived token for Pro/Max users
-#
-#   Generate an OAuth token by running `claude setup-token` in your terminal,
-#   then add it to your .env file:
-#     CLAUDE_CODE_OAUTH_TOKEN=your_generated_token_here
-#
-#   Add CLAUDE_CODE_OAUTH_TOKEN to extra_env so it reaches agent containers.
-
-# ---------------------------------------------------------------------------
 # State machine
 # ---------------------------------------------------------------------------
 #
@@ -297,7 +247,7 @@ states:
 
   # ── 1. Investigate ──────────────────────────────────────────────────────
   # Read the codebase, understand the problem, post an investigation summary.
-  # Uses Opus for deeper reasoning. Low turn count — investigation only.
+  # Uses Opus for deeper reasoning.  Low turn count — investigation only.
   investigate:
     type: agent
     prompt: prompts/investigate.example.md
@@ -342,7 +292,7 @@ states:
 
   # ── 4. Implement ────────────────────────────────────────────────────────
   # Write code, create branch, run tests, open PR.
-  # Uses Sonnet for fast iteration. Higher turn count for complex work.
+  # Uses Sonnet for fast iteration.  Higher turn count for complex work.
   implement:
     type: agent
     prompt: prompts/implement.example.md
@@ -378,23 +328,7 @@ states:
     effort: xhigh
     session: fresh            # no prior context — adversarial review
     transitions:
-      complete: eval-merge
-
-  # ── 5b. Merge Evaluation (evaluator) ────────────────────────────────────
-  # Automated evaluation: fresh session reviews the diff and produces
-  # a structured verdict. If auto_approve is true and the evaluator
-  # approves, the merge-review gate is skipped.
-  eval-merge:
-    type: evaluator
-    prompt: prompts/evaluator.example.md
-    linear_state: active
-    model: claude-sonnet-4-6
-    max_turns: 5
-    session: fresh
-    auto_approve: false             # set true once you trust the evaluator
-    transitions:
       complete: merge-review
-      approve: merge
 
   # ── 8. Merge Review (gate) ──────────────────────────────────────────────
   # Human reviews the code review findings and decides to merge or rework.
@@ -408,7 +342,7 @@ states:
       approve: merge
 
   # ── 8. Merge ────────────────────────────────────────────────────────────
-  # Merge the PR and clean up. Short turn count — just the merge.
+  # Merge the PR and clean up.  Short turn count — just the merge.
   merge:
     type: agent
     prompt: prompts/merge.example.md

@@ -13,9 +13,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from jinja2 import BaseLoader, Environment, StrictUndefined, Undefined
+from jinja2 import BaseLoader, Environment, Undefined
 
-from .config import HooksConfig, LinearStatesConfig, RepoConfig, ServiceConfig, StateConfig
+from .config import (
+    LinearStatesConfig,
+    ServiceConfig,
+    StateConfig,
+    global_prompt_paths,
+)
 from .models import Issue
 from .tracking import get_comments_since, get_last_tracking_timestamp
 
@@ -48,78 +53,11 @@ def render_template(template_str: str, context: dict[str, Any]) -> str:
     """Render a Jinja2 template string with the given context.
 
     Uses a permissive undefined handler so missing variables render as
-    empty strings rather than raising errors. Intended for prompt rendering,
-    where agent prompts benefit from forgiving templates.
-
-    For **hook rendering**, use ``render_hook_template`` instead — hooks
-    execute as shell and silent-undefined would let typos through as
-    ``git clone $EMPTY``.
+    empty strings rather than raising errors.
     """
     env = Environment(loader=BaseLoader(), undefined=_SilentUndefined)
     template = env.from_string(template_str)
     return template.render(**context)
-
-
-def render_hook_template(
-    hook_script: str, repo: RepoConfig
-) -> str:
-    """Render a hook shell script with repo metadata using StrictUndefined.
-
-    Unlike ``render_template`` (which silently drops undefined variables),
-    this raises on any typo or missing variable — hooks execute as shell
-    and a silent empty-string substitution would produce dangerous behavior
-    like ``git clone $EMPTY``.
-
-    Context exposed: a nested ``repo`` namespace identical to the prompt
-    context — ``{{ repo.name }}``, ``{{ repo.clone_url }}``, ``{{ repo.label }}``.
-
-    This helper is ONLY invoked when the config has an explicit ``repos:``
-    section (``cfg.repos_synthesized == False``). Legacy configs bypass
-    Jinja rendering entirely so hook bodies with literal ``{``/``}``
-    (e.g. shell function syntax ``!f() { ...; }; f``) continue to work
-    unchanged.
-    """
-    env = Environment(loader=BaseLoader(), undefined=StrictUndefined)
-    template = env.from_string(hook_script)
-    return template.render(repo={
-        "name": repo.name,
-        "clone_url": repo.clone_url or "",
-        "label": repo.label or "",
-    })
-
-
-def render_hooks_for_dispatch(
-    hooks: HooksConfig, repo: RepoConfig | None, synthesized: bool
-) -> HooksConfig:
-    """Return a HooksConfig with fields Jinja-rendered over repo metadata.
-
-    When ``synthesized`` is True (legacy 1:1 config, no ``repos:`` section
-    in YAML), hook scripts are returned verbatim with NO rendering. This
-    preserves R19 backward compatibility for configs containing literal
-    ``{``/``}`` characters in shell bodies.
-
-    When ``synthesized`` is False, each non-empty hook field is rendered
-    with ``render_hook_template``. Undefined variable references raise
-    ``jinja2.UndefinedError`` which the orchestrator catches and surfaces
-    as a Linear comment on the ticket.
-
-    The original ``hooks`` object is not mutated; a new ``HooksConfig`` is
-    returned.
-    """
-    if synthesized or repo is None:
-        return hooks
-
-    def _render(script: str | None) -> str | None:
-        return render_hook_template(script, repo) if script else script
-
-    return HooksConfig(
-        after_create=_render(hooks.after_create),
-        before_run=_render(hooks.before_run),
-        after_run=_render(hooks.after_run),
-        before_remove=_render(hooks.before_remove),
-        on_stage_enter=_render(hooks.on_stage_enter),
-        timeout_ms=hooks.timeout_ms,
-    )
 
 
 class _SilentUndefined(Undefined):
@@ -152,7 +90,6 @@ def build_template_context(
     run: int = 1,
     attempt: int = 1,
     last_run_at: str | None = None,
-    repo: RepoConfig | None = None,
 ) -> dict[str, Any]:
     """Build the Jinja2 template context dict from issue and run metadata.
 
@@ -162,17 +99,11 @@ def build_template_context(
         run: Current run number for this state.
         attempt: Retry attempt within this run.
         last_run_at: ISO timestamp of the last run, if any.
-        repo: The resolved RepoConfig for this dispatch. When provided, a
-            nested ``repo`` namespace is exposed to templates as
-            ``{{ repo.name }}``, ``{{ repo.clone_url }}``, ``{{ repo.label }}``.
-            For the synthetic ``_default`` repo, ``clone_url`` and ``label``
-            render as empty strings; ``name`` renders as ``_default``.
 
     Returns:
-        A flat dict suitable for Jinja2 rendering. If ``repo`` is provided,
-        the dict also contains a nested ``repo`` entry.
+        A flat dict suitable for Jinja2 rendering.
     """
-    ctx: dict[str, Any] = {
+    return {
         "issue_id": issue.id,
         "issue_identifier": issue.identifier,
         "issue_title": issue.title,
@@ -187,13 +118,6 @@ def build_template_context(
         "attempt": attempt,
         "last_run_at": last_run_at or "",
     }
-    if repo is not None:
-        ctx["repo"] = {
-            "name": repo.name,
-            "clone_url": repo.clone_url or "",
-            "label": repo.label or "",
-        }
-    return ctx
 
 
 def comment_author(comment: dict[str, Any]) -> str:
@@ -235,8 +159,6 @@ def build_lifecycle_section(
     run: int = 1,
     is_rework: bool = False,
     recent_comments: list[dict[str, Any]] | None = None,
-    transitions: dict[str, str] | None = None,
-    repo: RepoConfig | None = None,
 ) -> str:
     """Generate the auto-injected lifecycle section.
 
@@ -251,14 +173,6 @@ def build_lifecycle_section(
         run: Current run number.
         is_rework: Whether this is a rework run after gate rejection.
         recent_comments: Non-tracking comments since last run.
-        transitions: Workflow-specific transitions for this state. When
-            provided, used instead of ``state_cfg.transitions`` for the
-            "Available Transitions" and "When Done" sections. ``None``
-            falls back to ``state_cfg.transitions`` (backward compat).
-        repo: The resolved RepoConfig for this dispatch. Added as a
-            ``**Repository:**`` line when the repo is not the synthetic
-            ``_default`` legacy fallback. Omitted entirely for ``_default``
-            to avoid noise in single-repo legacy configs.
 
     Returns:
         A markdown string clearly demarcated as auto-generated.
@@ -273,26 +187,8 @@ def build_lifecycle_section(
     lines.append(f"- **Issue:** {issue.identifier} — {issue.title}")
     if issue.url:
         lines.append(f"- **URL:** {issue.url}")
-    # Only expose repo context in multi-repo mode. For the synthetic _default
-    # repo (legacy 1:1 config), the block is omitted — the agent has always
-    # inferred the codebase from cwd in that mode.
-    if repo is not None and repo.name != "_default":
-        lines.append(f"- **Repository:** {repo.name}")
-        if repo.clone_url:
-            lines.append(f"- **Clone URL:** {repo.clone_url}")
     lines.append(f"- **State:** {state_name}")
     lines.append(f"- **Run:** {run}")
-    lines.append("")
-
-    # Scope restriction guardrail
-    lines.append("### Scope Restriction")
-    lines.append("")
-    lines.append(
-        f"You are scoped to issue {issue.identifier} ONLY. Do not modify, "
-        f"comment on, or transition any other Linear issue. You may read "
-        f"other issues for context (e.g., checking a blocker's status), "
-        f"but do not take any write action on them."
-    )
     lines.append("")
 
     # Rework information
@@ -321,64 +217,19 @@ def build_lifecycle_section(
         for comment in recent_comments:
             lines.extend(format_comment(comment))
 
-    # Available transitions — prefer workflow-specific when provided
-    effective_transitions = transitions if transitions is not None else state_cfg.transitions
-    if effective_transitions:
+    # Available transitions
+    if state_cfg.transitions:
         lines.append("### Transitions")
         lines.append("")
-        for trigger, target in effective_transitions.items():
+        for trigger, target in state_cfg.transitions.items():
             lines.append(f"- `{trigger}` → **{target}**")
         lines.append("")
 
-    if state_cfg.type == "evaluator":
-        lines.append(
-            "You are an **evaluator**. Your job is to independently review "
-            "the work done in the prior stage and produce a structured verdict."
-        )
-        lines.append("")
-        lines.append("**Output your evaluation as a structured comment:**")
-        lines.append("")
-        lines.append("```")
-        lines.append(
-            '<!-- stokowski:evaluation {"tier": "approve|review-required", '
-            '"summary": "one-line summary", "findings": ["finding 1", ...]} -->'
-        )
-        lines.append("```")
-        lines.append("")
-        lines.append("**Tiers:**")
-        lines.append(
-            "- `approve` — the work is correct, complete, and safe to proceed"
-        )
-        lines.append(
-            "- `review-required` — you have concerns that need human attention"
-        )
-        lines.append("")
-        lines.append(
-            "Be specific in findings. If you approve, briefly state why. "
-            "If you flag for review, list every concern."
-        )
-        lines.append("")
-    elif len(effective_transitions) > 1:
-        lines.append(
-            "When you have completed your work, include a transition "
-            "directive in your final message to indicate the next step:"
-        )
-        lines.append("")
-        lines.append("```")
-        lines.append("<!-- transition:TRANSITION_NAME -->")
-        lines.append("```")
-        lines.append("")
-        lines.append(
-            "where TRANSITION_NAME is one of the transitions listed above. "
-            "If no directive is included, `complete` is used by default."
-        )
-        lines.append("")
-    else:
-        lines.append(
-            "When you have completed your work, the `complete` transition "
-            "will fire automatically. No special action is needed."
-        )
-        lines.append("")
+    # Evidence + reporting contract. Stokowski, not the agent, writes the
+    # Linear comment — a model asked to summarise its own work will reliably
+    # produce something readable and unreliably produce something checkable.
+    lines.extend(build_reporting_contract())
+
     lines.append("<!-- END STOKOWSKI LIFECYCLE -->")
 
     return "\n".join(lines)
@@ -545,8 +396,6 @@ def assemble_prompt(
     last_run_at: str | None = None,
     comments: list[dict[str, Any]] | None = None,
     global_prompt: str | list[str] | None = None,
-    transitions: dict[str, str] | None = None,
-    repo: RepoConfig | None = None,
 ) -> str:
     """Orchestrate three-layer prompt assembly.
 
@@ -568,9 +417,6 @@ def assemble_prompt(
         attempt: Retry attempt within this run.
         last_run_at: ISO timestamp of the last run.
         comments: All comments on the issue (for filtering).
-        transitions: Workflow-specific transitions for this state. Passed
-            through to ``build_lifecycle_section()``. ``None`` falls back
-            to ``state_cfg.transitions``.
 
     Returns:
         The fully assembled prompt string.
@@ -581,7 +427,6 @@ def assemble_prompt(
         run=run,
         attempt=attempt,
         last_run_at=last_run_at,
-        repo=repo,
     )
 
     parts: list[str] = []
@@ -607,21 +452,17 @@ def assemble_prompt(
                 "Global prompt file not found: %s", global_prompt_path
             )
 
-    # Layer 2: Stage prompt (evaluators fall back to global evaluator_prompt)
-    stage_prompt_path = state_cfg.prompt
-    if not stage_prompt_path and state_cfg.type == "evaluator":
-        stage_prompt_path = cfg.prompts.evaluator_prompt
-
-    if stage_prompt_path:
+    # Layer 2: Stage prompt
+    if state_cfg.prompt:
         try:
-            raw = load_prompt_file(stage_prompt_path, workflow_dir)
+            raw = load_prompt_file(state_cfg.prompt, workflow_dir)
             rendered = render_template(raw, context)
             parts.append(rendered)
         except FileNotFoundError:
             log.warning(
                 "Stage prompt file not found for state '%s': %s",
                 state_name,
-                stage_prompt_path,
+                state_cfg.prompt,
             )
 
     # Layer 3: Lifecycle injection
@@ -639,8 +480,6 @@ def assemble_prompt(
         run=run,
         is_rework=is_rework,
         recent_comments=recent,
-        transitions=transitions,
-        repo=repo,
     )
     parts.append(lifecycle)
 

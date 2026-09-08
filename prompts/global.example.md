@@ -122,38 +122,6 @@ Write screenshots, recordings and exported data to `$STOKOWSKI_ARTIFACTS`.
 Stokowski uploads that directory to Linear and then empties it. Anything
 written elsewhere in the repo is never seen and risks being committed.
 
-1. **Sync with main.** Check if your branch is behind main: `git log HEAD..origin/main --oneline`.
-   If there are commits, run `git rebase origin/main`. If conflicts arise, resolve them
-   intelligently — read both sides, understand intent, and pick the correct resolution.
-   After resolving, verify the build still passes. Force-push the updated branch.
-   If already up to date, skip this step.
-2. Run the project's type-check command to verify the codebase compiles clean.
-3. Run the project's test command to verify all tests pass.
-4. If any step fails, investigate and fix before starting new work.
-
-## Linear access
-
-- Prefer a Linear MCP server if one is registered in this session's tools.
-  Otherwise, use HTTP directly against `https://api.linear.app/graphql`.
-- The current issue's UUID and identifier are provided in the lifecycle
-  section of this prompt. Do not issue a lookup query to rediscover them.
-
-When using HTTP:
-
-- Stokowski sets the `LINEAR_API_KEY` env var to the resolved tracker API
-  key. Use it directly as the value of the `Authorization` header (no
-  `Bearer` prefix).
-- Write the JSON body to a file and pass it with `-d @file` to avoid
-  shell-quoting hazards. Example (adding a comment):
-
-      cat > /tmp/q.json <<'EOF'
-      {"query": "mutation($id:String!,$body:String!){commentCreate(input:{issueId:$id,body:$body}){success}}",
-       "variables": {"id": "<issue-uuid>", "body": "<markdown>"}}
-      EOF
-      curl -s -X POST https://api.linear.app/graphql \
-        -H "Authorization: $LINEAR_API_KEY" \
-        -H "Content-Type: application/json" \
-        -d @/tmp/q.json
 If your work changes something a person can see, capture it. A before/after
 pair beats a paragraph describing one.
 

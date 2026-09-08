@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import glob as _glob
 import logging
 import os
 import select
@@ -14,16 +13,11 @@ import termios
 import threading
 import tty
 from pathlib import Path
-from typing import Sequence
 
 
-def _load_dotenv(directory: Path | None = None):
-    """Load .env file from a directory if it exists.
-
-    Args:
-        directory: Directory to search for .env. Defaults to cwd.
-    """
-    env_file = (directory / ".env") if directory else Path(".env")
+def _load_dotenv():
+    """Load .env file from cwd if it exists."""
+    env_file = Path(".env")
     if not env_file.exists():
         return
     for line in env_file.read_text().splitlines():
@@ -45,7 +39,6 @@ from rich.text import Text
 
 from .orchestrator import MultiOrchestrator
 
-logger = logging.getLogger(__name__)
 console = Console()
 
 # Module-level update message, set once at startup
@@ -230,7 +223,6 @@ class KeyboardHandler:
 
     def _run(self):
         if not sys.stdin.isatty():
-            logger.info("Non-interactive mode: keyboard handler disabled, use web dashboard")
             return
 
         fd = sys.stdin.fileno()
@@ -359,10 +351,8 @@ async def run_orchestrator(workflow_path: str, host_ip: str | None = None, port:
             import uvicorn
 
             app = create_app(orch)
-            # Bind 0.0.0.0 in containers so the port forward works on macOS Docker
-            bind_host = "0.0.0.0" if not sys.stdin.isatty() else "127.0.0.1"
             server_config = uvicorn.Config(
-                app, host=bind_host, port=port, log_level="warning",
+                app, host=effective_host_ip, port=effective_port, log_level="warning",
             )
             _uvicorn_server = uvicorn.Server(server_config)
             _uvicorn_server.install_signal_handlers = lambda: None
@@ -377,21 +367,11 @@ async def run_orchestrator(workflow_path: str, host_ip: str | None = None, port:
                 "[yellow]Install web extras for dashboard: pip install stokowski[web][/yellow]"
             )
 
-    if not sys.stdin.isatty() and not port:
-        logger.warning(
-            "Running non-interactively without web dashboard — consider using --port"
-        )
-
     await check_for_updates()
 
-    _paths_display = (
-        str(workflow_paths)
-        if isinstance(workflow_paths, (str, Path))
-        else ", ".join(str(p) for p in workflow_paths)
-    )
     console.print(Panel(
         f"[bold]Stokowski[/bold]  [dim]Claude Code Orchestrator[/dim]\n"
-        f"[dim]workflow:[/dim] {_paths_display}",
+        f"[dim]workflow:[/dim] {workflow_path}",
         border_style="dim",
     ))
 
@@ -431,13 +411,9 @@ def cli():
     )
     parser.add_argument(
         "workflow",
-        nargs="*",
-        default=[],
-        help=(
-            "Paths to workflow file(s). Accepts a single file, a directory "
-            "containing workflow files, a glob, or multiple paths. "
-            "Auto-detected if not specified."
-        ),
+        nargs="?",
+        default=None,
+        help="Path to workflow.yaml or WORKFLOW.md (auto-detected if not specified)",
     )
     parser.add_argument(
         "--host",
@@ -463,27 +439,21 @@ def cli():
 
     args = parser.parse_args()
 
-    # Load .env BEFORE workflow-path resolution so STOKOWSKI_WORKFLOW_PATH
-    # from .env is visible to resolve_workflow_paths.
+    if args.workflow is None:
+        if Path("workflow.yaml").exists():
+            args.workflow = "./workflow.yaml"
+        elif Path("workflow.yml").exists():
+            args.workflow = "./workflow.yml"
+        elif Path("WORKFLOW.md").exists():
+            args.workflow = "./WORKFLOW.md"
+        else:
+            console.print(
+                "[red]No workflow file found. Create workflow.yaml or WORKFLOW.md, "
+                "or specify a path: stokowski <path>[/red]"
+            )
+            sys.exit(1)
+
     _load_dotenv()
-
-    try:
-        workflow_paths = resolve_workflow_paths(args.workflow)
-    except FileNotFoundError as e:
-        console.print(f"[red]{e}[/red]")
-        sys.exit(1)
-
-    # Load .env from each workflow file's directory (later wins via direct
-    # assignment). Enables `stokowski /path/to/workflow.yaml` to pick up a
-    # project-local .env regardless of cwd.
-    cwd = Path.cwd().resolve()
-    seen_dirs: set[Path] = set()
-    for wpath in workflow_paths:
-        wdir = wpath.resolve().parent
-        if wdir != cwd and wdir not in seen_dirs:
-            _load_dotenv(wdir)
-            seen_dirs.add(wdir)
-
     setup_logging(args.verbose)
 
     if args.stats:
@@ -582,7 +552,7 @@ def show_stats(workflow_path: str) -> None:
 
 
 def _force_kill_children():
-    """Kill any lingering claude -p processes and Docker containers."""
+    """Kill any lingering claude -p processes."""
     import subprocess
     try:
         result = subprocess.run(
@@ -602,71 +572,38 @@ def _force_kill_children():
     except Exception:
         pass
 
-    # Kill Docker containers
-    try:
-        result = subprocess.run(
-            ["docker", "ps", "-q", "--filter", "label=stokowski=true"],
-            capture_output=True, text=True,
-        )
-        for cid in result.stdout.strip().split("\n"):
-            if cid.strip():
-                subprocess.run(
-                    ["docker", "kill", cid.strip()], capture_output=True
-                )
-    except Exception:
-        pass
-
 
 # ── Dry run ───────────────────────────────────────────────────────────────────
 
-async def dry_run(workflow_paths: Sequence[Path] | Path | str):
+async def dry_run(workflow_path: str):
     from .config import parse_workflow_file, validate_config
-    from .linear import LinearClient
-
-    if isinstance(workflow_paths, (str, Path)):
-        paths = [Path(workflow_paths)]
-    else:
-        paths = list(workflow_paths)
 
     console.print("[bold]Dry run mode[/bold]\n")
 
-    any_errors = False
-    seen_slugs: dict[str, Path] = {}
+    try:
+        workflow = parse_workflow_file(workflow_path)
+    except Exception as e:
+        console.print(f"[red]Failed to load workflow: {e}[/red]")
+        sys.exit(1)
 
-    for idx, path in enumerate(paths):
-        console.print(f"[bold cyan]── Project file {idx + 1}/{len(paths)}: {path}[/bold cyan]")
-        try:
-            workflow = parse_workflow_file(str(path))
-        except Exception as e:
-            console.print(f"[red]Failed to load workflow: {e}[/red]\n")
-            any_errors = True
-            continue
+    errors = validate_config(workflow.config)
+    if errors:
+        for e in errors:
+            console.print(f"[red]Config error: {e}[/red]")
+        sys.exit(1)
 
-        errors = validate_config(workflow.config)
-        if errors:
-            for e in errors:
-                console.print(f"[red]  Config error: {e}[/red]")
-            any_errors = True
-            console.print()
-            continue
-        # Cross-file duplicate slug check.
-        slug = cfg.tracker.project_slug
-        if slug in seen_slugs:
-            console.print(
-                f"[red]  Duplicate project_slug={slug!r} — also declared in "
-                f"{seen_slugs[slug]}[/red]\n"
-            )
-            any_errors = True
-            continue
-        seen_slugs[slug] = path
+    cfg = workflow.config
+    server_port = cfg.server.port
+    server_host = cfg.server.host or "127.0.0.1"
+    server_info = f"http://{server_host}:{server_port}" if server_port else "disabled"
+    console.print("[green]Config valid[/green]")
+    console.print(f"  Global max_concurrent_agents: {cfg.agent.max_concurrent_agents}")
+    console.print(f"  Polling interval: {cfg.polling.interval_ms}ms")
+    console.print(f"  Web dashboard: {server_info}")
+    console.print(f"  Projects: {len(cfg.projects)}")
+    console.print()
 
-        console.print("[green]  Config valid[/green]")
-        console.print(f"    Tracker: {cfg.tracker.kind}")
-        console.print(f"    Project: {cfg.tracker.project_slug}")
-        console.print(f"    Max agents: {cfg.agent.max_concurrent_agents}")
-        console.print(f"    Claude model: {cfg.claude.model or 'default'}")
-        console.print(f"    Permission mode: {cfg.claude.permission_mode}")
-        console.print(f"    Workspace root: {cfg.workspace.resolved_root(path.parent)}")
+    from .linear import LinearClient
 
     for project in cfg.projects:
         per_project_cap = (
@@ -725,9 +662,6 @@ async def dry_run(workflow_paths: Sequence[Path] | Path | str):
                 )
             console.print(table)
         await client.close()
-        console.print()
-
-    if any_errors:
         console.print()
 
 

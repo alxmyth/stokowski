@@ -8,10 +8,7 @@ import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from stokowski.models import Issue
+from typing import Any
 
 import yaml
 
@@ -37,18 +34,9 @@ class PollingConfig:
 class WorkspaceConfig:
     root: str = ""
 
-    def resolved_root(self, base: Path | None = None) -> Path:
-        """Resolve ~ and $VAR in workspace root.
-
-        Args:
-            base: Base directory for resolving relative paths (e.g. workflow dir).
-        """
+    def resolved_root(self) -> Path:
         if self.root:
-            expanded = os.path.expanduser(os.path.expandvars(self.root))
-            p = Path(expanded)
-            if not p.is_absolute() and base:
-                p = base / p
-            return p
+            return Path(os.path.expandvars(os.path.expanduser(self.root)))
         return Path(tempfile.gettempdir()) / "stokowski_workspaces"
 
 
@@ -162,6 +150,12 @@ class AgentConfig:
 
 
 @dataclass
+class ServerConfig:
+    port: int | None = None
+    host: str | None = None
+
+
+@dataclass
 class DockerConfig:
     """Docker isolation settings for agent containers."""
     enabled: bool = False
@@ -179,33 +173,6 @@ class DockerConfig:
 
 
 @dataclass
-class ServerConfig:
-    port: int | None = None
-    host: str | None = None
-
-
-@dataclass
-class LoggingConfig:
-    """Agent run log retention configuration."""
-    enabled: bool = False
-    log_dir: str = ""
-    max_age_days: int = 14
-    max_total_size_mb: int = 500
-
-    def resolved_log_dir(self, base: Path | None = None) -> Path:
-        """Resolve ~ and $VAR in log_dir.
-
-        Args:
-            base: Base directory for resolving relative paths (e.g. workflow dir).
-        """
-        expanded = os.path.expanduser(os.path.expandvars(self.log_dir))
-        p = Path(expanded)
-        if not p.is_absolute() and base:
-            p = base / p
-        return p
-
-
-@dataclass
 class LinearStatesConfig:
     """Maps logical state names to actual Linear state names."""
     todo: str = "Todo"
@@ -220,7 +187,6 @@ class LinearStatesConfig:
 @dataclass
 class PromptsConfig:
     """Prompt file references."""
-    evaluator_prompt: str | None = None
     global_prompt: str | list[str] | None = None
 
 
@@ -242,12 +208,9 @@ class StateConfig:
     permission_mode: str | None = None
     allowed_tools: list[str] | None = None
     rework_to: str | None = None     # gate only
-    max_rework: int | None = None    # gate only; also used for agent-initiated rework cap
-    skip_labels: list[str] = field(default_factory=list)  # labels that auto-approve this gate
-    auto_approve: bool = False
+    max_rework: int | None = None    # gate only
     transitions: dict[str, str] = field(default_factory=dict)
     hooks: HooksConfig | None = None
-    docker_image: str | None = None           # Override default_image for this state
 
 
 @dataclass
@@ -265,9 +228,7 @@ class ProjectConfig:
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
     hooks: HooksConfig = field(default_factory=HooksConfig)
-    logging: LoggingConfig = field(default_factory=LoggingConfig)
     prompts: PromptsConfig = field(default_factory=PromptsConfig)
-    docker: DockerConfig = field(default_factory=DockerConfig)
     states: dict[str, StateConfig] = field(default_factory=dict)
     workflows: dict[str, WorkflowSpec] = field(default_factory=dict)
     routing: RoutingConfig = field(default_factory=RoutingConfig)
@@ -276,17 +237,6 @@ class ProjectConfig:
     workflow_dir: Path = field(default_factory=lambda: Path("."))
     # Per-project cap (overrides AgentConfig.max_concurrent_per_project[name]).
     max_concurrent: int | None = None
-    workflows: dict[str, WorkflowConfig] = field(default_factory=dict)
-    repos: dict[str, RepoConfig] = field(default_factory=dict)
-    # Set by the parser: True when the repos: section was absent from the
-    # source YAML and a synthetic `_default` entry was generated for backward
-    # compatibility. Operators should never set this field directly.
-    repos_synthesized: bool = False
-
-    @property
-    def docker_if_enabled(self) -> DockerConfig | None:
-        """Return docker config only when enabled, else None."""
-        return self.docker if self.docker.enabled else None
 
     def resolved_api_key(self) -> str:
         key = self.tracker.api_key
@@ -309,87 +259,12 @@ class ProjectConfig:
         env["STOKOWSKI_PROJECT"] = self.name
         return env
 
-    def docker_env(self) -> dict[str, str]:
-        """Build minimal env vars for Docker agent containers.
-
-        Unlike agent_env() which inherits the full parent environment,
-        Docker mode only forwards explicitly declared variables to
-        maintain container isolation.
-        """
-        env: dict[str, str] = {}
-        api_key = self.resolved_api_key()
-        if api_key:
-            env["LINEAR_API_KEY"] = api_key
-        if self.tracker.project_slug:
-            env["LINEAR_PROJECT_SLUG"] = self.tracker.project_slug
-        if self.tracker.endpoint:
-            env["LINEAR_ENDPOINT"] = self.tracker.endpoint
-        if not self.docker.inherit_claude_config:
-            ak = os.environ.get("ANTHROPIC_API_KEY", "")
-            if ak:
-                env["ANTHROPIC_API_KEY"] = ak
-        for var_name in self.docker.extra_env:
-            if var_name in os.environ:
-                env[var_name] = os.environ[var_name]
-        return env
-
     @property
     def entry_state(self) -> str | None:
-        """Return the first agent state.
-
-        If workflows are defined, delegates to the default workflow's
-        entry_state. Otherwise falls back to scanning the states dict.
-        """
-        if self.workflows:
-            for wf in self.workflows.values():
-                if wf.default:
-                    return wf.entry_state or None
-            # No default workflow — fall through to legacy scan
         for name, sc in self.states.items():
-            if sc.type in ("agent", "evaluator"):
+            if sc.type == "agent":
                 return name
         return None
-
-    def resolve_workflow(self, issue: Issue) -> WorkflowConfig:
-        """Resolve which workflow applies to an issue based on its labels.
-
-        Iterates workflows and checks if the workflow's label matches any
-        of the issue's labels (case-insensitive). First match wins.
-        Falls back to the workflow marked ``default=True``.
-        Raises ValueError if no default workflow is configured.
-        """
-        issue_labels_lower = [l.lower() for l in issue.labels]
-        for wf in self.workflows.values():
-            if wf.label is not None and wf.label.lower() in issue_labels_lower:
-                return wf
-        # No label match — return default
-        for wf in self.workflows.values():
-            if wf.default:
-                return wf
-        raise ValueError("No default workflow configured")
-
-    def resolve_repo(self, issue: Issue) -> RepoConfig:
-        """Resolve which repo applies to an issue based on its labels.
-
-        Mirrors ``resolve_workflow``: iterate repos, case-insensitive label
-        match (first wins), then fall back to the repo marked ``default=True``.
-
-        For legacy configs (``repos_synthesized=True``) there is exactly one
-        repo (``_default``) marked ``default=True``, so any issue resolves
-        to it.
-        """
-        issue_labels_lower = [l.lower() for l in issue.labels]
-        for repo in self.repos.values():
-            if repo.label is not None and repo.label.lower() in issue_labels_lower:
-                return repo
-        for repo in self.repos.values():
-            if repo.default:
-                return repo
-        raise ValueError("No default repo configured")
-
-    def get_workflow(self, name: str) -> WorkflowConfig | None:
-        """Look up a workflow by name. Returns None if not found."""
-        return self.workflows.get(name)
 
     def all_states(self) -> dict[str, StateConfig]:
         """Every state across every workflow.
@@ -415,7 +290,7 @@ class ProjectConfig:
         if ls.todo and ls.todo not in seen:
             seen.append(ls.todo)
         for sc in self.all_states().values():
-            if sc.type in ("agent", "evaluator"):
+            if sc.type == "agent":
                 linear_name = _resolve_linear_state_name(sc.linear_state, ls)
                 if linear_name and linear_name not in seen:
                     seen.append(linear_name)
@@ -456,6 +331,7 @@ class ServiceConfig:
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
+    docker: DockerConfig = field(default_factory=DockerConfig)
     linear_states: LinearStatesConfig = field(default_factory=LinearStatesConfig)
     prompts: PromptsConfig = field(default_factory=PromptsConfig)
     states: dict[str, StateConfig] = field(default_factory=dict)
@@ -463,6 +339,35 @@ class ServiceConfig:
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     projects: list[ProjectConfig] = field(default_factory=list)
     workflow_dir: Path = field(default_factory=lambda: Path("."))
+
+    @property
+    def docker_if_enabled(self) -> "DockerConfig | None":
+        """Return docker config only when enabled, else None."""
+        return self.docker if self.docker.enabled else None
+
+    def docker_env(self) -> dict[str, str]:
+        """Build minimal env vars for Docker agent containers.
+
+        Unlike agent_env() which inherits the full parent environment,
+        Docker mode only forwards explicitly declared variables to
+        maintain container isolation.
+        """
+        env: dict[str, str] = {}
+        api_key = self.resolved_api_key()
+        if api_key:
+            env["LINEAR_API_KEY"] = api_key
+        if self.tracker.project_slug:
+            env["LINEAR_PROJECT_SLUG"] = self.tracker.project_slug
+        if self.tracker.endpoint:
+            env["LINEAR_ENDPOINT"] = self.tracker.endpoint
+        if not self.docker.inherit_claude_config:
+            ak = os.environ.get("ANTHROPIC_API_KEY", "")
+            if ak:
+                env["ANTHROPIC_API_KEY"] = ak
+        for var_name in self.docker.extra_env:
+            if var_name in os.environ:
+                env[var_name] = os.environ[var_name]
+        return env
 
     def resolved_api_key(self) -> str:
         # Legacy passthrough — delegates to first project.
@@ -552,8 +457,6 @@ def _resolve_linear_state_name(key: str, ls: LinearStatesConfig) -> str:
         "review": ls.review,
         "gate_approved": ls.gate_approved,
         "rework": ls.rework,
-        "todo": ls.todo,
-        "terminal": ls.terminal[0] if ls.terminal else "Done",
     }
     return mapping.get(key, key)
 
@@ -628,16 +531,13 @@ def _parse_state_config(name: str, raw: dict[str, Any]) -> StateConfig:
         fallback_model=raw.get("fallback_model"),
         turn_timeout_ms=raw.get("turn_timeout_ms"),
         stall_timeout_ms=raw.get("stall_timeout_ms"),
-        session=str(raw.get("session", "fresh" if raw.get("type") == "evaluator" else "inherit")),
+        session=str(raw.get("session", "inherit")),
         permission_mode=raw.get("permission_mode"),
         allowed_tools=_coerce_list(allowed) if allowed is not None else None,
         rework_to=raw.get("rework_to"),
         max_rework=raw.get("max_rework"),
-        skip_labels=_coerce_list(raw.get("skip_labels")),
-        auto_approve=bool(raw.get("auto_approve", False)),
         transitions=raw.get("transitions") or {},
         hooks=_parse_hooks(hooks_raw) if hooks_raw else None,
-        docker_image=raw.get("docker_image") or (raw.get("docker", {}) or {}).get("image"),
     )
 
 
@@ -889,7 +789,7 @@ def _legacy_project_name(tracker_raw: dict[str, Any], workflow_path: Path) -> st
     return "default"
 
 
-def parse_workflow_file(path: str | Path) -> ParsedConfig:
+def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
     """Parse a workflow file (.yaml/.yml or .md with front matter) into config."""
     path = Path(path)
     workflow_dir = path.parent
@@ -930,15 +830,6 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
     )
     s = config_raw.get("server", {}) or {}
     server = ServerConfig(port=s.get("port"), host=s.get("host"))
-
-    # Parse logging
-    lg = config_raw.get("logging", {}) or {}
-    logging_cfg = LoggingConfig(
-        enabled=bool(lg.get("enabled", False)),
-        log_dir=str(lg.get("log_dir", "")),
-        max_age_days=_coerce_int(lg.get("max_age_days"), 14),
-        max_total_size_mb=_coerce_int(lg.get("max_total_size_mb"), 500),
-    )
 
     # Resolve projects list (multi-project) or synthesize from top-level (legacy)
     projects_raw = config_raw.get("projects")
@@ -989,99 +880,25 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
         name = _legacy_project_name(tracker_raw, path)
         projects.append(_build_project(name, synthetic_raw, {}, workflow_dir))
 
+    # Parse docker (fork feature: agent container isolation)
+    dk = config_raw.get("docker", {}) or {}
+    docker = DockerConfig(
+        enabled=bool(dk.get("enabled", False)),
+        default_image=str(dk.get("default_image", "")),
+        inherit_claude_config=bool(dk.get("inherit_claude_config", True)),
+        host_claude_dir=str(dk.get("host_claude_dir", "~/.claude")),
+        host_claude_dir_mount=str(dk.get("host_claude_dir_mount", "")),
+        plugin_shim_host_path=str(dk.get("plugin_shim_host_path", "")),
+        plugin_shim_container_path=str(dk.get("plugin_shim_container_path", "")),
+        extra_env=_coerce_list(dk.get("extra_env")),
+        extra_volumes=_coerce_list(dk.get("extra_volumes")),
+        volume_prefix=str(dk.get("volume_prefix", "stokowski-ws")),
+        sessions_volume=str(dk.get("sessions_volume", "stokowski-sessions")),
+        init=bool(dk.get("init", True)),
+    )
+
     # Populate top-level fields from projects[0] for backward compat.
     p0 = projects[0]
-    # Parse workflows
-    workflows_raw = config_raw.get("workflows", {}) or {}
-    workflows: dict[str, WorkflowConfig] = {}
-
-    if workflows_raw:
-        # Multi-workflow mode: parse each workflow entry
-        for wf_name, wf_data in workflows_raw.items():
-            wd = wf_data or {}
-            label = wd.get("label")
-            default = bool(wd.get("default", False))
-            triage = bool(wd.get("triage", False))
-            path = _coerce_list(wd.get("path"))
-            terminal_state = str(wd.get("terminal_state", "terminal"))
-            transitions = derive_workflow_transitions(path, states)
-            # Find entry_state: first agent/evaluator state in path
-            entry = ""
-            for name in path:
-                sc = states.get(name)
-                if sc and sc.type in ("agent", "evaluator"):
-                    entry = name
-                    break
-            workflows[wf_name] = WorkflowConfig(
-                name=wf_name,
-                label=label,
-                default=default,
-                path=path,
-                terminal_state=terminal_state,
-                transitions=transitions,
-                entry_state=entry,
-                triage=triage,
-            )
-    else:
-        # Legacy/backward compat: synthesize a single _default workflow
-        # using StateConfig.transitions verbatim (do NOT call derive_workflow_transitions)
-        path = list(states.keys())
-        transitions = {name: dict(sc.transitions) for name, sc in states.items()}
-        entry = ""
-        for name, sc in states.items():
-            if sc.type in ("agent", "evaluator"):
-                entry = name
-                break
-        workflows["_default"] = WorkflowConfig(
-            name="_default",
-            label=None,
-            default=True,
-            path=path,
-            terminal_state="terminal",
-            transitions=transitions,
-            entry_state=entry,
-        )
-
-    # Parse repos registry. Synthesize a _default entry when the section
-    # is absent OR explicitly empty — both cases are treated as "no multi-repo
-    # configured" and fall back to the single-repo legacy path. Explicit
-    # empty emits a warning since it's likely an operator mistake.
-    repos_raw = config_raw.get("repos", None)
-    repos: dict[str, RepoConfig] = {}
-    repos_synthesized = False
-
-    if isinstance(repos_raw, dict) and repos_raw:
-        # Explicit registry with at least one entry
-        for repo_name, repo_data in repos_raw.items():
-            rd = repo_data or {}
-            repos[repo_name] = RepoConfig(
-                name=repo_name,
-                label=rd.get("label"),
-                clone_url=str(rd.get("clone_url", "")),
-                default=bool(rd.get("default", False)),
-                docker_image=rd.get("docker_image"),
-            )
-    else:
-        # Absent OR explicit empty dict — synthesize _default for backward compat.
-        # Mirrors the multi-workflow _default synthesis at the workflows
-        # branch above. The synthetic entry carries sentinel values
-        # (empty clone_url, None label) and is exempt from R21 validation.
-        if repos_raw is not None:
-            # Explicit empty dict — operator probably meant to populate this.
-            log.warning(
-                "repos: section is present but empty — treating as legacy "
-                "single-repo config. Populate entries to enable multi-repo "
-                "routing, or remove the section to silence this warning."
-            )
-        repos["_default"] = RepoConfig(
-            name="_default",
-            label=None,
-            clone_url="",
-            default=True,
-            docker_image=None,
-        )
-        repos_synthesized = True
-
     cfg = ServiceConfig(
         tracker=p0.tracker,
         polling=polling,
@@ -1090,9 +907,7 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
         claude=p0.claude,
         agent=agent,
         server=server,
-        logging=logging_cfg,
         docker=docker,
-        workflows=workflows,
         linear_states=p0.linear_states,
         prompts=p0.prompts,
         states=p0.states,
@@ -1102,11 +917,9 @@ def parse_workflow_file(path: str | Path) -> ParsedConfig:
         routing=p0.routing,
         projects=projects,
         workflow_dir=workflow_dir,
-        repos=repos,
-        repos_synthesized=repos_synthesized,
     )
 
-    return ParsedConfig(config=cfg, prompt_template=prompt_template)
+    return WorkflowDefinition(config=cfg, prompt_template=prompt_template)
 
 
 def _prompt_exists(workflow_dir: Path, prompt: str) -> bool:
@@ -1120,9 +933,6 @@ def _prompt_exists(workflow_dir: Path, prompt: str) -> bool:
 def _validate_project(project: ProjectConfig, errors: list[str]) -> None:
     """Validate a single project's state machine and tracker."""
     prefix = f"project '{project.name}'"
-
-    # Detect legacy vs multi-workflow mode
-    is_legacy = len(cfg.workflows) == 1 and "_default" in cfg.workflows
 
     if project.tracker.kind != "linear":
         errors.append(f"{prefix}: unsupported tracker kind: {project.tracker.kind}")
@@ -1199,7 +1009,7 @@ def _validate_states(
     all_state_names = set(states.keys())
 
     for name, sc in states.items():
-        if sc.type not in ("agent", "gate", "terminal", "evaluator"):
+        if sc.type not in ("agent", "gate", "terminal"):
             errors.append(f"{prefix} state '{name}': invalid type: {sc.type}")
             continue
 
@@ -1216,33 +1026,15 @@ def _validate_states(
                 )
 
         elif sc.type == "gate":
-            if is_legacy:
-                # Gates must have rework_to
-                if not sc.rework_to:
-                    errors.append(f"Gate state '{name}' is missing 'rework_to' field")
-                elif sc.rework_to not in all_state_names:
-                    errors.append(
-                        f"Gate state '{name}' rework_to target '{sc.rework_to}' "
-                        f"is not a defined state"
-                    )
-                # Gates must have approve transition
-                if "approve" not in sc.transitions:
-                    errors.append(f"Gate state '{name}' is missing 'approve' transition")
-            # (in multi-workflow mode, gate rework_to and approve are validated per-workflow below)
-
-        elif sc.type == "evaluator":
-            has_agent = True
-            if not sc.prompt and not cfg.prompts.evaluator_prompt:
+            if not sc.rework_to:
+                errors.append(f"{prefix} state '{name}': gate missing 'rework_to' field")
+            elif sc.rework_to not in all_state_names:
                 errors.append(
-                    f"Evaluator state '{name}' has no prompt and no "
-                    f"prompts.evaluator_prompt default"
+                    f"{prefix} state '{name}': rework_to target '{sc.rework_to}' "
+                    f"is not a defined state"
                 )
-            if sc.session != "fresh":
-                log.warning(
-                    "Evaluator state '%s' has session='%s' — "
-                    "evaluators should use session='fresh' for independent review",
-                    name, sc.session,
-                )
+            if "approve" not in sc.transitions:
+                errors.append(f"{prefix} state '{name}': gate missing 'approve' transition")
 
         elif sc.type == "terminal":
             has_terminal = True
@@ -1265,167 +1057,19 @@ def _validate_states(
     if not has_terminal:
         errors.append(f"{prefix}: no terminal states defined")
 
-    # In multi-workflow mode, error if any StateConfig has explicit transitions
-    if not is_legacy:
-        for name, sc in cfg.states.items():
-            if sc.transitions:
-                errors.append(
-                    f"State '{name}' has explicit transitions in multi-workflow mode; "
-                    f"transitions are derived from workflow paths"
-                )
+    # Warn about unreachable states
+    entry = next((n for n, sc in states.items() if sc.type == "agent"), None)
+    reachable: set[str] = set()
+    if entry:
+        reachable.add(entry)
+    for sc in states.values():
+        for target in sc.transitions.values():
+            reachable.add(target)
+        if sc.rework_to:
+            reachable.add(sc.rework_to)
+    for name in all_state_names - reachable:
+        log.warning("project '%s' state '%s' is unreachable", project.name, name)
 
-    # --- Workflow validation ---
-    # Exactly one default workflow
-    default_count = sum(1 for wf in cfg.workflows.values() if wf.default)
-    if default_count == 0:
-        errors.append("No default workflow defined (exactly one workflow must have default: true)")
-    elif default_count > 1:
-        errors.append(
-            f"Multiple default workflows defined ({default_count}); "
-            f"exactly one workflow must have default: true"
-        )
-
-    # No duplicate labels across workflows
-    seen_labels: dict[str, str] = {}  # label -> workflow name
-    for wf in cfg.workflows.values():
-        if wf.label is not None:
-            label_lower = wf.label.lower()
-            if label_lower in seen_labels:
-                errors.append(
-                    f"Duplicate label '{wf.label}' on workflows "
-                    f"'{seen_labels[label_lower]}' and '{wf.name}'"
-                )
-            else:
-                seen_labels[label_lower] = wf.name
-
-    # Per-workflow validation
-    all_referenced_states: set[str] = set()
-    for wf in cfg.workflows.values():
-        # Every path entry must reference an existing state
-        for state_name in wf.path:
-            if state_name not in all_state_names:
-                errors.append(
-                    f"Workflow '{wf.name}' path references non-existent state '{state_name}'"
-                )
-
-        all_referenced_states.update(wf.path)
-
-        # Each workflow path must contain at least one agent state
-        has_path_agent = any(
-            cfg.states.get(s) and cfg.states[s].type in ("agent", "evaluator")
-            for s in wf.path
-        )
-        if not has_path_agent:
-            errors.append(
-                f"Workflow '{wf.name}' path contains no agent states "
-                f"(need at least one state with type 'agent')"
-            )
-
-        # Each workflow path must end with a terminal state
-        if wf.path:
-            last_state = wf.path[-1]
-            last_sc = cfg.states.get(last_state)
-            if last_sc and last_sc.type != "terminal":
-                errors.append(
-                    f"Workflow '{wf.name}' path must end with a terminal state "
-                    f"('{last_state}' has type '{last_sc.type}')"
-                )
-        else:
-            errors.append(f"Workflow '{wf.name}' has an empty path")
-
-        # Validate terminal_state key
-        valid_terminal_keys = {"terminal", "todo", "active", "review", "gate_approved", "rework"}
-        if wf.terminal_state not in valid_terminal_keys:
-            errors.append(
-                f"Workflow '{wf.name}' has invalid terminal_state: '{wf.terminal_state}' "
-                f"(must be a valid LinearStatesConfig key)"
-            )
-        if wf.terminal_state in ("active",):
-            log.warning(
-                "Workflow '%s' terminal_state resolves to an active state "
-                "('%s') — this could cause dispatch loops",
-                wf.name, wf.terminal_state,
-            )
-
-        # Gate validation within path context
-        for i, state_name in enumerate(wf.path):
-            sc = cfg.states.get(state_name)
-            if not sc or sc.type != "gate":
-                continue
-
-            # Gate must have resolvable approve (next state in path)
-            wf_transitions = wf.transitions.get(state_name, {})
-            if "approve" not in wf_transitions:
-                errors.append(
-                    f"Gate '{state_name}' in workflow '{wf.name}' has no resolvable "
-                    f"approve transition (no next state in path)"
-                )
-
-            # Gate must have resolvable rework_to
-            if "rework_to" not in wf_transitions:
-                # Check if the gate's StateConfig.rework_to is set
-                if not sc.rework_to:
-                    errors.append(
-                        f"Gate '{state_name}' in workflow '{wf.name}' has no resolvable "
-                        f"rework_to (no explicit rework_to and no prior agent state in path)"
-                    )
-
-        # Evaluator validation within path context
-        for i, state_name in enumerate(wf.path):
-            sc = cfg.states.get(state_name)
-            if not sc or sc.type != "evaluator":
-                continue
-
-            next_in_path = wf.path[i + 1] if i + 1 < len(wf.path) else None
-            next_sc_in_path = cfg.states.get(next_in_path) if next_in_path else None
-            if not next_sc_in_path or next_sc_in_path.type != "gate":
-                errors.append(
-                    f"Evaluator state '{state_name}' in workflow '{wf.name}' "
-                    f"must be immediately followed by a gate state in the path"
-                )
-
-        # Per-workflow reachability: walk this workflow's transition graph
-        wf_entry = wf.entry_state
-        wf_reachable: set[str] = set()
-        if wf_entry:
-            wf_reachable.add(wf_entry)
-        for state_name, state_transitions in wf.transitions.items():
-            for target in state_transitions.values():
-                wf_reachable.add(target)
-        wf_path_set = set(wf.path)
-        wf_unreachable = wf_path_set - wf_reachable
-        for name in wf_unreachable:
-            log.warning(
-                "State '%s' is unreachable in workflow '%s' "
-                "(no transitions lead to it)",
-                name, wf.name,
-            )
-
-    # Warn if a state in the pool is not referenced by any workflow path
-    unreferenced = all_state_names - all_referenced_states
-    for name in unreferenced:
-        log.warning(
-            "State '%s' is defined but not referenced by any workflow path", name
-        )
-
-    # Legacy mode: also run the original unreachable-states check using
-    # StateConfig.transitions (the synthesized _default workflow copies them
-    # verbatim, so the per-workflow check above covers this — but we keep
-    # the original check for backward compatibility in case the logic diverges)
-    if is_legacy:
-        entry = cfg.entry_state
-        reachable: set[str] = set()
-        if entry:
-            reachable.add(entry)
-        for sc in cfg.states.values():
-            for target in sc.transitions.values():
-                reachable.add(target)
-            if sc.rework_to:
-                reachable.add(sc.rework_to)
-
-        unreachable = all_state_names - reachable
-        for name in unreachable:
-            log.warning("State '%s' is unreachable (no transitions lead to it)", name)
 
 def validate_config(cfg: ServiceConfig) -> list[str]:
     """Validate state machine config for dispatch readiness. Returns list of errors."""
@@ -1435,254 +1079,4 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
         return errors
     for project in cfg.projects:
         _validate_project(project, errors)
-    # Docker validation
-    if cfg.docker.enabled:
-        if not cfg.docker.default_image:
-            errors.append("docker.enabled is true but docker.default_image is not set")
-        if cfg.docker.inherit_claude_config:
-            host_dir = os.path.expandvars(os.path.expanduser(cfg.docker.host_claude_dir))
-            # Only warn if running locally — in DooD mode this is a host path
-            # that won't exist inside the orchestrator container
-            if not os.environ.get("HOST_HOME") and not Path(host_dir).exists():
-                log.warning(
-                    "docker.host_claude_dir '%s' does not exist — "
-                    "agents may fail to authenticate",
-                    host_dir,
-                )
-            # In DooD mode (orchestrator inside a container), the orchestrator
-            # cannot write host-visible temp files without an operator-provided
-            # shim. Require explicit shim config whenever a Claude Code state
-            # exists — Codex-only workflows don't consume plugin config and are
-            # exempt from the shim requirement.
-            if os.path.exists("/.dockerenv"):
-                claude_states = [
-                    name for name, sc in cfg.states.items()
-                    if sc.type == "agent" and sc.runner == "claude"
-                ]
-                if claude_states:
-                    missing = []
-                    if not cfg.docker.host_claude_dir_mount:
-                        missing.append("docker.host_claude_dir_mount")
-                    if not cfg.docker.plugin_shim_host_path:
-                        missing.append("docker.plugin_shim_host_path")
-                    if not cfg.docker.plugin_shim_container_path:
-                        missing.append("docker.plugin_shim_container_path")
-                    if missing:
-                        state_list = ", ".join(sorted(claude_states))
-                        errors.append(
-                            "Docker-in-Docker mode detected with inherit_claude_config: true "
-                            f"and Claude Code state(s) present ({state_list}), "
-                            f"but required shim fields are not set: {', '.join(missing)}. "
-                            "These fields are needed to rewrite plugin paths without touching "
-                            "host files. See CLAUDE.md (Docker mode) for setup."
-                        )
-    for name, sc in cfg.states.items():
-        if sc.docker_image and not cfg.docker.enabled:
-            log.warning(
-                "State '%s' has docker_image set but docker.enabled is false", name
-            )
-        if sc.skip_labels and sc.type != "gate":
-            log.warning(
-                "State '%s' has skip_labels but is not a gate — labels will be ignored",
-                name,
-            )
-        if sc.auto_approve and sc.type != "evaluator":
-            log.warning(
-                "State '%s' has auto_approve but is not an evaluator — flag will be ignored",
-                name,
-            )
-
-    # Warn if max_concurrent_agents_by_state keys don't match state names
-    for state_key in cfg.agent.max_concurrent_agents_by_state:
-        if state_key not in cfg.states:
-            log.warning(
-                "max_concurrent_agents_by_state key '%s' does not match any defined state",
-                state_key,
-            )
-
-    # Validate logging
-    if cfg.logging.enabled and not cfg.logging.log_dir:
-        log.warning("logging.enabled is true but log_dir is not set")
-
-    # --- Multi-repo validation (R21) ---
-    errors.extend(_validate_repos(cfg))
-
     return errors
-
-
-_VALID_CLONE_URL_SCHEMES = ("https://", "ssh://", "git@")
-_CREDENTIAL_URL_RE = re.compile(r"^[^:]+://[^/]*:[^@]+@")
-_PATH_SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._\-]+$")
-_RESERVED_LABEL_PREFIXES = ("workflow:", "repo:")
-_RESERVED_REPO_NAME = "_default"
-
-
-def _validate_repos(cfg: ServiceConfig) -> list[str]:
-    """R21 validation for the repos: registry. Returns list of errors.
-
-    Warnings are logged directly at WARNING level and do not populate the
-    returned list. The synthetic ``_default`` repo (cfg.repos_synthesized)
-    is exempt from integrity and path-safety checks.
-    """
-    errors: list[str] = []
-
-    # Empty cfg.repos is treated as "no multi-repo configured" (equivalent to
-    # legacy-synthesized). This only happens when a test builds ServiceConfig
-    # directly without going through parse_workflow_file; parsed configs
-    # always have at least the synthetic _default.
-    if not cfg.repos:
-        return errors
-
-    # Repo entry integrity + path safety + reserved-name check
-    seen_labels: dict[str, str] = {}
-    default_count = 0
-    for name, repo in cfg.repos.items():
-        is_synthetic_default = (
-            cfg.repos_synthesized and name == _RESERVED_REPO_NAME
-        )
-
-        # Path safety: registry name must match the sanitize_key regex so the
-        # composite workspace key is safe for filesystem paths.
-        if not _PATH_SAFE_NAME_RE.match(name):
-            errors.append(
-                f"Repo name '{name}' contains invalid characters "
-                f"(must match [A-Za-z0-9._-])"
-            )
-
-        # Operator-authored repos may not use the reserved _default name.
-        if name == _RESERVED_REPO_NAME and not cfg.repos_synthesized:
-            errors.append(
-                f"Repo name '_default' is reserved for the legacy synthesis "
-                f"branch; rename this entry (e.g., 'default-repo')"
-            )
-
-        if is_synthetic_default:
-            # Exempt from non-empty checks and duplicate-label checks.
-            if repo.default:
-                default_count += 1
-            continue
-
-        # Non-empty clone_url and label
-        if not repo.clone_url:
-            errors.append(f"Repo '{name}' has empty clone_url")
-        if not repo.label:
-            errors.append(f"Repo '{name}' has empty label")
-
-        # clone_url scheme check
-        if repo.clone_url:
-            if repo.clone_url.startswith("file://"):
-                errors.append(
-                    f"Repo '{name}' clone_url uses file:// scheme "
-                    f"(rejected for safety)"
-                )
-            elif _CREDENTIAL_URL_RE.match(repo.clone_url):
-                errors.append(
-                    f"Repo '{name}' clone_url contains embedded credentials "
-                    f"(user:pass@host); move credentials to a git credential "
-                    f"helper or an environment variable"
-                )
-            elif not repo.clone_url.startswith(_VALID_CLONE_URL_SCHEMES):
-                errors.append(
-                    f"Repo '{name}' clone_url must use https://, ssh://, or "
-                    f"git@ form (got: {repo.clone_url[:40]!r})"
-                )
-
-        # Unique labels across repos (case-insensitive)
-        if repo.label:
-            label_lower = repo.label.lower()
-            if label_lower in seen_labels:
-                errors.append(
-                    f"Duplicate repo label '{repo.label}' on repos "
-                    f"'{seen_labels[label_lower]}' and '{name}'"
-                )
-            else:
-                seen_labels[label_lower] = name
-
-        if repo.default:
-            default_count += 1
-
-    # Default constraint
-    if default_count > 1:
-        errors.append(
-            f"Multiple default repos defined ({default_count}); "
-            f"at most one repo may have default: true"
-        )
-
-    # Single-repo configs must mark their one repo as default. This enforces
-    # R3's "trivially defaulted" case explicitly rather than inferring it.
-    non_synthetic = [
-        r for n, r in cfg.repos.items()
-        if not (cfg.repos_synthesized and n == _RESERVED_REPO_NAME)
-    ]
-    if len(non_synthetic) == 1 and not non_synthetic[0].default:
-        errors.append(
-            f"Repo '{non_synthetic[0].name}' is the only repo defined but is "
-            f"not marked default: true; single-repo configs must mark their "
-            f"sole repo as default"
-        )
-
-    # Triage requirement: multi-repo (excluding synthetic) + no default →
-    # require exactly one workflow with triage=True so unlabeled tickets can
-    # be routed through triage to acquire a repo:* label.
-    if len(non_synthetic) > 1 and default_count == 0:
-        triage_workflows = [
-            wf for wf in cfg.workflows.values() if wf.triage
-        ]
-        if len(triage_workflows) == 0:
-            errors.append(
-                "Multi-repo config with no default repo requires exactly one "
-                "workflow with triage: true to route unlabeled tickets "
-                "(found: 0 triage workflows)"
-            )
-        elif len(triage_workflows) > 1:
-            names = ", ".join(sorted(w.name for w in triage_workflows))
-            errors.append(
-                f"Exactly one workflow may have triage: true "
-                f"(found {len(triage_workflows)}: {names})"
-            )
-
-    # Reserved-prefix warning: warn on operator-declared labels that
-    # near-match stokowski's reserved namespaces (typo protection). Checked
-    # across workflows and repos; emitted at WARNING level.
-    for prefix in _RESERVED_LABEL_PREFIXES:
-        near_match_typos = _near_match_prefixes(prefix)
-        for wf in cfg.workflows.values():
-            if wf.label and any(
-                wf.label.lower().startswith(t) for t in near_match_typos
-            ):
-                log.warning(
-                    "Workflow '%s' label '%s' looks like a near-match to "
-                    "the reserved prefix '%s' — typo?",
-                    wf.name, wf.label, prefix,
-                )
-        for repo in cfg.repos.values():
-            if repo.label and any(
-                repo.label.lower().startswith(t) for t in near_match_typos
-            ):
-                log.warning(
-                    "Repo '%s' label '%s' looks like a near-match to the "
-                    "reserved prefix '%s' — typo?",
-                    repo.name, repo.label, prefix,
-                )
-
-    return errors
-
-
-def _near_match_prefixes(prefix: str) -> list[str]:
-    """Generate simple transposition/typo variants of a reserved prefix.
-
-    Covers common typos: single-char transposition and trailing-s variants.
-    Not exhaustive — only catches the obvious mistakes an operator might make.
-    """
-    variants: set[str] = set()
-    base = prefix.rstrip(":")  # "workflow" / "repo"
-    # Swap adjacent characters (one pair at a time)
-    for i in range(len(base) - 1):
-        swapped = list(base)
-        swapped[i], swapped[i + 1] = swapped[i + 1], swapped[i]
-        variant = "".join(swapped) + ":"
-        if variant != prefix:
-            variants.add(variant)
-    # Trailing-s plural (e.g., repos: instead of repo:)
-    variants.add(base + "s:")
-    return list(variants)

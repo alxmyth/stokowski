@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import signal
@@ -12,121 +11,33 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from jinja2 import (
-    Environment,
-    StrictUndefined,
-    TemplateSyntaxError,
-    UndefinedError,
-)
+from jinja2 import Environment, StrictUndefined, TemplateSyntaxError
 
 from .config import (
     ClaudeConfig,
     HooksConfig,
     ProjectConfig,
-    RepoConfig,
     ServiceConfig,
     StateConfig,
-    ParsedConfig,
-    _resolve_linear_state_name,
-    WorkflowConfig,
+    WorkflowDefinition,
     _resolve_linear_state_name,
     merge_state_config,
     parse_workflow_file,
     validate_config,
 )
-from .docker_runner import (
-    check_docker_available,
-    cleanup_orphaned_containers,
-    cleanup_orphaned_volumes,
-    kill_container,
-    pull_image,
-)
 from .linear import LinearClient
 from .models import Issue, RetryEntry, RunAttempt
 from .pool import ConcurrencyPool
-from .prompt import (
-    assemble_prompt,
-    build_lifecycle_section,
-    render_hook_template,
-    render_hooks_for_dispatch,
-)
+from .prompt import assemble_prompt, build_lifecycle_section
 from .runner import run_agent_turn, run_turn
-from .tracking import (
-    build_attachment_metadata,
-    has_pending_rejection,
-    make_evaluation_comment,
-    make_gate_comment,
-    make_migrated_comment,
-    make_rejection_comment,
-    parse_attachment_state,
-    parse_latest_tracking,
-)
+from .tracking import make_gate_comment, make_state_comment, parse_latest_tracking
 from . import artifacts as artifacts_mod
 from . import report as report_mod
 from .events import summarise_tool_input
 from .ledger import Ledger
-from .workspace import ensure_workspace, remove_workspace, sanitize_key
+from .workspace import ensure_workspace, remove_workspace
 
 logger = logging.getLogger("stokowski")
-
-
-def _resolve_docker_image(
-    state_cfg: StateConfig | None,
-    repo: RepoConfig,
-    platform_default: str,
-) -> str:
-    """3-level Docker image resolution (R8).
-
-    Precedence, most-specific first:
-    1. ``state_cfg.docker_image`` — team workflow stage declaration;
-       wins when the stage is repo-agnostic and the team wants the same
-       image everywhere.
-    2. ``repo.docker_image`` — repo registry entry default; used for
-       toolchain-bound stages on heterogeneous teams.
-    3. ``platform_default`` — the configured ``docker.default_image``
-       fallback.
-
-    Returns an empty string when no image is configured at any level;
-    the caller decides whether that's acceptable.
-    """
-    if state_cfg and state_cfg.docker_image:
-        return state_cfg.docker_image
-    if repo.docker_image:
-        return repo.docker_image
-    return platform_default or ""
-
-
-def _render_hooks_best_effort(
-    hooks: HooksConfig,
-    repo: RepoConfig,
-    synthesized: bool,
-) -> HooksConfig:
-    """Render hooks for teardown paths without aborting on UndefinedError.
-
-    Used from remove_workspace call sites where a mid-flight config typo
-    shouldn't prevent cleanup. The hook execution would fail anyway if the
-    typo is real, but we prefer a clean cleanup path over re-raising here.
-    """
-    try:
-        return render_hooks_for_dispatch(hooks, repo, synthesized)
-    except UndefinedError as e:
-        logger.warning(
-            "Hook rendering failed during teardown for repo=%s: %s — "
-            "passing raw hooks through (execution may fail)",
-            repo.name, e,
-        )
-        return hooks
-
-
-def _select_evaluator_transition(tier: str, auto_approve: bool) -> str:
-    """Choose transition name based on evaluation tier and gate config.
-
-    Returns "approve" only when tier is "approve" AND auto_approve is True.
-    All other cases return "complete" (enters the gate for human review).
-    """
-    if tier == "approve" and auto_approve:
-        return "approve"
-    return "complete"
 
 
 class Orchestrator:
@@ -148,7 +59,7 @@ class Orchestrator:
         legacy behaviour of `agent.max_concurrent_agents - len(running)`.
         """
         self.workflow_path = Path(workflow_path)
-        self.workflow: ParsedConfig | None = None
+        self.workflow: WorkflowDefinition | None = None
         self.project_name = project_name
         self.project: ProjectConfig | None = None
         self.pool = pool
@@ -180,7 +91,7 @@ class Orchestrator:
         self.ledger = Ledger.for_workflow(Path(self.workflow_path))
 
         # Internal
-        self._linear: LinearClient | None = None  # legacy single-client slot (Unit 5 removes)
+        self._linear: LinearClient | None = None
         self._tasks: dict[str, asyncio.Task] = {}
         self._retry_timers: dict[str, asyncio.TimerHandle] = {}
         self._child_pids: set[int] = set()  # Track claude subprocess PIDs
@@ -204,9 +115,6 @@ class Orchestrator:
         # "Entering state: implement" comments in 1.7 seconds.
         self._announced_states: set[tuple[str, str, int]] = set()
         self._pending_gates: dict[str, str] = {}           # issue_id -> gate state name
-        self._issue_workflow: dict[str, str] = {}          # issue_id -> workflow name
-        self._issue_repo: dict[str, str] = {}              # issue_id -> repo name (multi-repo)
-        self._issue_project: dict[str, str] = {}           # issue_id -> project_slug (multi-project)
 
         # Eligible-but-not-dispatched (queue panel data, refreshed each tick)
         self._queued: list[dict] = []
@@ -216,62 +124,9 @@ class Orchestrator:
         # worker is cancelled mid-flight from multiple paths.
         self._slot_held: set[str] = set()
 
-        # Cancellation tracking
-        self._force_cancelled: set[str] = set()  # issue_ids cancelled by reconciliation
-        self._background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
-
-        # R10 single-repo cap — the async rejection pre-pass populates this
-        # set before the synchronous eligibility loop runs; _is_eligible
-        # only observes membership (no I/O in the hot path). Label-change
-        # invalidation clears entries so dispatch resumes when operators fix
-        # the labels. Orchestrator restart loses the set, but the rejection
-        # pre-pass repopulates it on the first tick by scanning tracking
-        # comments via ``has_pending_rejection``.
-        self._rejected_issues: set[str] = set()
-
-        # Cold-start migration marker — tracks issue IDs for which we have
-        # posted a one-time migrated-comment during this orchestrator run,
-        # so a sequence of gate fetches on the same issue does not spam.
-        self._migrated_issues: set[str] = set()
-
-        # Config-error block set — populated when a dispatch fails due to a
-        # permanent config problem (hook template typo, Jinja2 syntax error).
-        # _is_eligible observes this to prevent retry loops on unrecoverable
-        # errors. Cleared on every successful _load_workflow so dispatch
-        # resumes when the operator fixes workflow.yaml. Also cleared on
-        # issue-labels change (_last_issues diff) in case the issue was
-        # moved to a different repo/workflow whose config is healthy.
-        self._config_blocked: set[str] = set()
-
-        # Rejection fetch-failure marker — when _process_rejections can't
-        # fetch comments for a dual-label issue, we fail closed (add to
-        # _rejected_issues) to prevent dispatching with arbitrary first-wins
-        # repo routing. This companion set tracks "pessimistic" rejections
-        # that should be re-evaluated on the next tick instead of sticking
-        # until labels change. See ADV-003.
-        self._rejection_fetch_pending: set[str] = set()
-
-        # Prior-tick labels snapshot — captured BEFORE _last_issues is
-        # updated on each tick. Consumed by _process_rejections to detect
-        # label changes since the previous tick (see COR-001). Keyed by
-        # issue id, holds the sorted lowercase label list from the prior
-        # tick's Issue. Empty on the first tick / orchestrator restart
-        # (which is correct: no prior tick to compare against).
-        self._prev_issue_labels: dict[str, list[str]] = {}
-
     @property
     def cfg(self) -> ServiceConfig:
-        """Transitional shim: returns the primary (first-loaded) project cfg.
-
-        Kept so the existing (mostly single-project) call sites and tests
-        continue to work during the Unit 5 sweep. Post-dispatch sites should
-        migrate to ``self._cfg_for_issue(issue_id)``; pre-dispatch shared-
-        globals sites should migrate to ``self._primary_cfg()`` explicitly.
-        Removed at the end of Unit 5.
-        """
-        if self.workflow is None and self.configs:
-            self.workflow = next(iter(self.configs.values()))
-        assert self.workflow is not None, "cfg accessed before _load_all_workflows()"
+        assert self.workflow is not None
         return self.workflow.config
 
     def _project_view(self, full: WorkflowDefinition, project: ProjectConfig) -> WorkflowDefinition:
@@ -297,13 +152,12 @@ class Orchestrator:
         )
         return WorkflowDefinition(config=project_cfg, prompt_template=full.prompt_template)
 
-    def _primary_cfg(self) -> ServiceConfig:
-        """Return the first-loaded project's config (for shared globals).
+    def _load_workflow(self) -> list[str]:
+        """Load/reload workflow file. Returns validation errors.
 
-        Shared globals (``agent.max_concurrent_agents``, ``server.port``) come
-        from whichever project file loaded first, case-insensitively sorted.
-        ``polling.interval_ms`` is NOT read from here — it's cached on
-        ``self._polling_interval_ms`` as the min across all files.
+        Resolves `self.project_name` to the matching ProjectConfig and
+        builds a per-project ServiceConfig view that the rest of the
+        orchestrator can read from via `self.cfg`.
         """
         try:
             full = parse_workflow_file(self.workflow_path)
@@ -440,242 +294,21 @@ class Orchestrator:
             self.pool.release(self.project_name or "")
 
     def _ensure_linear_client(self) -> LinearClient:
-        """Legacy single-client accessor.
-
-        Returns the primary project's client. Unit 5 sweep migrates callers
-        to ``_linear_client_for(project_slug)`` with an explicit slug. Kept
-        during Unit 2-4 so existing call sites in the orchestrator keep
-        working before the sweep.
-
-        Test stub support: if ``self._linear`` is set explicitly (as
-        existing tests do), it takes priority — this lets tests continue to
-        stub a single client against the primary project.
-        """
-        if self._linear is not None:
-            return self._linear
-        if not self.configs:
+        if self._linear is None:
             self._linear = LinearClient(
                 endpoint=self.cfg.tracker.endpoint,
                 api_key=self.cfg.resolved_api_key(),
             )
-            return self._linear
-        primary_slug = next(iter(self.configs.keys()))
-        return self._linear_client_for(primary_slug)
-
-    # -- Kill / cleanup helpers --
-
-    @staticmethod
-    def _kill_pid(pid: int) -> None:
-        """Kill a process by PID. Send SIGKILL to process group, fall back to individual kill.
-
-        os.killpg(SIGKILL) is atomic for the process group. Claude Code runs
-        with start_new_session=True (its own pgrp), so this kills the agent
-        and any direct children.
-        """
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-
-    async def _kill_worker(self, issue_id: str, reason: str) -> None:
-        """Kill a running worker: subprocess, container, then async task.
-
-        Order matters: the subprocess must be killed BEFORE the task is
-        cancelled, because CancelledError does not propagate to child processes.
-        Handles missing RunAttempt gracefully (e.g., for gated issues).
-        """
-        attempt = self.running.get(issue_id)
-
-        # 1. Kill subprocess PID (must happen first)
-        if attempt and attempt.pid:
-            self._kill_pid(attempt.pid)
-            self._child_pids.discard(attempt.pid)
-
-        # 2. Kill Docker container
-        if attempt and attempt.container_name:
-            try:
-                await kill_container(attempt.container_name)
-            except Exception as exc:
-                logger.warning(
-                    f"Failed to kill container {attempt.container_name}: {exc}"
-                )
-
-        # 3. Cancel async task last
-        task = self._tasks.get(issue_id)
-        if task and not task.done():
-            task.cancel()
-
-        logger.info(f"Killed worker issue={issue_id} reason={reason}")
-
-    def _cleanup_issue_state(self, issue_id: str) -> None:
-        """Remove all per-issue tracking state. Idempotent — safe to call multiple times.
-
-        Any new per-issue state dict added to Orchestrator.__init__ must also
-        be added here.
-        """
-        # -- Core state machine --
-        self._issue_current_state.pop(issue_id, None)
-        self._issue_state_runs.pop(issue_id, None)
-        self._pending_gates.pop(issue_id, None)
-        self._issue_workflow.pop(issue_id, None)
-        self._issue_repo.pop(issue_id, None)
-        self._issue_project.pop(issue_id, None)
-        self._rejected_issues.discard(issue_id)
-        self._migrated_issues.discard(issue_id)
-        self._config_blocked.discard(issue_id)
-        self._rejection_fetch_pending.discard(issue_id)
-        self._prev_issue_labels.pop(issue_id, None)
-        # -- Session/timing --
-        self._last_session_ids.pop(issue_id, None)
-        self._last_completed_at.pop(issue_id, None)
-        # -- Issue cache --
-        self._last_issues.pop(issue_id, None)
-        # -- Retry --
-        timer = self._retry_timers.pop(issue_id, None)
-        if timer is not None:
-            timer.cancel()
-        self.retry_attempts.pop(issue_id, None)
-        # -- Dispatch --
-        self.running.pop(issue_id, None)
-        self._tasks.pop(issue_id, None)
-        self.claimed.discard(issue_id)
-
-    def _fire_and_forget(self, coro) -> None:
-        """Schedule a coroutine without awaiting it. Prevents GC of the task."""
-        task = asyncio.create_task(coro)
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-
-    def _client_for_issue(self, issue_id: str) -> LinearClient:
-        """Return the LinearClient for the project owning ``issue_id``.
-
-        Falls back to the legacy _ensure_linear_client() when the issue has
-        no project binding (pre-bind paths like _post_*_comment called from
-        error-handling blocks).
-        """
-        slug = self._issue_project.get(issue_id)
-        if slug and slug in self.configs:
-            return self._linear_client_for(slug)
-        return self._ensure_linear_client()
-
-    async def _upsert_state(
-        self,
-        issue: Issue,
-        metadata: dict,
-        comment: str | None = None,
-    ) -> None:
-        """Upsert the Stokowski attachment and optionally post a human comment."""
-        client = self._client_for_issue(issue.id)
-        state = metadata.get("state", "")
-        run = metadata.get("run", 1)
-        subtitle = f"{state} · run {run}"
-        await client.upsert_stokowski_attachment(
-            issue_id=issue.id,
-            identifier=issue.identifier,
-            metadata=metadata,
-            subtitle=subtitle,
-        )
-        if comment:
-            await client.post_comment(issue.id, comment)
-
-    async def _post_cancellation_comment(
-        self, issue_id: str, state_name: str
-    ) -> None:
-        """Post a best-effort tracking comment when an issue is cancelled."""
-        try:
-            client = self._client_for_issue(issue_id)
-            await client.post_comment(
-                issue_id,
-                f"[Stokowski] Agent terminated — issue moved to {state_name}.",
-            )
-        except Exception as e:
-            logger.debug(f"Failed to post cancellation comment for {issue_id}: {e}")
-
-    async def _post_hook_error_comment(self, issue_id: str, detail: str) -> None:
-        """Post a Linear comment when a hook template or hook execution fails."""
-        try:
-            client = self._client_for_issue(issue_id)
-            await client.post_comment(
-                issue_id, f"[Stokowski] {detail}"
-            )
-        except Exception as e:
-            logger.debug(f"Failed to post hook-error comment for {issue_id}: {e}")
-
-    async def _cleanup_logs(self) -> None:
-        """Run log retention cleanup. Best-effort — errors logged and swallowed.
-
-        Multi-project: iterate each project's logging config. Projects may
-        share a log_dir (union the exempt set) or use different dirs.
-        """
-        exempt = {
-            self.running[iid].issue_identifier
-            for iid in self.running
-            if self.running[iid].issue_identifier
-        }
-        for slug, parsed in self.configs.items():
-            pcfg = parsed.config
-            if not pcfg.logging.enabled or not pcfg.logging.log_dir:
-                continue
-            try:
-                workflow_dir = self._config_paths.get(slug, self.workflow_path).parent
-                log_dir = pcfg.logging.resolved_log_dir(workflow_dir)
-                if not log_dir.exists():
-                    continue
-                if pcfg.logging.max_age_days > 0:
-                    cleanup_old_logs(log_dir, pcfg.logging.max_age_days)
-                if pcfg.logging.max_total_size_mb > 0:
-                    enforce_size_limit(
-                        log_dir, pcfg.logging.max_total_size_mb, exempt
-                    )
-            except Exception as e:
-                logger.warning(f"Log retention cleanup failed for {slug}: {e}")
+        return self._linear
 
     async def start(self):
         """Start the orchestration loop."""
-        errors_by_slug = self._load_all_workflows()
-        if errors_by_slug:
-            for slug, errs in errors_by_slug.items():
-                for e in errs:
-                    logger.error(f"Config error ({slug}): {e}")
-            raise RuntimeError(f"Startup validation failed: {errors_by_slug}")
+        errors = self._load_workflow()
+        if errors:
+            for e in errors:
+                logger.error(f"Config error: {e}")
+            raise RuntimeError(f"Startup validation failed: {errors}")
 
-        # Startup filename → project_slug log (operators can see which file
-        # supplies shared globals).
-        primary_slug = next(iter(self.configs.keys()))
-        for slug, path in self._config_paths.items():
-            logger.info(
-                f"Loaded project file={path} slug={slug} primary={slug == primary_slug}"
-            )
-
-        # Docker startup checks — union of all docker-enabled projects.
-        docker_enabled_cfgs = [
-            p.config for p in self.configs.values() if p.config.docker.enabled
-        ]
-        if docker_enabled_cfgs:
-            ok, msg = await check_docker_available()
-            if not ok:
-                raise RuntimeError(f"Docker mode enabled but: {msg}")
-            # Pre-pull every image across the 3-level hybrid for every
-            # docker-enabled project.
-            images: set[str] = set()
-            for cfg in docker_enabled_cfgs:
-                if cfg.docker.default_image:
-                    images.add(cfg.docker.default_image)
-                for sc in cfg.states.values():
-                    if sc.docker_image:
-                        images.add(sc.docker_image)
-                for repo in cfg.repos.values():
-                    if repo.docker_image:
-                        images.add(repo.docker_image)
-            for img in images:
-                logger.info(f"Pulling Docker image: {img}")
-                if not await pull_image(img):
-                    logger.warning(f"Failed to pull image: {img} (may already be cached)")
-
-        primary = self._primary_cfg()
         logger.info(
             f"Starting orchestrator "
             f"project={self.project_name} "
@@ -701,12 +334,11 @@ class Orchestrator:
             except Exception as e:
                 logger.error(f"Tick error: {e}")
 
-            # Interruptible sleep — read the cached min polling interval so
-            # a hot-reload that changes the min is picked up next tick.
+            # Interruptible sleep
             try:
                 await asyncio.wait_for(
                     self._stop_event.wait(),
-                    timeout=self._polling_interval_ms / 1000,
+                    timeout=self.cfg.polling.interval_ms / 1000,
                 )
                 break  # stop_event was set
             except asyncio.TimeoutError:
@@ -729,17 +361,6 @@ class Orchestrator:
                     pass
         self._child_pids.clear()
 
-        # Kill Docker agent containers by label — if any project has docker
-        # enabled, run one cleanup pass (containers are labeled globally).
-        any_docker = any(
-            p.config.docker.enabled for p in self.configs.values()
-        )
-        if any_docker or (self.workflow and self.cfg.docker.enabled):
-            try:
-                await cleanup_orphaned_containers()
-            except Exception:
-                pass
-
         # Cancel async tasks
         for issue_id, task in list(self._tasks.items()):
             task.cancel()
@@ -748,280 +369,57 @@ class Orchestrator:
             await asyncio.sleep(0.5)
         self._tasks.clear()
 
-        # Close the legacy single-client slot AND every per-project client.
         if self._linear:
-            try:
-                await self._linear.close()
-            except Exception:
-                pass
-        for slug, client in list(self._linear_clients.items()):
-            try:
-                await client.close()
-            except Exception:
-                pass
-        self._linear_clients.clear()
+            await self._linear.close()
 
     async def _startup_cleanup(self):
-        """Remove workspaces for issues already in terminal states.
-
-        Multi-project: iterate each project, fetch its terminal issues via
-        its own client, remove workspaces using its repos/hooks. Docker
-        container cleanup runs once (containers are labeled globally).
-        Volume pruning unions active keys across every docker-enabled project
-        and prunes in a single pass.
-        """
-        any_docker = any(p.config.docker.enabled for p in self.configs.values())
-
-        if any_docker:
-            count = await cleanup_orphaned_containers()
-            if count:
-                logger.info(f"Killed {count} orphaned agent containers")
-
-        # Per-project terminal-issue workspace cleanup.
-        for slug, parsed in self.configs.items():
-            pcfg = parsed.config
-            try:
-                client = self._linear_client_for(slug)
-                terminal = await client.fetch_issues_by_states(
-                    pcfg.tracker.project_slug,
-                    pcfg.terminal_linear_states(),
-                )
-                ws_root = pcfg.workspace.resolved_root(
-                    self._config_paths.get(slug, self.workflow_path).parent
-                )
-                for issue in terminal:
-                    for repo in pcfg.repos.values():
-                        rendered_hooks = _render_hooks_best_effort(
-                            pcfg.hooks, repo, pcfg.repos_synthesized,
-                        )
-                        await remove_workspace(
-                            ws_root, issue.identifier, repo.name, rendered_hooks,
-                            docker_cfg=pcfg.docker_if_enabled,
-                        )
-            except Exception as e:
-                logger.warning(f"Startup cleanup failed for {slug} (continuing): {e}")
-
-        # Union Docker volume pruning across docker-enabled projects.
-        if any_docker:
-            try:
-                active_keys: set[str] = set()
-                from .workspace import compose_workspace_key
-                for issue_id, issue_obj in self._last_issues.items():
-                    # Resolve the issue's project; fall back to every project's
-                    # repos if binding not known (conservative union).
-                    slug = self._issue_project.get(issue_id)
-                    if slug and slug in self.configs:
-                        repos = self.configs[slug].config.repos.values()
-                    else:
-                        repos = (
-                            r
-                            for parsed in self.configs.values()
-                            for r in parsed.config.repos.values()
-                        )
-                    for repo in repos:
-                        active_keys.add(
-                            compose_workspace_key(issue_obj.identifier, repo.name).lower()
-                        )
-                # Use the first docker-enabled project's DockerConfig for the
-                # volume-cleanup call (volume labels are global).
-                docker_cfg_for_cleanup = next(
-                    p.config.docker
-                    for p in self.configs.values()
-                    if p.config.docker.enabled
-                )
-                removed = await cleanup_orphaned_volumes(docker_cfg_for_cleanup, active_keys)
-                if removed:
-                    logger.info(
-                        f"Pruned {removed} orphaned Docker workspace volume(s)"
-                    )
-            except Exception as e:
-                logger.warning(f"Docker volume cleanup failed (continuing): {e}")
-
-        await self._cleanup_logs()
-
-    def _cfg_for_issue_or_primary(self, issue_id: str) -> ServiceConfig:
-        """Variant of _cfg_for_issue that falls back to the primary cfg when
-        the issue has no project binding yet (cold-start / pre-bind paths)."""
-        slug = self._issue_project.get(issue_id)
-        if slug and slug in self.configs:
-            return self.configs[slug].config
-        return self._primary_cfg()
-
-    def _resolve_workflow(self, issue: Issue) -> WorkflowConfig:
-        """Resolve which workflow applies to an issue and cache the result.
-
-        Multi-project: uses the issue's OWN project config (workflows are
-        declared per-project).
-        """
-        cfg = self._cfg_for_issue_or_primary(issue.id)
-        workflow = cfg.resolve_workflow(issue)
-        self._issue_workflow[issue.id] = workflow.name
-        return workflow
-
-    def _get_issue_workflow_config(self, issue_id: str) -> WorkflowConfig:
-        """Look up the cached workflow for an issue, with fallbacks."""
-        cfg = self._cfg_for_issue_or_primary(issue_id)
-        cached_name = self._issue_workflow.get(issue_id)
-        if cached_name is not None:
-            wf = cfg.get_workflow(cached_name)
-            if wf is not None:
-                return wf
-            cached_issue = self._last_issues.get(issue_id)
-            if cached_issue is not None:
-                try:
-                    return self._resolve_workflow(cached_issue)
-                except ValueError:
-                    pass
-        for wf in cfg.workflows.values():
-            if wf.default:
-                return wf
-        if cfg.workflows:
-            return next(iter(cfg.workflows.values()))
-        raise RuntimeError("No workflows defined in config")
-
-    def _resolve_repo(self, issue: Issue) -> RepoConfig:
-        """Resolve which repo applies to an issue and cache the result."""
-        cfg = self._cfg_for_issue_or_primary(issue.id)
-        repo = cfg.resolve_repo(issue)
-        self._issue_repo[issue.id] = repo.name
-        return repo
-
-    def _repo_name_for_tracking(self, issue_id: str) -> str:
-        """Return the repo name to carry in a tracking comment payload."""
-        return self._get_issue_repo_config(issue_id).name
-
-    def _get_issue_repo_config(self, issue_id: str) -> RepoConfig:
-        """Look up the cached repo for an issue, with fallbacks."""
-        cfg = self._cfg_for_issue_or_primary(issue_id)
-        cached_name = self._issue_repo.get(issue_id)
-        if cached_name is not None:
-            repo = cfg.repos.get(cached_name)
-            if repo is not None:
-                return repo
-            cached_issue = self._last_issues.get(issue_id)
-            if cached_issue is not None:
-                try:
-                    return self._resolve_repo(cached_issue)
-                except ValueError:
-                    pass
-        for repo in cfg.repos.values():
-            if repo.default:
-                return repo
-        if cfg.repos:
-            return next(iter(cfg.repos.values()))
-        raise RuntimeError("No repos defined in config")
-
-    def _resolve_gate_workflow(
-        self, issue: Issue, tracking: dict | None
-    ) -> WorkflowConfig:
-        """Resolve workflow for a gated issue, handling cold-start recovery.
-
-        Resolution order:
-        1. Cached in ``_issue_workflow`` → use cached workflow
-        2. Not cached (cold start after restart):
-           a. If ``tracking`` has a ``workflow`` field and it exists in config
-              → cache it and use it
-           b. Otherwise → resolve from issue labels via ``_resolve_workflow()``
-
-        This must be called before looking up transitions in gate handling,
-        so that ``_issue_workflow`` is populated for downstream use.
-        """
-        # 1. Already cached — use it
-        if issue.id in self._issue_workflow:
-            return self._get_issue_workflow_config(issue.id)
-
-        cfg = self._cfg_for_issue_or_primary(issue.id)
-        # 2. Cold start — try tracking comment's workflow field
-        if tracking is not None:
-            tracked_wf_name = tracking.get("workflow")
-            if tracked_wf_name is not None:
-                wf = cfg.get_workflow(tracked_wf_name)
-                if wf is not None:
-                    self._issue_workflow[issue.id] = wf.name
-                    return wf
-
-        # 3. Resolve from issue labels (default fallback)
-        return self._resolve_workflow(issue)
+        """Remove workspaces for issues already in terminal states."""
+        try:
+            client = self._ensure_linear_client()
+            terminal = await client.fetch_issues_by_states(
+                self.cfg.tracker.project_slug,
+                self.cfg.terminal_linear_states(),
+            )
+            ws_root = self.cfg.workspace.resolved_root()
+            for issue in terminal:
+                await remove_workspace(ws_root, issue.identifier, self.cfg.hooks)
+            if terminal:
+                logger.info(f"Cleaned {len(terminal)} terminal workspaces")
+        except Exception as e:
+            logger.warning(f"Startup cleanup failed (continuing): {e}")
 
     async def _resolve_current_state(self, issue: Issue) -> tuple[str, int]:
         """Resolve current state machine state for an issue.
         Returns (state_name, run).
-
-        Multi-project: reads the issue's own project cfg. ``_issue_project``
-        must be stamped before this is called (enforced by ``_tick``/
-        ``_handle_gate_responses`` binding ordering).
         """
-        cfg = self._cfg_for_issue_or_primary(issue.id)
-
-        # Check state cache first
+        # Check cache first
         if issue.id in self._issue_current_state:
             state_name = self._issue_current_state[issue.id]
             run = self._issue_state_runs.get(issue.id, 1)
-            if issue.id not in self._issue_workflow:
-                self._resolve_workflow(issue)
             return state_name, run
 
-        is_todo = (
-            issue.state
-            and issue.state.strip().lower() == cfg.linear_states.todo.strip().lower()
-        )
-        if is_todo:
-            workflow = self._resolve_workflow(issue)
-            entry = workflow.entry_state
-            if not entry:
-                raise RuntimeError(f"No entry state for workflow '{workflow.name}'")
-            self._issue_current_state[issue.id] = entry
-            self._issue_state_runs[issue.id] = 1
-            return entry, 1
-
-        # Try attachment-based recovery first, fall back to comments.
-        # Use the issue's own project client (multi-project).
-        client = self._client_for_issue(issue.id)
-        tracking = None
-        att_meta = await client.fetch_stokowski_attachment(issue.identifier)
-        if att_meta:
-            tracking = parse_attachment_state(att_meta)
-        if not tracking:
-            comments = await client.fetch_comments(issue.id)
-            tracking = parse_latest_tracking(comments)
+        # Fetch comments from Linear and parse latest tracking
+        client = self._ensure_linear_client()
+        comments = await client.fetch_comments(issue.id)
+        tracking = parse_latest_tracking(comments)
         # Restore the pipeline this issue started on before interpreting its
         # state — a state name only means something inside its own workflow.
         self._adopt_workflow_from_tracking(issue, tracking)
 
-        workflow: WorkflowConfig | None = None
-        if issue.id in self._issue_workflow:
-            workflow = self._get_issue_workflow_config(issue.id)
-        elif tracking is not None:
-            tracked_wf_name = tracking.get("workflow")
-            if tracked_wf_name is not None:
-                wf_from_tracking = cfg.get_workflow(tracked_wf_name)
-                if wf_from_tracking is not None:
-                    workflow = wf_from_tracking
-                    self._issue_workflow[issue.id] = workflow.name
-            if workflow is None:
-                workflow = self._resolve_workflow(issue)
-        else:
-            workflow = self._resolve_workflow(issue)
+        entry = self._entry_state_for(issue)
+        if entry is None:
+            raise RuntimeError("No entry state defined in config")
 
-        entry = workflow.entry_state
-        if not entry:
-            raise RuntimeError(
-                f"No entry state in workflow '{workflow.name}'"
-            )
-
-        await self._resolve_repo_for_coldstart(issue, tracking, comments)
-
+        # No tracking → entry state, run 1
         if tracking is None:
             self._issue_current_state[issue.id] = entry
             self._issue_state_runs[issue.id] = 1
             return entry, 1
 
-        workflow_path_set = set(workflow.path)
-
         if tracking["type"] == "state":
             state_name = tracking.get("state", entry)
             run = tracking.get("run", 1)
-            if state_name in cfg.states and state_name in workflow_path_set:
+            if state_name in self._states_for(issue):
                 self._issue_current_state[issue.id] = state_name
                 self._issue_state_runs[issue.id] = run
                 return state_name, run
@@ -1044,39 +442,31 @@ class Orchestrator:
             run = tracking.get("run", 1)
 
             if status == "waiting":
-                if gate_state in cfg.states and gate_state in workflow_path_set:
+                if gate_state in self._states_for(issue):
                     self._issue_current_state[issue.id] = gate_state
                     self._issue_state_runs[issue.id] = run
                     self._pending_gates[issue.id] = gate_state
                     return gate_state, run
 
             elif status == "approved":
-                wf_transitions = workflow.transitions.get(gate_state, {})
-                target = wf_transitions.get("approve")
-                if not target:
-                    gate_cfg = cfg.states.get(gate_state)
-                    if gate_cfg:
-                        target = gate_cfg.transitions.get("approve")
-                if target and target in cfg.states:
+                gate_cfg = self._states_for(issue).get(gate_state)
+                if gate_cfg and "approve" in gate_cfg.transitions:
+                    target = gate_cfg.transitions["approve"]
                     self._issue_current_state[issue.id] = target
                     self._issue_state_runs[issue.id] = run
                     return target, run
 
             elif status == "rework":
-                wf_transitions = workflow.transitions.get(gate_state, {})
+                gate_cfg = self._states_for(issue).get(gate_state)
                 rework_to = tracking.get("rework_to", "")
-                if not rework_to:
-                    rework_to = wf_transitions.get("rework_to", "")
-                if not rework_to:
-                    gate_cfg = cfg.states.get(gate_state)
-                    if gate_cfg:
-                        rework_to = gate_cfg.rework_to or ""
-                if rework_to and rework_to in cfg.states:
+                if not rework_to and gate_cfg:
+                    rework_to = gate_cfg.rework_to or ""
+                if rework_to and rework_to in self._states_for(issue):
                     self._issue_current_state[issue.id] = rework_to
                     self._issue_state_runs[issue.id] = run
                     return rework_to, run
 
-        # Fallback to workflow entry state
+        # Fallback to entry state
         self._issue_current_state[issue.id] = entry
         self._issue_state_runs[issue.id] = 1
         return entry, 1
@@ -1095,66 +485,19 @@ class Orchestrator:
 
     async def _enter_gate(self, issue: Issue, state_name: str):
         """Move issue to gate state and post tracking comment."""
-        cfg = self._cfg_for_issue_or_primary(issue.id)
-        state_cfg = cfg.states.get(state_name)
-        workflow = self._get_issue_workflow_config(issue.id)
-
-        # Check for skip labels — auto-approve if any match
-        if state_cfg and state_cfg.skip_labels:
-            issue_labels_lower = [l.lower() for l in (issue.labels or [])]
-            skip_labels_lower = [s.lower() for s in state_cfg.skip_labels]
-            should_skip = any(sl in issue_labels_lower for sl in skip_labels_lower)
-
-            # Resolve approve target from workflow transitions
-            state_transitions = workflow.transitions.get(state_name, {})
-            approve_target = state_transitions.get("approve")
-
-            if should_skip and approve_target:
-                target = approve_target
-                run = self._issue_state_runs.get(issue.id, 1)
-
-                repo_name = self._repo_name_for_tracking(issue.id)
-                meta = build_attachment_metadata(
-                    state=state_name, type="gate", run=run,
-                    workflow=workflow.name, repo=repo_name,
-                    status="approved",
-                )
-                await self._upsert_state(issue, meta)
-
-                self._issue_current_state[issue.id] = target
-                self._issue_state_runs[issue.id] = 1  # Reset for new state
-                self.running.pop(issue.id, None)
-                self._tasks.pop(issue.id, None)
-                # Keep claimed — prevents double-dispatch race with concurrent tick
-                self._pending_gates.pop(issue.id, None)
-
-                # Upsert state-entry for audit trail
-                meta = build_attachment_metadata(
-                    state=target, type="state", run=1,
-                    workflow=workflow.name, repo=repo_name,
-                )
-                await self._upsert_state(issue, meta)
-
-                logger.info(
-                    f"Gate auto-skipped issue={issue.identifier} "
-                    f"gate={state_name} (label match) -> {target}"
-                )
-                self._schedule_retry(issue, attempt_num=0, delay_ms=1000)
-                return
-
         state_cfg = self._states_for(issue).get(state_name)
+        prompt = state_cfg.prompt if state_cfg else ""
         run = self._issue_state_runs.get(issue.id, 1)
 
-        client = self._client_for_issue(issue.id)
-        issue_cfg = self._cfg_for_issue_or_primary(issue.id)
+        client = self._ensure_linear_client()
 
-        meta = build_attachment_metadata(
-            state=state_name, type="gate", run=run,
-            workflow=workflow.name,
-            repo=self._repo_name_for_tracking(issue.id),
+        comment = make_gate_comment(
+            state=state_name,
             status="waiting",
+            prompt=prompt or "",
+            run=run,
         )
-        await self._upsert_state(issue, meta)
+        await client.post_comment(issue.id, comment)
 
         # Use the gate's own linear_state (per workflow.yaml), not a global one.
         # Previously this hardcoded `linear_states.review`, which forced every
@@ -1214,54 +557,42 @@ class Orchestrator:
     async def _transition(self, issue: Issue, transition_name: str):
         """Follow a transition from the current state.
 
-        Uses workflow-specific transitions instead of StateConfig.transitions.
-
         Handles target types:
-        - terminal → move to workflow-configured terminal state, clean workspace, release tracking
+        - terminal → move to Done, clean workspace, release tracking
         - gate → enter gate
         - agent → post state comment, ensure active Linear state, schedule retry
         """
-        issue_cfg = self._cfg_for_issue_or_primary(issue.id)
         current_state_name = self._issue_current_state.get(issue.id)
         if not current_state_name:
-            self.claimed.discard(issue.id)
             logger.warning(f"No current state for {issue.identifier}, cannot transition", extra={"linked_to": issue.identifier})
             return
 
-        current_cfg = issue_cfg.states.get(current_state_name)
+        current_cfg = self._states_for(issue).get(current_state_name)
         if not current_cfg:
-            self.claimed.discard(issue.id)
             logger.warning(f"Unknown state '{current_state_name}' for {issue.identifier}", extra={"linked_to": issue.identifier})
             return
 
-        workflow = self._get_issue_workflow_config(issue.id)
-        state_transitions = workflow.transitions.get(current_state_name, {})
-
-        target_name = state_transitions.get(transition_name)
+        target_name = current_cfg.transitions.get(transition_name)
         if not target_name:
             logger.warning(
                 f"No '{transition_name}' transition from state '{current_state_name}' "
-                f"for {issue.identifier}, falling back to 'complete'"
+                f"for {issue.identifier}",
+                extra={"linked_to": issue.identifier},
             )
-            target_name = state_transitions.get("complete")
-            if not target_name:
-                self.claimed.discard(issue.id)
-                return
-            transition_name = "complete"
+            return
 
-        target_cfg = issue_cfg.states.get(target_name)
+        target_cfg = self._states_for(issue).get(target_name)
         if not target_cfg:
             logger.warning(f"Transition target '{target_name}' not found in config")
-            self.claimed.discard(issue.id)
             return
 
         run = self._issue_state_runs.get(issue.id, 1)
 
         if target_cfg.type == "terminal":
-            terminal_key = workflow.terminal_state
-            terminal_state = _resolve_linear_state_name(terminal_key, issue_cfg.linear_states)
+            # Move issue to terminal state
+            terminal_state = self.cfg.terminal_linear_states()[0] if self.cfg.terminal_linear_states() else "Done"
             try:
-                client = self._client_for_issue(issue.id)
+                client = self._ensure_linear_client()
                 moved = await client.update_issue_state(issue.id, terminal_state)
                 if moved:
                     logger.info(f"Moved {issue.identifier} to terminal state '{terminal_state}'", extra={"linked_to": issue.identifier})
@@ -1274,18 +605,10 @@ class Orchestrator:
                 issue=issue.identifier, state=terminal_state,
             )
 
+            # Clean up workspace
             try:
-                ws_root = issue_cfg.workspace.resolved_root(
-                    self._workflow_dir_for_issue(issue.id)
-                )
-                repo = self._get_issue_repo_config(issue.id)
-                rendered_hooks = _render_hooks_best_effort(
-                    issue_cfg.hooks, repo, issue_cfg.repos_synthesized
-                )
-                await remove_workspace(
-                    ws_root, issue.identifier, repo.name, rendered_hooks,
-                    docker_cfg=issue_cfg.docker_if_enabled,
-                )
+                ws_root = self.cfg.workspace.resolved_root()
+                await remove_workspace(ws_root, issue.identifier, self.cfg.hooks)
             except Exception as e:
                 logger.warning(f"Failed to remove workspace for {issue.identifier}: {e}", extra={"linked_to": issue.identifier})
             # Clean up tracking state
@@ -1302,25 +625,13 @@ class Orchestrator:
             await self._enter_gate(issue, target_name)
 
         else:
-            # Agent or evaluator state — post state comment, ensure active
-            # Linear state, schedule retry. Evaluator states dispatch through
-            # this same path since they behave like agents at the dispatch level.
+            # Agent state — post state comment, ensure active Linear state, schedule retry
             self._issue_current_state[issue.id] = target_name
-
-            if transition_name != "complete":
-                run = run + 1
-                self._issue_state_runs[issue.id] = run
-            else:
-                run = 1
-                self._issue_state_runs[issue.id] = run
-
-                workflow=workflow.name,
-                repo=self._repo_name_for_tracking(issue.id),
-            await self._upsert_state(issue, meta)
+            await self._announce_state(issue, target_name, run)
 
             # Ensure issue is in active Linear state
-            client = self._client_for_issue(issue.id)
-            active_state = issue_cfg.linear_states.active
+            client = self._ensure_linear_client()
+            active_state = self.cfg.linear_states.active
             moved = await client.update_issue_state(issue.id, active_state)
             if not moved:
                 logger.warning(f"Failed to move {issue.identifier} to active state '{active_state}'", extra={"linked_to": issue.identifier})
@@ -1342,81 +653,41 @@ class Orchestrator:
         await client.post_comment(issue.id, comment)
 
     async def _handle_gate_responses(self):
-        """Check for gate-approved and rework issues, handle transitions.
+        """Check for gate-approved and rework issues, handle transitions."""
+        # Early return if no gate states in config
+        has_gates = any(sc.type == "gate" for sc in self.cfg.all_states().values())
+        if not has_gates:
+            return
 
-        Multi-project cold-start ordering (critical): for each project we
-        fetch gate issues with THAT project's client, stamp
-        ``_issue_project`` before any downstream ``_cfg_for_issue`` call,
-        and then run the existing per-issue logic which reads cfg via
-        ``_cfg_for_issue(issue.id)``. Gate states (review / gate_approved /
-        rework) are not in ``active_linear_states()`` so ``_tick``'s
-        candidate fetch cannot stamp them — this method is the sole
-        binding site for gate issues after orchestrator restart.
-        """
-        # Iterate per project — skip projects without gates.
-        approved_pairs: list[tuple[Issue, str]] = []  # (issue, project_slug)
-        rework_pairs: list[tuple[Issue, str]] = []
+        client = self._ensure_linear_client()
 
-        for slug, parsed in list(self.configs.items()):
-            pcfg = parsed.config
-            if not any(sc.type == "gate" for sc in pcfg.states.values()):
-                continue
-            try:
-                client = self._linear_client_for(slug)
-            except RuntimeError:
-                continue
+        # Fetch gate-approved issues
+        try:
+            approved_issues = await client.fetch_issues_by_states(
+                self.cfg.tracker.project_slug,
+                [self.cfg.linear_states.gate_approved],
+            )
+        except Exception as e:
+            logger.warning(f"Failed to fetch gate-approved issues: {e}")
+            approved_issues = []
 
-            # Fetch gate-approved issues for this project
-            try:
-                approved_issues = await client.fetch_issues_by_states(
-                    pcfg.tracker.project_slug,
-                    [pcfg.linear_states.gate_approved],
-                )
-            except Exception as e:
-                logger.warning(f"Failed to fetch gate-approved issues ({slug}): {e}")
-                approved_issues = []
-            for issue in approved_issues:
-                # Bind BEFORE any caller may invoke _cfg_for_issue.
-                self._issue_project[issue.id] = slug
-                approved_pairs.append((issue, slug))
-
-            # Fetch rework issues for this project
-            try:
-                rework_issues = await client.fetch_issues_by_states(
-                    pcfg.tracker.project_slug,
-                    [pcfg.linear_states.rework],
-                )
-            except Exception as e:
-                logger.warning(f"Failed to fetch rework issues ({slug}): {e}")
-                rework_issues = []
-            for issue in rework_issues:
-                self._issue_project[issue.id] = slug
-                rework_pairs.append((issue, slug))
-
-        # Process gate approvals
-        for issue, slug in approved_pairs:
+        for issue in approved_issues:
             if issue.id in self.running or issue.id in self.claimed:
                 continue
 
-            client = self._linear_client_for(slug)
-            issue_cfg = self._cfg_for_issue(issue.id)
-
             gate_state = self._pending_gates.pop(issue.id, None)
-            tracking: dict | None = None
-            comments: list[dict] | None = None
             if not gate_state:
-                # Cold-start fallback: attachment first, then comments
-                att_meta = await client.fetch_stokowski_attachment(issue.identifier)
-                if att_meta:
-                    tracking = parse_attachment_state(att_meta)
-                if not tracking or tracking.get("type") != "gate" or tracking.get("status") != "waiting":
-                    comments = await client.fetch_comments(issue.id)
-                    tracking = parse_latest_tracking(comments)
+                comments = await client.fetch_comments(issue.id)
+                tracking = parse_latest_tracking(comments)
                 if tracking and tracking.get("type") == "gate" and tracking.get("status") == "waiting":
                     gate_state = tracking.get("state", "")
 
             if gate_state:
-
+                run = self._issue_state_runs.get(issue.id, 1)
+                comment = make_gate_comment(
+                    state=gate_state, status="approved", run=run,
+                )
+                await client.post_comment(issue.id, comment)
 
                 # Set current state to the gate so _transition can read FROM it,
                 # then route through _transition. This dispatches the approve
@@ -1451,39 +722,30 @@ class Orchestrator:
                     extra={"linked_to": issue.identifier},
                 )
 
-        # Process rework
-        for issue, slug in rework_pairs:
+        # Fetch rework issues
+        try:
+            rework_issues = await client.fetch_issues_by_states(
+                self.cfg.tracker.project_slug,
+                [self.cfg.linear_states.rework],
+            )
+        except Exception as e:
+            logger.warning(f"Failed to fetch rework issues: {e}")
+            rework_issues = []
+
+        for issue in rework_issues:
             if issue.id in self.running or issue.id in self.claimed:
                 continue
 
-            client = self._linear_client_for(slug)
-            issue_cfg = self._cfg_for_issue(issue.id)
-
             gate_state = self._pending_gates.pop(issue.id, None)
-            tracking: dict | None = None
-            comments: list[dict] | None = None
             if not gate_state:
-                # Cold-start fallback: attachment first, then comments
-                att_meta = await client.fetch_stokowski_attachment(issue.identifier)
-                if att_meta:
-                    tracking = parse_attachment_state(att_meta)
-                if not tracking or tracking.get("type") != "gate" or tracking.get("status") != "waiting":
-                    comments = await client.fetch_comments(issue.id)
-                    tracking = parse_latest_tracking(comments)
+                comments = await client.fetch_comments(issue.id)
+                tracking = parse_latest_tracking(comments)
                 if tracking and tracking.get("type") == "gate" and tracking.get("status") == "waiting":
                     gate_state = tracking.get("state", "")
 
             if gate_state:
-                # Resolve workflow (cold-start recovery if needed)
-                workflow = self._resolve_gate_workflow(issue, tracking)
-
                 gate_cfg = self._states_for(issue).get(gate_state)
-
-                # Resolve rework_to from workflow transitions, then StateConfig fallback
-                wf_transitions = workflow.transitions.get(gate_state, {})
-                rework_to = wf_transitions.get("rework_to", "")
-                if not rework_to:
-                    rework_to = gate_cfg.rework_to if gate_cfg else ""
+                rework_to = gate_cfg.rework_to if gate_cfg else ""
                 if not rework_to:
                     logger.warning(f"Gate {gate_state} has no rework_to target, skipping")
                     continue
@@ -1493,21 +755,16 @@ class Orchestrator:
                 max_rework = gate_cfg.max_rework if gate_cfg else None
                 if max_rework is not None and run >= max_rework:
                     # Exceeded max rework — post escalated comment, don't transition
-                    meta = build_attachment_metadata(
-                        state=gate_state, type="gate", run=new_run,
-                        workflow=workflow.name, status="rework",
-                        rework_to=rework_to, repo=repo_name,
-                    )
-                    human = make_gate_comment(
+                    comment = make_gate_comment(
                         state=gate_state, status="escalated", run=run,
-                        workflow=workflow.name,
                     )
-                    await self._upsert_state(issue, meta, comment=human)
-                    # Upsert state-entry for rework target
-                    meta = build_attachment_metadata(
-                        state=rework_to, type="state", run=new_run,
+                    await client.post_comment(issue.id, comment)
+                    logger.warning(
+                        f"Max rework exceeded issue={issue.identifier} "
+                        f"gate={gate_state} run={run} max={max_rework}",
+                        extra={"linked_to": issue.identifier},
                     )
-                    await self._upsert_state(issue, meta)
+                    continue
 
                 new_run = run + 1
                 self._issue_state_runs[issue.id] = new_run
@@ -1524,16 +781,8 @@ class Orchestrator:
                 comment = make_gate_comment(
                     state=gate_state, status="rework",
                     rework_to=rework_to, run=new_run,
-                    workflow=workflow.name,
                 )
                 await client.post_comment(issue.id, comment)
-
-                # Post state-entry comment for rework target
-                state_comment = make_state_comment(
-                    state=rework_to, run=new_run,
-                    workflow=workflow.name,
-                )
-                await client.post_comment(issue.id, state_comment)
 
                 self._issue_current_state[issue.id] = rework_to
 
@@ -1693,17 +942,9 @@ class Orchestrator:
             logger.info(f"Gate rebuild complete: {rebuilt} gate(s) recovered from Linear")
 
     async def _tick(self):
-        """Single poll tick: reconcile, validate, fetch, dispatch.
-
-        Multi-project: iterate each loaded project, fetch with its own
-        LinearClient, and stamp ``_issue_project[issue.id]`` before any
-        downstream per-issue config lookup runs.
-        """
-        # Reload workflow (supports hot-reload) — independent per-file.
-        errors_by_slug = self._load_all_workflows()
-        if errors_by_slug:
-            for slug, errs in errors_by_slug.items():
-                logger.warning(f"Config invalid ({slug}): {errs}")
+        """Single poll tick: reconcile, validate, fetch, dispatch."""
+        # Reload workflow (supports hot-reload)
+        errors = self._load_workflow()
 
         # Part 1: Reconcile running issues
         await self._reconcile()
@@ -1714,47 +955,27 @@ class Orchestrator:
         # Evict gate entries whose tickets have moved to terminal states
         await self._evict_terminal_gates()
 
-        # Part 2: If every project has errored, skip dispatch entirely.
-        if not self.configs:
-            logger.warning("No healthy projects loaded, skipping dispatch")
+        # Part 2: Validate config
+        if errors:
+            logger.warning(f"Config invalid, skipping dispatch: {errors}")
             return
 
-        # Part 3: Fetch candidates — per project, with its own client.
-        all_candidates: list[Issue] = []
-        for slug, parsed in list(self.configs.items()):
-            pcfg = parsed.config
-            try:
-                client = self._linear_client_for(slug)
-                candidates = await client.fetch_candidate_issues(
-                    pcfg.tracker.project_slug,
-                    pcfg.active_linear_states(),
-                )
-            except Exception as e:
-                logger.error(f"Failed to fetch candidates for {slug}: {e}")
-                continue
-            for issue in candidates:
-                # Bind every returned issue to its project BEFORE any
-                # downstream lookup that may call _cfg_for_issue.
-                self._issue_project[issue.id] = slug
-            all_candidates.extend(candidates)
-
-        candidates = all_candidates
-
-        # Snapshot prior-tick labels BEFORE updating _last_issues. See COR-001.
-        for issue in candidates:
-            prior = self._last_issues.get(issue.id)
-            if prior is not None:
-                self._prev_issue_labels[issue.id] = sorted(
-                    l.lower() for l in prior.labels
-                )
-            else:
-                self._prev_issue_labels.pop(issue.id, None)
+        # Part 3: Fetch candidates
+        try:
+            client = self._ensure_linear_client()
+            candidates = await client.fetch_candidate_issues(
+                self.cfg.tracker.project_slug,
+                self.cfg.active_linear_states(),
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch candidates: {e}")
+            return
 
         # Cache issues for retry lookup
         for issue in candidates:
             self._last_issues[issue.id] = issue
 
-        # Part 4: Sort by priority (global sort — projects interleave)
+        # Part 4: Sort by priority
         candidates.sort(
             key=lambda i: (
                 i.priority if i.priority is not None else 999,
@@ -1771,14 +992,8 @@ class Orchestrator:
                 except Exception as e:
                     logger.warning(f"Failed to resolve state for {issue.identifier}: {e}", extra={"linked_to": issue.identifier})
 
-        # Rejection pre-pass
-        await self._process_rejections(candidates)
-
         # Part 5: Dispatch
         self._queued = []  # reset per-tick queue snapshot
-
-        # Track starved projects for the end-of-dispatch WARN log.
-        any_dispatch = False
 
         for issue in candidates:
             if not self._is_eligible(issue):
@@ -1796,19 +1011,15 @@ class Orchestrator:
                 })
                 continue
 
-            # Per-state concurrency check — uses the issue's own project cfg
-            # (state names are per-project; a limit from project A cannot
-            # apply to project B's states).
-            issue_cfg = self._cfg_for_issue(issue.id)
-            internal_state = self._issue_current_state.get(issue.id, "")
-            state_limit = issue_cfg.agent.max_concurrent_agents_by_state.get(
-                internal_state
-            )
+            # Per-state concurrency check
+            state_key = issue.state.strip().lower()
+            state_limit = self.cfg.agent.max_concurrent_agents_by_state.get(state_key)
             if state_limit is not None:
                 state_count = sum(
                     1
                     for r in self.running.values()
-                    if r.state_name == internal_state
+                    if self._last_issues.get(r.issue_id, Issue(id="", identifier="", title="")).state.strip().lower()
+                    == state_key
                 )
                 if state_count >= state_limit:
                     self._queued.append({
@@ -1835,264 +1046,15 @@ class Orchestrator:
                 continue
 
             self._dispatch(issue)
-            any_dispatch = True
-
-        # Starvation signal: if the budget is exhausted AND some project has
-        # eligible issues but zero running, operators should see it.
-        if available_slots == 0 and self.running:
-            running_slugs = {
-                self._issue_project.get(iid)
-                for iid in self.running
-                if iid in self._issue_project
-            }
-            for slug in self.configs.keys():
-                if slug in running_slugs:
-                    continue
-                starved = [
-                    c for c in candidates
-                    if self._issue_project.get(c.id) == slug
-                    and self._is_eligible(c)
-                ]
-                if starved:
-                    logger.warning(
-                        f"Dispatch budget exhausted: project={slug} has "
-                        f"{len(starved)} eligible but 0 running issues"
-                    )
-
-    async def _resolve_repo_for_coldstart(
-        self,
-        issue: Issue,
-        tracking: dict | None,
-        comments: list[dict],
-    ) -> None:
-        """Restore _issue_repo after a cold start, with migration handling.
-
-        If the cache is already populated for this issue (fresh dispatch in
-        this process), nothing to do.
-
-        If tracking has a ``repo`` field (post-multi-repo tracking comment),
-        use it — but verify the repo still exists in config. A hot-reload
-        could have removed it; fall through to label resolution then.
-
-        If tracking has no ``repo`` field (pre-multi-repo tracking comment,
-        or the very first dispatch in this process), fall back to resolving
-        via labels. If the result is the synthetic ``_default`` repo AND
-        this is the first time we've processed this issue in the current
-        process, post a one-time ``stokowski:migrated`` comment so the
-        cold-start decision is recorded.
-        """
-        if issue.id in self._issue_repo:
-            return
-
-        # Defensive read — payload.get() never direct-subscript
-        cfg = self._cfg_for_issue_or_primary(issue.id)
-        tracked_repo_name: str | None = None
-        if tracking is not None:
-            tracked_repo_name = tracking.get("repo")
-
-        if tracked_repo_name is not None:
-            repo = cfg.repos.get(tracked_repo_name)
-            if repo is not None:
-                self._issue_repo[issue.id] = repo.name
-                return
-            # Tracked repo no longer in config — fall through to labels.
-            logger.info(
-                f"Cold-start: tracked repo '{tracked_repo_name}' no longer "
-                f"in config for {issue.identifier}; re-resolving from labels"
-            )
-
-        # Resolve from labels
-        try:
-            resolved = cfg.resolve_repo(issue)
-        except ValueError:
-            # Shouldn't happen with a validated config — log and bail
-            logger.warning(
-                f"Cold-start: resolve_repo failed for {issue.identifier}; "
-                f"skipping repo cache population"
-            )
-            return
-
-        self._issue_repo[issue.id] = resolved.name
-
-        # Handle pre-multi-repo tracking (tracking exists but has no repo
-        # field). Two post-migration actions, in priority order:
-        #   (1) Post a one-time stokowski:migrated comment so the recovery
-        #       decision is auditable on the ticket thread.
-        #   (2) Log a warning if the issue also has a repo:* label that
-        #       didn't match any configured repo (could indicate config
-        #       drift since the issue was last dispatched).
-        #
-        # KP-06: the previous structure ran these as two independent blocks
-        # with the same guard, which made the warning in (2) dead code on
-        # the (1)-success path (because (1) added issue.id to
-        # _migrated_issues, invalidating the "not in _migrated_issues"
-        # guard in (2)). Restructured as an if/elif so both paths are
-        # reachable: warning fires when the migration comment post fails.
-        pre_migration = (
-            tracking is not None
-            and tracking.get("repo") is None
-            and resolved.name == "_default"
-        )
-        if pre_migration and issue.id not in self._migrated_issues:
-            try:
-                client = self._ensure_linear_client()
-                await client.post_comment(
-                    issue.id, make_migrated_comment(resolved.name),
-                )
-                self._migrated_issues.add(issue.id)
-            except Exception as e:
-                logger.debug(
-                    f"Failed to post migrated comment for "
-                    f"{issue.identifier}: {e}"
-                )
-                # Fall through to the operator-facing warning below so at
-                # least the log has a signal that we hit the migration
-                # path. The warning is cheaper than the comment and costs
-                # nothing on repeat ticks.
-
-        if pre_migration:
-            has_repo_label = any(
-                l.lower().startswith("repo:") for l in (issue.labels or [])
-            )
-            if has_repo_label and issue.id not in self._migrated_issues:
-                logger.warning(
-                    f"Cold-start: {issue.identifier} has repo:* label(s) "
-                    f"but fell back to _default — labels: {issue.labels}"
-                )
-
-    async def _process_rejections(self, issues: list[Issue]) -> None:
-        """Async pre-pass: enforce R10 single-repo cap for each candidate.
-
-        For each issue:
-        1. Count ``repo:*`` labels on ``issue.labels``.
-        2. If > 1 AND the issue was previously rejected with a DIFFERENT
-           label set (labels were edited), discard the prior marker so we
-           can re-evaluate against the new labels on this tick.
-        3. If > 1 AND no marker exists, fetch the comment thread, check
-           for an existing rejection sentinel via ``has_pending_rejection``
-           against the current sorted label set, post a new sentinel iff
-           none exists, then add ``issue.id`` to ``_rejected_issues``.
-        4. If <= 1, ensure ``issue.id`` is NOT in ``_rejected_issues`` —
-           operator fixed the labels, dispatch can proceed.
-
-        Failures to fetch comments are logged but do not populate the set
-        (err on the side of allowing dispatch rather than silently
-        stalling the ticket).
-        """
-        if not issues:
-            return
-
-        for issue in issues:
-            # Each issue uses its own project's Linear client.
-            client = self._client_for_issue(issue.id)
-            current_labels = [l.lower() for l in (issue.labels or [])]
-            repo_labels = [l for l in current_labels if l.startswith("repo:")]
-
-            # Clear stale markers when labels changed since the prior tick.
-            # _prev_issue_labels is captured at the top of _tick BEFORE
-            # _last_issues is updated, so the comparison is against the
-            # PREVIOUS tick's labels, not the current tick's (COR-001).
-            prior_labels = self._prev_issue_labels.get(issue.id)
-            if (
-                issue.id in self._rejected_issues
-                and prior_labels is not None
-                and prior_labels != sorted(current_labels)
-            ):
-                self._rejected_issues.discard(issue.id)
-                self._rejection_fetch_pending.discard(issue.id)
-
-            # Re-evaluate pessimistic rejections (fetch failures from prior
-            # ticks) regardless of label change — the Linear outage may have
-            # cleared and we should re-attempt the dedup check.
-            if issue.id in self._rejection_fetch_pending:
-                self._rejected_issues.discard(issue.id)
-                self._rejection_fetch_pending.discard(issue.id)
-
-            if len(repo_labels) > 1:
-                if issue.id in self._rejected_issues:
-                    # Already handled on an earlier tick; nothing to do.
-                    continue
-
-                # Check existing comments to avoid duplicate rejection posts
-                try:
-                    comments = await client.fetch_comments(issue.id)
-                except Exception as e:
-                    # Fail-closed (ADV-003): without knowing whether a prior
-                    # rejection comment exists, dispatching a dual-labeled
-                    # ticket would commit an arbitrary first-wins repo
-                    # routing to the tracking thread — worse than a
-                    # temporary stall. Mark rejected AND flag for retry so
-                    # the next tick re-attempts the fetch regardless of
-                    # whether labels changed.
-                    logger.error(
-                        f"Rejection pre-pass: failed to fetch comments for "
-                        f"{issue.identifier}: {e}. Failing closed — will "
-                        f"retry on next tick."
-                    )
-                    self._rejected_issues.add(issue.id)
-                    self._rejection_fetch_pending.add(issue.id)
-                    continue
-
-                if not has_pending_rejection(comments, current_labels):
-                    # Detect triage origin: if the most recent state-tracking
-                    # comment's workflow field is a triage workflow, attribute
-                    # the conflict to triage rather than human labeling.
-                    tracking = parse_latest_tracking(comments)
-                    reason = "multi_repo"
-                    if tracking and tracking.get("type") == "state":
-                        wf_name = tracking.get("workflow")
-                        if wf_name:
-                            issue_cfg_rej = self._cfg_for_issue_or_primary(issue.id)
-                            wf = issue_cfg_rej.get_workflow(wf_name)
-                            if wf and wf.triage:
-                                reason = "triage_multi_repo"
-                    comment_body = make_rejection_comment(
-                        current_labels, reason=reason
-                    )
-                    try:
-                        await client.post_comment(issue.id, comment_body)
-                        logger.info(
-                            f"R10 rejection posted for {issue.identifier} "
-                            f"(labels={repo_labels}, reason={reason})"
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to post rejection comment for "
-                            f"{issue.identifier}: {e}"
-                        )
-                        # Do NOT mark as rejected if the post failed —
-                        # next tick will retry.
-                        continue
-
-                self._rejected_issues.add(issue.id)
-            else:
-                # <= 1 repo label: dispatch may proceed. Clear any stale
-                # marker left over from a prior dual-label state.
-                self._rejected_issues.discard(issue.id)
 
     def _is_eligible(self, issue: Issue) -> bool:
         """Check if an issue is eligible for dispatch."""
         if not issue.id or not issue.identifier or not issue.title or not issue.state:
             return False
 
-        # R10: more than one repo:* label → ineligible. The async pre-pass
-        # (see _process_rejections) has already done the Linear work of
-        # posting a dedup'd rejection comment; we just observe the set here.
-        if issue.id in self._rejected_issues:
-            return False
-
-        # Config-error block: hook template rendering failed on a prior
-        # dispatch. Retrying won't fix a config typo; _load_workflow clears
-        # this set when the operator reloads a valid workflow.yaml.
-        if issue.id in self._config_blocked:
-            return False
-
-        # Multi-project: per-issue state names (a ticket from project B must
-        # pass eligibility using project B's linear_states names).
-        cfg = self._cfg_for_issue_or_primary(issue.id)
         state_lower = issue.state.strip().lower()
-        active_lower = [s.strip().lower() for s in cfg.active_linear_states()]
-        terminal_lower = [s.strip().lower() for s in cfg.terminal_linear_states()]
+        active_lower = [s.strip().lower() for s in self.cfg.active_linear_states()]
+        terminal_lower = [s.strip().lower() for s in self.cfg.terminal_linear_states()]
 
         if state_lower not in active_lower:
             return False
@@ -2115,12 +1077,13 @@ class Orchestrator:
         """Dispatch a worker for an issue."""
         self.claimed.add(issue.id)
 
-        issue_cfg = self._cfg_for_issue_or_primary(issue.id)
         state_name = self._issue_current_state.get(issue.id)
         if not state_name:
-            state_name = self._get_issue_workflow_config(issue.id).entry_state or issue_cfg.entry_state
+            state_name = self._entry_state_for(issue)
 
-        state_cfg = issue_cfg.states.get(state_name) if state_name else None
+        # If at a gate, enter it instead of dispatching a worker.
+        # Release the slot we reserved — the gate path doesn't run an agent.
+        state_cfg = self._states_for(issue).get(state_name) if state_name else None
         if state_cfg and state_cfg.type == "gate":
             self._release_slot(issue.id)
             asyncio.create_task(self._safe_enter_gate(issue, state_name))
@@ -2162,122 +1125,33 @@ class Orchestrator:
         )
 
     async def _run_worker(self, issue: Issue, attempt: RunAttempt):
-        """Worker coroutine: prepare workspace, run agent turns.
-
-        Hot-reload race (ADV-005): ``self.cfg`` is mutated by
-        ``_load_all_workflows`` at every tick. If a concurrent tick runs
-        while this coroutine is awaiting, subsequent ``self.cfg`` reads
-        inside this worker would see a fresh (possibly different) config.
-
-        Multi-project: ``cfg`` is pinned to the issue's OWN project config
-        (resolved via ``_cfg_for_issue_or_primary``). Hot-reload of a
-        DIFFERENT project's file does not affect this worker.
-        """
-        cfg = self._cfg_for_issue_or_primary(issue.id)
+        """Worker coroutine: prepare workspace, run agent turns."""
         try:
             # Resolve state if not set
             if not attempt.state_name:
                 state_name, run = await self._resolve_current_state(issue)
                 attempt.state_name = state_name
-                state_cfg = cfg.states.get(state_name)
+                state_cfg = self._states_for(issue).get(state_name)
                 if state_cfg and state_cfg.type == "gate":
                     # Issue should be at a gate, not running
                     await self._enter_gate(issue, state_name)
                     return
 
             state_name = attempt.state_name
-            state_cfg = cfg.states.get(state_name) if state_name else None
+            state_cfg = self._states_for(issue).get(state_name) if state_name else None
 
-            claude_cfg = cfg.claude
-            hooks_cfg = cfg.hooks
+            claude_cfg = self.cfg.claude
+            hooks_cfg = self.cfg.hooks
             runner_type = "claude"
 
             if state_cfg:
                 claude_cfg, hooks_cfg = merge_state_config(
-                    state_cfg, cfg.claude, cfg.hooks
+                    state_cfg, self.cfg.claude, self.cfg.hooks
                 )
                 runner_type = state_cfg.runner
 
-            ws_root = cfg.workspace.resolved_root(
-                self._workflow_dir_for_issue(issue.id)
-            )
-            # Resolve repo using the pinned cfg snapshot (ADV-005). A
-            # concurrent _load_workflow during our await could have swapped
-            # self.cfg; resolving via `cfg.resolve_repo` guarantees the
-            # repo corresponds to the config we started this dispatch
-            # against. _issue_repo cache is still updated so subsequent
-            # ticks see the resolution.
-            try:
-                repo = cfg.resolve_repo(issue)
-                self._issue_repo[issue.id] = repo.name
-            except ValueError as e:
-                # No default repo configured — config got corrupted by a
-                # hot-reload between dispatch and here, or the operator
-                # removed the default. Treat as config_error.
-                msg = (
-                    f"Repo resolution failed for {issue.identifier}: {e}. "
-                    f"No matching `repo:*` label and no default repo in "
-                    f"the current config."
-                )
-                logger.error(msg)
-                self._fire_and_forget(self._post_hook_error_comment(issue.id, msg))
-                attempt.status = "config_error"
-                attempt.error = str(e)
-                self._on_worker_exit(issue, attempt)
-                return
-            docker_image = ""
-            if cfg.docker.enabled:
-                docker_image = _resolve_docker_image(
-                    state_cfg, repo, cfg.docker.default_image,
-                )
-            # Render root hooks with repo metadata when the config has an
-            # explicit repos: section. Legacy configs (repos_synthesized)
-            # bypass rendering — preserves R19 backward compat for hook
-            # bodies containing literal {}/${ shell syntax.
-            try:
-                rendered_hooks = render_hooks_for_dispatch(
-                    cfg.hooks, repo, cfg.repos_synthesized
-                )
-            except (UndefinedError, TemplateSyntaxError) as render_err:
-                # Config-level problem in a hook template:
-                # - UndefinedError: a variable reference like {{ repo.clne_url }} (typo)
-                # - TemplateSyntaxError: a `{{ ` / `{% ` that Jinja2 can't parse
-                #   (common when migrating a legacy config with Jinja2-conflicting
-                #   shell syntax from 1:1 to multi-repo mode).
-                # Surface on Linear + mark status='config_error' so _on_worker_exit
-                # routes to _config_blocked (no retry loop) instead of scheduling
-                # exponential backoff against a broken template.
-                if isinstance(render_err, UndefinedError):
-                    hint = (
-                        "This typically means a typo in a Jinja2 variable "
-                        "reference (e.g. `{{ repo.clne_url }}` instead of "
-                        "`{{ repo.clone_url }}`)."
-                    )
-                else:
-                    hint = (
-                        "Jinja2 could not parse the hook body. Common cause: "
-                        "migrating a legacy 1:1 config with shell syntax like "
-                        "`!f() {{ ...; }}; f` or literal `{{ `/`{% ` tokens to "
-                        "multi-repo mode, which activates Jinja2 rendering. "
-                        "Either escape the tokens (`{{ '{{' }}`) or rework the "
-                        "hook body."
-                    )
-                msg = (
-                    f"Hook template rendering failed for "
-                    f"{issue.identifier} (repo={repo.name}): "
-                    f"{type(render_err).__name__}: {render_err}. {hint}"
-                )
-                logger.error(msg)
-                self._fire_and_forget(self._post_hook_error_comment(issue.id, msg))
-                attempt.status = "config_error"
-                attempt.error = f"hook template error: {render_err}"
-                self._on_worker_exit(issue, attempt)
-                return
-            ws = await ensure_workspace(
-                ws_root, issue.identifier, repo.name, rendered_hooks,
-                docker_cfg=cfg.docker_if_enabled,
-                docker_image=docker_image,
-            )
+            ws_root = self.cfg.workspace.resolved_root()
+            ws = await ensure_workspace(ws_root, issue.identifier, self.cfg.hooks)
             attempt.workspace_path = str(ws.path)
 
             # Evidence directory, created fresh each turn and excluded from git
@@ -2288,11 +1162,11 @@ class Orchestrator:
             report_mod.discard(ws.path)
 
             # Move issue from Todo to In Progress if needed
-            todo_state = cfg.linear_states.todo
+            todo_state = self.cfg.linear_states.todo
             if todo_state and issue.state.strip().lower() == todo_state.strip().lower():
                 try:
-                    client = self._client_for_issue(issue.id)
-                    active_state = cfg.linear_states.active
+                    client = self._ensure_linear_client()
+                    active_state = self.cfg.linear_states.active
                     moved = await client.update_issue_state(issue.id, active_state)
                     if moved:
                         issue.state = active_state
@@ -2309,46 +1183,20 @@ class Orchestrator:
                 except Exception as e:
                     logger.warning(f"Failed to move {issue.identifier} to active: {e}", extra={"linked_to": issue.identifier})
 
-            # Upsert state tracking (only for first dispatch of a state)
+            # Post state tracking comment (only for first dispatch of a state)
             if state_name:
                 run = self._issue_state_runs.get(issue.id, 1)
                 if attempt.attempt is None or attempt.attempt == 0:
                     await self._announce_state(issue, state_name, run)
 
-            # Run on_stage_enter hook if defined. Render over repo metadata
-            # (same gate as root hooks — only when repos: section is explicit).
+            # Run on_stage_enter hook if defined
             if state_cfg and state_cfg.hooks and state_cfg.hooks.on_stage_enter:
                 from .workspace import run_hook
-                try:
-                    stage_enter_script = (
-                        state_cfg.hooks.on_stage_enter
-                        if cfg.repos_synthesized
-                        else render_hook_template(
-                            state_cfg.hooks.on_stage_enter, repo
-                        )
-                    )
-                except (UndefinedError, TemplateSyntaxError) as render_err:
-                    msg = (
-                        f"on_stage_enter hook template rendering failed for "
-                        f"{issue.identifier} state={state_name} repo={repo.name}: "
-                        f"{type(render_err).__name__}: {render_err}"
-                    )
-                    logger.error(msg)
-                    self._fire_and_forget(
-                        self._post_hook_error_comment(issue.id, msg)
-                    )
-                    attempt.status = "config_error"
-                    attempt.error = f"hook template error: {render_err}"
-                    self._on_worker_exit(issue, attempt)
-                    return
                 ok = await run_hook(
-                    stage_enter_script,
+                    state_cfg.hooks.on_stage_enter,
                     ws.path,
-                    (state_cfg.hooks.timeout_ms if state_cfg.hooks else cfg.hooks.timeout_ms),
+                    (state_cfg.hooks.timeout_ms if state_cfg.hooks else self.cfg.hooks.timeout_ms),
                     f"on_stage_enter:{state_name}",
-                    docker_cfg=cfg.docker_if_enabled,
-                    docker_image=docker_image,
-                    workspace_key=ws.workspace_key,
                 )
                 if not ok:
                     attempt.status = "failed"
@@ -2358,49 +1206,12 @@ class Orchestrator:
 
             prompt = await self._render_prompt_async(issue, attempt.attempt, state_name)
 
-            # Build env vars for the agent subprocess using the pinned cfg.
-            if cfg.docker.enabled:
-                agent_env = cfg.docker_env()
-            else:
-                agent_env = cfg.agent_env()
+            # Build env vars for the agent subprocess from workflow.yaml config
+            agent_env = self.cfg.agent_env()
             agent_env["STOKOWSKI_ARTIFACTS"] = str(artifact_path)
             agent_env["STOKOWSKI_ISSUE"] = issue.identifier
             if state_name:
                 agent_env["STOKOWSKI_STATE"] = state_name
-            agent_env["STOKOWSKI_ISSUE_IDENTIFIER"] = issue.identifier
-            # Multi-project: pass the owning project slug so hooks can branch
-            # on it (R7).
-            slug = self._issue_project.get(issue.id)
-            if slug:
-                agent_env["STOKOWSKI_LINEAR_PROJECT_SLUG"] = slug
-            # Per-dispatch repo env vars (R16).
-            agent_env["STOKOWSKI_REPO_NAME"] = repo.name
-            if repo.clone_url:
-                agent_env["STOKOWSKI_REPO_CLONE_URL"] = repo.clone_url
-            # Triage workflow dispatch: inject the tenant-scoped repo list so
-            # the triage agent can emit repo:<name> labels (R17, R18a).
-            workflow_for_env = self._get_issue_workflow_config(issue.id)
-            if workflow_for_env.triage:
-                repo_list = [
-                    {
-                        "name": r.name,
-                        "label": r.label or "",
-                        "clone_url": r.clone_url or "",
-                    }
-                    for r in cfg.repos.values()
-                    if r.name != "_default"
-                ]
-                agent_env["STOKOWSKI_REPOS_JSON"] = json.dumps(repo_list)
-
-            # Build log path if logging enabled (per-project logging config).
-            log_path = None
-            if cfg.logging.enabled and cfg.logging.log_dir:
-                workflow_dir = self._workflow_dir_for_issue(issue.id)
-                log_dir = cfg.logging.resolved_log_dir(workflow_dir)
-                issue_log_dir = log_dir / sanitize_key(issue.identifier)
-                timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                ext = ".log" if runner_type == "codex" else ".ndjson"
-                log_path = issue_log_dir / f"{timestamp}-turn-{attempt.turn_count + 1}{ext}"
 
             # State machine mode: single turn per dispatch. The state
             # machine handles continuation via _transition after each
@@ -2419,10 +1230,6 @@ class Orchestrator:
                     on_event=self._on_agent_event,
                     on_pid=self._on_child_pid,
                     env=agent_env,
-                    docker_cfg=cfg.docker,
-                    workspace_key=ws.workspace_key,
-                    docker_image=docker_image,
-                    log_path=log_path,
                 )
             else:
                 # Legacy mode: multi-turn loop
@@ -2431,12 +1238,12 @@ class Orchestrator:
                     if turn > 0:
                         current_state = issue.state
                         try:
-                            client = self._client_for_issue(issue.id)
+                            client = self._ensure_linear_client()
                             states = await client.fetch_issue_states_by_ids([issue.id])
                             current_state = states.get(issue.id, issue.state)
                             state_lower = current_state.strip().lower()
                             active_lower = [
-                                s.strip().lower() for s in cfg.active_linear_states()
+                                s.strip().lower() for s in self.cfg.active_linear_states()
                             ]
                             if state_lower not in active_lower:
                                 logger.info(
@@ -2454,16 +1261,6 @@ class Orchestrator:
                             f"Check your progress and continue the task."
                         )
 
-                    # Recalculate log path per turn in legacy mode
-                    turn_log_path = None
-                    if cfg.logging.enabled and cfg.logging.log_dir:
-                        workflow_dir = self._workflow_dir_for_issue(issue.id)
-                        log_dir = cfg.logging.resolved_log_dir(workflow_dir)
-                        issue_log_dir = log_dir / sanitize_key(issue.identifier)
-                        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                        ext = ".log" if runner_type == "codex" else ".ndjson"
-                        turn_log_path = issue_log_dir / f"{timestamp}-turn-{attempt.turn_count + 1}{ext}"
-
                     attempt = await run_turn(
                         runner_type=runner_type,
                         claude_cfg=claude_cfg,
@@ -2475,10 +1272,6 @@ class Orchestrator:
                         on_event=self._on_agent_event,
                         on_pid=self._on_child_pid,
                         env=agent_env,
-                        docker_cfg=cfg.docker,
-                        workspace_key=ws.workspace_key,
-                        docker_image=docker_image,
-                        log_path=turn_log_path,
                     )
 
                     if attempt.status != "succeeded":
@@ -2502,47 +1295,33 @@ class Orchestrator:
         self, issue: Issue, attempt_num: int | None, state_name: str | None = None
     ) -> str:
         """Render prompt using state machine prompt assembly (async — fetches comments)."""
-        cfg = self._cfg_for_issue_or_primary(issue.id)
-        if state_name and state_name in cfg.states:
-            state_cfg = cfg.states[state_name]
+        states = self._states_for(issue)
+        if state_name and state_name in states:
+            state_cfg = states[state_name]
             run = self._issue_state_runs.get(issue.id, 1)
             last_completed = self._last_completed_at.get(issue.id)
             last_run_at = last_completed.isoformat() if last_completed else None
 
-            # Fetch comments via the issue's own project client.
+            # Fetch comments for lifecycle context
             comments: list[dict] | None = None
             try:
-                client = self._client_for_issue(issue.id)
+                client = self._ensure_linear_client()
                 comments = await client.fetch_comments(issue.id)
             except Exception as e:
                 logger.warning(f"Failed to fetch comments for prompt: {e}", extra={"linked_to": issue.identifier})
 
-            state_cfg_for_rework = cfg.states.get(state_name)
-            is_rework = (
-                run > 1
-                and (not state_cfg_for_rework or state_cfg_for_rework.session != "fresh")
-            )
-
-            workflow = self._get_issue_workflow_config(issue.id)
-            wf_transitions = workflow.transitions.get(state_name)
-
-            repo = self._get_issue_repo_config(issue.id)
-
-            workflow_dir = str(self._workflow_dir_for_issue(issue.id))
             return assemble_prompt(
-                cfg=cfg,
-                workflow_dir=workflow_dir,
+                cfg=self.cfg,
+                workflow_dir=str(self.workflow_path.parent),
                 issue=issue,
                 state_name=state_name,
                 state_cfg=state_cfg,
                 run=run,
-                is_rework=is_rework,
+                is_rework=False,
                 attempt=attempt_num or 1,
                 last_run_at=last_run_at,
                 comments=comments,
                 global_prompt=(wf.global_prompt if (wf := self._workflow_for(issue)) else None),
-                transitions=wf_transitions,
-                repo=repo,
             )
 
         # Legacy fallback
@@ -2552,24 +1331,19 @@ class Orchestrator:
         self, issue: Issue, attempt_num: int | None, state_name: str | None = None
     ) -> str:
         """Render the prompt template with issue context (legacy/sync fallback)."""
-        cfg = self._cfg_for_issue_or_primary(issue.id)
+        assert self.workflow is not None
 
         # State machine mode: call assemble_prompt without comments
-        if state_name and state_name in cfg.states:
-            state_cfg = cfg.states[state_name]
+        states = self._states_for(issue)
+        if state_name and state_name in states:
+            state_cfg = states[state_name]
             run = self._issue_state_runs.get(issue.id, 1)
             last_completed = self._last_completed_at.get(issue.id)
             last_run_at = last_completed.isoformat() if last_completed else None
 
-            workflow = self._get_issue_workflow_config(issue.id)
-            wf_transitions = workflow.transitions.get(state_name)
-
-            repo = self._get_issue_repo_config(issue.id)
-
-            workflow_dir = str(self._workflow_dir_for_issue(issue.id))
             return assemble_prompt(
-                cfg=cfg,
-                workflow_dir=workflow_dir,
+                cfg=self.cfg,
+                workflow_dir=str(self.workflow_path.parent),
                 issue=issue,
                 state_name=state_name,
                 state_cfg=state_cfg,
@@ -2579,17 +1353,10 @@ class Orchestrator:
                 last_run_at=last_run_at,
                 comments=None,
                 global_prompt=(wf.global_prompt if (wf := self._workflow_for(issue)) else None),
-                transitions=wf_transitions,
-                repo=repo,
             )
 
         # Legacy mode: use workflow prompt_template with Jinja2
-        # Resolve the ParsedConfig for legacy template access.
-        slug = self._issue_project.get(issue.id)
-        parsed = self.configs.get(slug) if slug else None
-        if parsed is None:
-            parsed = next(iter(self.configs.values())) if self.configs else self.workflow
-        template_str = parsed.prompt_template if parsed else ""
+        template_str = self.workflow.prompt_template
 
         if not template_str:
             return f"You are working on an issue from Linear: {issue.identifier} - {issue.title}"
@@ -2845,67 +1612,8 @@ class Orchestrator:
             if isinstance(result_text, str) and result_text:
                 logger.info(f"[{identifier}] result: {result_text[:160]}", extra=extra)
 
-    async def _handle_evaluator_exit(
-        self, issue: Issue, attempt: RunAttempt, state_cfg: StateConfig
-    ) -> str:
-        """Handle evaluator completion: parse tier, upsert attachment, return transition name.
-
-        Evaluation state is upserted synchronously (awaited) before returning,
-        to ensure the verdict is persisted for crash recovery and audit.
-        """
-        from .tracking import parse_evaluation_tier
-
-        tier, summary, findings = parse_evaluation_tier(
-            attempt.result_text or attempt.last_message or ""
-        )
-
-        transition_name = _select_evaluator_transition(
-            tier=tier, auto_approve=state_cfg.auto_approve,
-        )
-
-        # Upsert evaluation state — awaited (not fire-and-forget) because
-        # auto-approve decisions bypass human review and the attachment is
-        # needed for crash recovery and audit.
-        wf = self._get_issue_workflow_config(issue.id)
-        run = self._issue_state_runs.get(issue.id, 1)
-        meta = build_attachment_metadata(
-            state=attempt.state_name, type="evaluation", run=run,
-            workflow=wf.name, tier=tier, summary=summary,
-            findings=findings,
-            repo=self._repo_name_for_tracking(issue.id),
-        )
-        human = make_evaluation_comment(
-            state=attempt.state_name, tier=tier,
-            summary=summary, findings=findings,
-        )
-        try:
-            await self._upsert_state(issue, meta, comment=human)
-        except Exception as e:
-            logger.warning(
-                f"Failed to upsert evaluation state for {issue.identifier}: {e}"
-            )
-
-        logger.info(
-            f"Evaluator result issue={issue.identifier} "
-            f"state={attempt.state_name} tier={tier} "
-            f"transition={transition_name}"
-        )
-        return transition_name
-
     def _on_worker_exit(self, issue: Issue, attempt: RunAttempt):
-        """Handle worker completion.
-
-        _reconcile() owns cleanup for externally-cancelled workers (via
-        _kill_worker + _cleanup_issue_state). This method owns cleanup for
-        naturally-completed workers. The _force_cancelled guard prevents
-        double-processing (token aggregation is not idempotent).
-        """
-        # If reconciliation already killed and cleaned up this worker, skip
-        # all post-exit logic — no transitions, retries, or token aggregation.
-        if issue.id in self._force_cancelled:
-            self._force_cancelled.discard(issue.id)
-            return
-
+        """Handle worker completion."""
         self.total_input_tokens += attempt.input_tokens
         self.total_output_tokens += attempt.output_tokens
         self.total_cache_creation_tokens += attempt.cache_creation_tokens
@@ -2917,17 +1625,8 @@ class Orchestrator:
             elapsed = (datetime.now(timezone.utc) - attempt.started_at).total_seconds()
             self.total_seconds_running += elapsed
 
-        issue_cfg = self._cfg_for_issue_or_primary(issue.id)
         if attempt.session_id:
-            # Only persist session IDs for inherit-mode states.
-            # Fresh sessions must not overwrite the stored ID, or the
-            # next inherit-mode state resumes the wrong session.
-            should_persist = True
-            state_cfg = issue_cfg.states.get(attempt.state_name or "")
-            if state_cfg and state_cfg.session == "fresh":
-                should_persist = False
-            if should_persist:
-                self._last_session_ids[issue.id] = attempt.session_id
+            self._last_session_ids[issue.id] = attempt.session_id
 
         completed_at = datetime.now(timezone.utc)
         attempt.completed_at = completed_at
@@ -2939,75 +1638,17 @@ class Orchestrator:
         self._release_slot(issue.id)
 
         if attempt.status == "succeeded":
-            if attempt.state_name and attempt.state_name in issue_cfg.states:
-                state_cfg = issue_cfg.states[attempt.state_name]
-
-                # Evaluator states: parse output, post comment, select transition
-                if state_cfg.type == "evaluator":
-                    async def _eval_then_transition():
-                        transition = await self._handle_evaluator_exit(
-                            issue, attempt, state_cfg
-                        )
-                        await self._safe_transition(issue, transition)
-                    asyncio.create_task(_eval_then_transition())
-                    return  # evaluator handles its own transition
-
-                # Non-evaluator: use agent-requested transition or default
-                transition_name = attempt.requested_transition or "complete"
-                if not attempt.requested_transition:
-                    logger.info(
-                        f"No transition directive, defaulting to complete "
-                        f"for {issue.identifier}"
-                    )
-
-                # Agent self-cancellation via reserved "cancel" transition
-                if transition_name == "cancel":
-                    logger.info(
-                        f"Agent self-cancelled {issue.identifier}: "
-                        f"{attempt.last_message[:200]}"
-                    )
-                    self._cleanup_issue_state(issue.id)
-                    return
-
-                # Safety cap: enforce max_rework for agent-initiated rework
-                if transition_name != "complete":
-                    sc = issue_cfg.states[attempt.state_name]
-                    if sc.max_rework is not None:
-                        run = self._issue_state_runs.get(issue.id, 1)
-                        if run > sc.max_rework:
-                            logger.warning(
-                                f"Max rework ({sc.max_rework}) exceeded "
-                                f"for {issue.identifier} in state "
-                                f"{attempt.state_name}, forcing complete"
-                            )
-                            transition_name = "complete"
-
-                asyncio.create_task(
-                    self._safe_transition(issue, transition_name)
-                )
+            if attempt.state_name and attempt.state_name in self._states_for(issue):
+                # State machine mode: transition via "complete"
+                asyncio.create_task(self._safe_transition(issue, "complete"))
             else:
                 # Legacy mode
                 self._schedule_retry(issue, attempt_num=1, delay_ms=1000)
-        elif attempt.status == "config_error":
-            # Unrecoverable config problem (hook template typo, Jinja2
-            # syntax error, etc). A retry loop can't fix a config typo, so
-            # mark the issue blocked and release the claim. On successful
-            # hot-reload of workflow.yaml, _load_workflow clears
-            # _config_blocked and the issue dispatches again.
-            self._config_blocked.add(issue.id)
-            self.claimed.discard(issue.id)
-            self.running.pop(issue.id, None)
-            self._tasks.pop(issue.id, None)
-            logger.warning(
-                f"Config error blocking issue={issue.identifier}: "
-                f"{attempt.error}. Dispatch will resume after "
-                f"workflow.yaml is reloaded with a valid config."
-            )
         elif attempt.status in ("failed", "timed_out", "stalled"):
             current_attempt = (attempt.attempt or 0) + 1
             delay = min(
                 10_000 * (2 ** (current_attempt - 1)),
-                issue_cfg.agent.max_retry_backoff_ms,
+                self.cfg.agent.max_retry_backoff_ms,
             )
             self._schedule_retry(
                 issue,
@@ -3017,9 +1658,6 @@ class Orchestrator:
             )
         else:
             self.claimed.discard(issue.id)
-
-        # Best-effort log retention cleanup after worker completes
-        self._fire_and_forget(self._cleanup_logs())
 
     def _schedule_retry(
         self,
@@ -3064,22 +1702,15 @@ class Orchestrator:
         if entry is None:
             return
 
-        # Fetch fresh candidates using the issue's OWN project client + states.
-        slug = self._issue_project.get(issue_id)
-        if slug is None or slug not in self.configs:
-            # Lost binding (project evicted, or never bound) — nothing to retry.
-            self.claimed.discard(issue_id)
-            logger.info(f"Retry: issue {entry.identifier} lost project binding, releasing")
-            return
-        pcfg = self.configs[slug].config
+        # Fetch fresh candidates to check eligibility
         try:
-            client = self._linear_client_for(slug)
+            client = self._ensure_linear_client()
             candidates = await client.fetch_candidate_issues(
-                pcfg.tracker.project_slug,
-                pcfg.active_linear_states(),
+                self.cfg.tracker.project_slug,
+                self.cfg.active_linear_states(),
             )
         except Exception as e:
-            logger.warning(f"Retry candidate fetch failed ({slug}): {e}")
+            logger.warning(f"Retry candidate fetch failed: {e}")
             self.claimed.discard(issue_id)
             return
 
@@ -3117,119 +1748,55 @@ class Orchestrator:
         self._dispatch(issue, attempt_num=entry.attempt)
 
     async def _reconcile(self):
-        """Reconcile running and gated issues against current Linear state.
-
-        Multi-project: fetch each issue's state through ITS project's client
-        and compare against ITS project's state names (active/terminal/review
-        differ per project).
-        """
-        ids_to_check = set(self.running) | set(self._pending_gates)
-        if not ids_to_check:
+        """Reconcile running issues against current Linear state."""
+        if not self.running:
             return
 
-        # Group IDs by project (fallback to primary for un-bound issues).
-        primary_slug = next(iter(self.configs.keys())) if self.configs else None
-        by_project: dict[str, list[str]] = {}
-        for issue_id in ids_to_check:
-            slug = self._issue_project.get(issue_id) or primary_slug
-            if slug is None:
-                continue
-            by_project.setdefault(slug, []).append(issue_id)
+        running_ids = list(self.running.keys())
 
-        states: dict[str, str] = {}
-        for slug, ids in by_project.items():
-            try:
-                client = self._linear_client_for(slug)
-                proj_states = await client.fetch_issue_states_by_ids(ids)
-            except Exception as e:
-                logger.warning(f"Reconciliation state fetch failed ({slug}): {e}")
-                continue
-            states.update(proj_states)
+        try:
+            client = self._ensure_linear_client()
+            states = await client.fetch_issue_states_by_ids(running_ids)
+        except Exception as e:
+            logger.warning(f"Reconciliation state fetch failed: {e}")
+            return
 
-        for issue_id in list(ids_to_check):
+        terminal_lower = [
+            s.strip().lower() for s in self.cfg.terminal_linear_states()
+        ]
+        active_lower = [
+            s.strip().lower() for s in self.cfg.active_linear_states()
+        ]
+        review_lower = self.cfg.linear_states.review.strip().lower()
+
+        for issue_id in running_ids:
             current_state = states.get(issue_id)
-            # Look up this issue's project config for state-name comparison.
-            slug = self._issue_project.get(issue_id) or primary_slug
-            issue_cfg = (
-                self.configs[slug].config
-                if slug and slug in self.configs
-                else self._primary_cfg()
-            )
-            terminal_lower = [
-                s.strip().lower() for s in issue_cfg.terminal_linear_states()
-            ]
-            active_lower = [
-                s.strip().lower() for s in issue_cfg.active_linear_states()
-            ]
-            review_lower = issue_cfg.linear_states.review.strip().lower()
-
             if current_state is None:
-                # Issue not found in Linear — may be deleted/archived.
-                if issue_id in self._pending_gates and issue_id not in self.running:
-                    logger.info(
-                        f"Reconciliation: gated issue {issue_id} not found in Linear, cleaning up"
-                    )
-                    cached = self._last_issues.get(issue_id)
-                    if cached:
-                        ws_root = issue_cfg.workspace.resolved_root(
-                            self._workflow_dir_for_issue(issue_id)
-                        )
-                        repo = self._get_issue_repo_config(issue_id)
-                        rendered_hooks = _render_hooks_best_effort(
-                            issue_cfg.hooks, repo, issue_cfg.repos_synthesized
-                        )
-                        await remove_workspace(
-                            ws_root, cached.identifier, repo.name, rendered_hooks,
-                            docker_cfg=issue_cfg.docker_if_enabled,
-                        )
-                    self._cleanup_issue_state(issue_id)
                 continue
 
             state_lower = current_state.strip().lower()
 
             if state_lower in terminal_lower:
+                # Terminal - stop worker and clean workspace
                 _ident = self.running[issue_id].issue_identifier if issue_id in self.running else issue_id
                 logger.info(
                     f"Reconciliation: {_ident} is terminal ({current_state}), stopping",
                     extra={"linked_to": _ident},
                 )
-                self._force_cancelled.add(issue_id)
+                task = self._tasks.get(issue_id)
+                if task:
+                    task.cancel()
 
-                if issue_id in self.running:
-                    await self._kill_worker(issue_id, reason=f"terminal state {current_state}")
+                attempt = self.running.get(issue_id)
+                if attempt:
+                    ws_root = self.cfg.workspace.resolved_root()
+                    await remove_workspace(
+                        ws_root, attempt.issue_identifier, self.cfg.hooks
+                    )
 
-                    attempt = self.running.get(issue_id)
-                    if attempt:
-                        ws_root = issue_cfg.workspace.resolved_root(
-                            self._workflow_dir_for_issue(issue_id)
-                        )
-                        repo = self._get_issue_repo_config(issue_id)
-                        rendered_hooks = _render_hooks_best_effort(
-                            issue_cfg.hooks, repo, issue_cfg.repos_synthesized
-                        )
-                        await remove_workspace(
-                            ws_root, attempt.issue_identifier, repo.name, rendered_hooks,
-                            docker_cfg=issue_cfg.docker_if_enabled,
-                        )
-                else:
-                    cached = self._last_issues.get(issue_id)
-                    if cached:
-                        ws_root = issue_cfg.workspace.resolved_root(
-                            self._workflow_dir_for_issue(issue_id)
-                        )
-                        repo = self._get_issue_repo_config(issue_id)
-                        rendered_hooks = _render_hooks_best_effort(
-                            issue_cfg.hooks, repo, issue_cfg.repos_synthesized
-                        )
-                        await remove_workspace(
-                            ws_root, cached.identifier, repo.name, rendered_hooks,
-                            docker_cfg=issue_cfg.docker_if_enabled,
-                        )
-
-                self._cleanup_issue_state(issue_id)
-                self._fire_and_forget(
-                    self._post_cancellation_comment(issue_id, current_state)
-                )
+                self.running.pop(issue_id, None)
+                self._tasks.pop(issue_id, None)
+                self.claimed.discard(issue_id)
                 self._release_slot(issue_id)
                 # Clean up state caches so stale entries don't accumulate
                 self._issue_current_state.pop(issue_id, None)
@@ -3239,23 +1806,28 @@ class Orchestrator:
                 self._last_session_ids.pop(issue_id, None)
 
             elif state_lower == review_lower:
-                # In review/gate state — kill worker subprocess but keep gate tracking
-                if issue_id in self.running:
-                    self._force_cancelled.add(issue_id)
-                    await self._kill_worker(issue_id, reason=f"review state {current_state}")
-                    self.running.pop(issue_id, None)
-                    self._tasks.pop(issue_id, None)
+                # In review/gate state — stop worker but keep gate tracking
+                task = self._tasks.get(issue_id)
+                if task:
+                    task.cancel()
+                self.running.pop(issue_id, None)
+                self._tasks.pop(issue_id, None)
                 self._release_slot(issue_id)
 
             elif state_lower not in active_lower:
-                # Neither active nor terminal nor review - kill and clean up
-                if issue_id in self.running:
-                    logger.info(
-                        f"Reconciliation: {issue_id} not active ({current_state}), stopping"
-                    )
-                    self._force_cancelled.add(issue_id)
-                    await self._kill_worker(issue_id, reason=f"non-active state {current_state}")
-                    self._cleanup_issue_state(issue_id)
+                # Neither active nor terminal nor review - stop without cleanup
+                _ident = self.running[issue_id].issue_identifier if issue_id in self.running else issue_id
+                logger.info(
+                    f"Reconciliation: {_ident} not active ({current_state}), stopping",
+                    extra={"linked_to": _ident},
+                )
+                task = self._tasks.get(issue_id)
+                if task:
+                    task.cancel()
+                self.running.pop(issue_id, None)
+                self._tasks.pop(issue_id, None)
+                self.claimed.discard(issue_id)
+                self._release_slot(issue_id)
 
     def get_state_snapshot(self) -> dict[str, Any]:
         """Get current runtime state for observability."""
@@ -3323,10 +1895,6 @@ class Orchestrator:
                     # The dashboard renders a timeline from this; cap the wire
                     # payload so a long-running agent cannot bloat every poll.
                     "activity": [e.to_dict() for e in list(r.activity)[-40:]],
-                    "container_name": r.container_name,
-                    "workflow": self._issue_workflow.get(r.issue_id),
-                    "project_slug": self._issue_project.get(r.issue_id),
-                    "error": r.error,
                 }
                 for r in self.running.values()
             ],
@@ -3337,7 +1905,6 @@ class Orchestrator:
                     "issue_identifier": e.identifier,
                     "attempt": e.attempt,
                     "error": e.error,
-                    "project_slug": self._issue_project.get(e.issue_id),
                 }
                 for e in self.retry_attempts.values()
             ],
@@ -3348,8 +1915,6 @@ class Orchestrator:
                     "issue_identifier": self._last_issues.get(issue_id, Issue(id="", identifier=issue_id, title="")).identifier,
                     "gate_state": gate_state,
                     "run": self._issue_state_runs.get(issue_id, 1),
-                    "workflow": self._issue_workflow.get(issue_id),
-                    "project_slug": self._issue_project.get(issue_id),
                 }
                 for issue_id, gate_state in self._pending_gates.items()
             ],
@@ -3369,11 +1934,6 @@ class Orchestrator:
                     self.total_seconds_running + active_seconds, 1
                 ),
             },
-            "workflows": {
-                name: {"path": wf.path}
-                for name, wf in self.cfg.workflows.items()
-            } if self.cfg else {},
-            "docker_enabled": self.cfg.docker.enabled if self.cfg else False,
         }
 
 
@@ -3599,104 +2159,3 @@ class MultiOrchestrator:
                 "seconds_running": round(total_seconds, 1),
             },
         }
-
-
-# ---------------------------------------------------------------------------
-# Log retention helpers (module-level pure functions for testability)
-# ---------------------------------------------------------------------------
-
-
-def cleanup_old_logs(log_dir: Path, max_age_days: int) -> int:
-    """Delete log files older than max_age_days. Returns count of deleted files."""
-    cutoff = time.time() - (max_age_days * 86400)
-    deleted = 0
-    for issue_dir in log_dir.iterdir():
-        if not issue_dir.is_dir():
-            continue
-        for log_file in issue_dir.iterdir():
-            if not log_file.is_file():
-                continue
-            try:
-                if log_file.stat().st_mtime < cutoff:
-                    log_file.unlink()
-                    deleted += 1
-            except OSError:
-                pass
-        # Remove empty issue directory
-        try:
-            if issue_dir.is_dir() and not any(issue_dir.iterdir()):
-                issue_dir.rmdir()
-        except OSError:
-            pass
-    if deleted:
-        logger.info(f"Log retention: deleted {deleted} old log files")
-    return deleted
-
-
-def enforce_size_limit(
-    log_dir: Path,
-    max_total_size_mb: int,
-    exempt_identifiers: set[str] | None = None,
-) -> int:
-    """Delete oldest log files when total size exceeds limit. Returns count deleted.
-
-    Files in directories matching exempt_identifiers are skipped (active agents).
-    """
-    exempt = exempt_identifiers or set()
-    max_bytes = max_total_size_mb * 1024 * 1024
-
-    # Collect all log files with their sizes and mtimes
-    files: list[tuple[Path, float, int]] = []  # (path, mtime, size)
-    total_size = 0
-    for issue_dir in log_dir.iterdir():
-        if not issue_dir.is_dir():
-            continue
-        for log_file in issue_dir.iterdir():
-            if not log_file.is_file():
-                continue
-            try:
-                stat = log_file.stat()
-                files.append((log_file, stat.st_mtime, stat.st_size))
-                total_size += stat.st_size
-            except OSError:
-                pass
-
-    if total_size <= max_bytes:
-        return 0
-
-    # Sort oldest first
-    files.sort(key=lambda x: x[1])
-
-    deleted = 0
-    for path, mtime, size in files:
-        if total_size <= max_bytes:
-            break
-        # Skip files for actively running agents
-        if path.parent.name in exempt:
-            continue
-        try:
-            path.unlink()
-            total_size -= size
-            deleted += 1
-        except OSError:
-            pass
-
-    # Clean up empty directories
-    for issue_dir in log_dir.iterdir():
-        if not issue_dir.is_dir():
-            continue
-        try:
-            if not any(issue_dir.iterdir()):
-                issue_dir.rmdir()
-        except OSError:
-            pass
-
-    if deleted:
-        logger.info(f"Log retention: deleted {deleted} files to enforce size limit")
-    if total_size > max_bytes:
-        logger.warning(
-            f"Log retention: still over size limit after cleanup "
-            f"({total_size // (1024*1024)}MB > {max_total_size_mb}MB) — "
-            f"remaining files may belong to active agents"
-        )
-    return deleted
