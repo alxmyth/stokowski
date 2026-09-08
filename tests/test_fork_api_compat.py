@@ -148,35 +148,72 @@ def test_enabling_docker_while_unwired_is_refused():
     assert "unsandboxed" in errors[0], "the error must say what actually goes wrong"
 
 
-def test_workspace_creation_uses_the_state_merged_hooks():
-    """A fork patch on an upstream line — so this test doubles as its tripwire.
+def test_workspace_creation_does_not_use_the_merged_hooks():
+    """Guards a regression this fork shipped and reverted, not an upstream bug.
 
-    `merge_state_config` resolves a state's hook overrides, and the runner
-    honours them. Upstream's workspace-creation call passes the root hooks
-    instead, so a state-level `after_create` is silently ignored while
-    `before_run` on the same state works.
+    It is tempting to pass `hooks_cfg` here: `merge_state_config` computed it
+    just above, the runner honours it, and passing the root config means a
+    state-level `after_create` override is ignored. That reasoning is wrong,
+    and the reason is in `merge_state_config` itself — it replaces the hooks
+    object wholesale instead of merging per field, and `_parse_hooks` fills
+    unset keys with None.
 
-    Upstream still carries the original line, so a future merge can quietly
-    revert this. That is the point: when it does, this fails and names the fix
-    rather than letting the override go quiet again.
+    So a state declaring only `on_stage_enter` — an ordinary thing to write,
+    and the only place `on_stage_enter` can be read from — yields
+    `after_create=None`. Passing `hooks_cfg` drops the root's clone step: the
+    workspace is created empty, `_ensure_git_ignored` returns early on a
+    non-git directory so nothing raises, and the agent is dispatched into an
+    empty directory to report on a repository that is not there. It also resets
+    `timeout_ms` to the 60s default.
+
+    Measured, before the revert:
+
+        merged.after_create : None
+        workspace contents  : []          # with hooks_cfg
+        workspace contents  : ['cloned.txt']   # with self.cfg.hooks
+
+    Upstream's inconsistency is the lesser bug and goes upstream with the merge
+    semantics question. Do not "fix" this line without fixing `merge_state_config`
+    first.
     """
+    import ast
+
     tree = ast.parse(ORCHESTRATOR.read_text())
     calls = [
         n for n in ast.walk(tree)
         if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "ensure_workspace"
     ]
     assert calls, "ensure_workspace call not found in orchestrator.py"
-
     for call in calls:
-        hooks_arg = call.args[2] if len(call.args) > 2 else None
-        rendered = ast.unparse(hooks_arg) if hooks_arg is not None else "<missing>"
-        assert rendered == "hooks_cfg", (
+        rendered = ast.unparse(call.args[2]) if len(call.args) > 2 else "<missing>"
+        assert rendered == "self.cfg.hooks", (
             f"orchestrator.py:{call.lineno} passes {rendered!r} as hooks to "
-            f"ensure_workspace. It must pass 'hooks_cfg' — the value "
-            f"merge_state_config produced — or a state-level after_create "
-            f"override is dropped. If a merge just reverted this, re-apply the "
-            f"fork patch and send it upstream."
+            f"ensure_workspace. Passing the merged hooks_cfg drops the root's "
+            f"after_create for any state that declares a hooks block, creating "
+            f"an empty workspace that is dispatched into. Read this test's "
+            f"docstring before changing it."
         )
+
+
+def test_merge_state_config_replaces_hooks_wholesale():
+    """Pins the behaviour the test above depends on.
+
+    If upstream ever changes `merge_state_config` to merge hooks per field,
+    this fails — and that is the signal that passing `hooks_cfg` at the
+    workspace call site becomes correct and the fork can drop its comment.
+    """
+    from stokowski.config import ClaudeConfig, HooksConfig, StateConfig, merge_state_config
+
+    root = HooksConfig(after_create="clone.sh", timeout_ms=90_000)
+    state = StateConfig(type="agent")
+    state.hooks = HooksConfig(on_stage_enter="enter.sh")
+
+    _, merged = merge_state_config(state, ClaudeConfig(), root)
+    assert merged.after_create is None, (
+        "merge_state_config now preserves root hooks — revisit the workspace "
+        "call site, which only passes self.cfg.hooks because of this behaviour"
+    )
+    assert merged.timeout_ms == 60_000, "root timeout_ms is no longer discarded"
 
 
 def test_unwired_fork_config_keys_are_refused():
