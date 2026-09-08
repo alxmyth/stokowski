@@ -61,14 +61,15 @@ def test_fork_extras_are_keyword_optional(fn):
 FORK_MODULES = {"workspace", "docker_runner"}
 
 
-def _cross_seam_calls():
+def _cross_seam_calls(package_dir=None):
     """Every call from an upstream-owned module into a fork-owned one.
 
     Discovered by parsing, not listed by hand, so a call site upstream adds or
     moves in a future merge is covered the moment it lands.
     """
     found = []
-    for path in sorted((REPO / "stokowski").glob("*.py")):
+    package_dir = package_dir or (REPO / "stokowski")
+    for path in sorted(package_dir.glob("*.py")):
         if path.stem in FORK_MODULES:
             continue
         tree = ast.parse(path.read_text())
@@ -77,9 +78,9 @@ def _cross_seam_calls():
             if isinstance(node, ast.ImportFrom) and node.module in FORK_MODULES:
                 for alias in node.names:
                     imported[alias.asname or alias.name] = (node.module, alias.name)
-        if not imported:
-            continue
         # `import x.workspace as ws` / `from . import workspace` -> ws.fn(...)
+        # Built before the skip: a module that imports only this way has an
+        # empty `imported` and would otherwise be dropped before we look.
         module_aliases = {}
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module is None:
@@ -91,6 +92,9 @@ def _cross_seam_calls():
                     tail = alias.name.rsplit(".", 1)[-1]
                     if tail in FORK_MODULES:
                         module_aliases[alias.asname or tail] = tail
+
+        if not imported and not module_aliases:
+            continue
 
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
@@ -268,3 +272,32 @@ def test_unwired_fork_config_keys_are_refused():
 
     # Upstream's own example must stay clean, or the guard is too broad.
     assert not validate_config(parse_workflow_file(str(REPO / "workflow.example.yaml")).config)
+
+
+def test_the_scanner_sees_alias_style_imports(tmp_path):
+    """Guards the guard: an earlier version skipped these silently.
+
+    The module scan bailed on `if not imported` before it had looked for module
+    aliases, so a file importing only `from . import workspace` was dropped
+    entirely — while `test_the_seam_is_actually_covered` still passed on the
+    other nine sites. A coverage tool with a blind spot reports the blind spot
+    as covered.
+    """
+    (tmp_path / "workspace.py").write_text("def ensure_workspace(a, b, c): ...\n")
+    (tmp_path / "caller.py").write_text(
+        "from . import workspace\n"
+        "def go():\n"
+        "    return workspace.ensure_workspace(1, 2, 3)\n"
+    )
+    found = _cross_seam_calls(package_dir=tmp_path)
+    assert [(c[2], c[3]) for c in found] == [("workspace", "ensure_workspace")], (
+        f"alias-style call not discovered; got {found!r}"
+    )
+
+
+def test_the_scanner_ignores_unrelated_modules(tmp_path):
+    """And does not invent call sites, which would make the count assertion lie."""
+    (tmp_path / "other.py").write_text(
+        "import json\ndef go():\n    return json.dumps({})\n"
+    )
+    assert _cross_seam_calls(package_dir=tmp_path) == []
