@@ -125,3 +125,24 @@ def test_docker_config_survived_convergence():
     assert hasattr(cfg, "docker"), "ServiceConfig lost the fork's docker field"
     assert cfg.docker.enabled is False, "docker must default off for upstream configs"
     assert cfg.docker_if_enabled is None, "disabled docker must resolve to None"
+
+
+def test_enabling_docker_while_unwired_is_refused():
+    """Failing open here means agents run on the host, not in a container.
+
+    Docker config parses today but nothing consumes it, so accepting
+    `enabled: true` would silently drop the isolation an operator asked for.
+    Delete this test when the Docker layer is re-applied — its failure is then
+    the signal that the guard is stale.
+    """
+    from stokowski.config import DockerConfig, ProjectConfig, validate_config
+
+    cfg = ServiceConfig(projects=[ProjectConfig(name="p")])
+    assert not [e for e in validate_config(cfg) if "docker" in e], (
+        "docker disabled must not produce an error"
+    )
+
+    cfg.docker = DockerConfig(enabled=True)
+    errors = [e for e in validate_config(cfg) if "docker" in e]
+    assert errors, "docker.enabled=true was accepted while Docker is not wired"
+    assert "unsandboxed" in errors[0], "the error must say what actually goes wrong"

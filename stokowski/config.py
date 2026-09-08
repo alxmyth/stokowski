@@ -1079,4 +1079,17 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
         return errors
     for project in cfg.projects:
         _validate_project(project, errors)
+
+    # Docker isolation is parsed but not yet re-wired after the upstream
+    # convergence (see tests_pending/README.md). Accepting `enabled: true` and
+    # doing nothing would run agents unsandboxed on the host while the operator
+    # believes they are contained — refuse instead of failing open.
+    if cfg.docker.enabled:
+        errors.append(
+            "docker.enabled is true, but Docker isolation is not wired in this "
+            "build — agents would run unsandboxed on the host. Set "
+            "docker.enabled: false, or re-apply the Docker layer first "
+            "(tests_pending/test_docker_runner.py)."
+        )
+
     return errors
