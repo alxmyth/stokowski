@@ -146,3 +146,34 @@ def test_enabling_docker_while_unwired_is_refused():
     errors = [e for e in validate_config(cfg) if "docker" in e]
     assert errors, "docker.enabled=true was accepted while Docker is not wired"
     assert "unsandboxed" in errors[0], "the error must say what actually goes wrong"
+
+
+def test_workspace_creation_uses_the_state_merged_hooks():
+    """A fork patch on an upstream line — so this test doubles as its tripwire.
+
+    `merge_state_config` resolves a state's hook overrides, and the runner
+    honours them. Upstream's workspace-creation call passes the root hooks
+    instead, so a state-level `after_create` is silently ignored while
+    `before_run` on the same state works.
+
+    Upstream still carries the original line, so a future merge can quietly
+    revert this. That is the point: when it does, this fails and names the fix
+    rather than letting the override go quiet again.
+    """
+    tree = ast.parse(ORCHESTRATOR.read_text())
+    calls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "ensure_workspace"
+    ]
+    assert calls, "ensure_workspace call not found in orchestrator.py"
+
+    for call in calls:
+        hooks_arg = call.args[2] if len(call.args) > 2 else None
+        rendered = ast.unparse(hooks_arg) if hooks_arg is not None else "<missing>"
+        assert rendered == "hooks_cfg", (
+            f"orchestrator.py:{call.lineno} passes {rendered!r} as hooks to "
+            f"ensure_workspace. It must pass 'hooks_cfg' — the value "
+            f"merge_state_config produced — or a state-level after_create "
+            f"override is dropped. If a merge just reverted this, re-apply the "
+            f"fork patch and send it upstream."
+        )
