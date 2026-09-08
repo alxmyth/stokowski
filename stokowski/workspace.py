@@ -138,8 +138,8 @@ async def run_hook(
 async def ensure_workspace(
     workspace_root: Path,
     issue_identifier: str,
-    repo_name: str,
     hooks: HooksConfig,
+    repo_name: str = "_default",
     docker_cfg: DockerConfig | None = None,
     docker_image: str = "",
 ) -> WorkspaceResult:
@@ -206,8 +206,8 @@ async def ensure_workspace(
 async def remove_workspace(
     workspace_root: Path,
     issue_identifier: str,
-    repo_name: str,
     hooks: HooksConfig,
+    repo_name: str = "_default",
     docker_cfg: DockerConfig | None = None,
 ) -> None:
     """Remove a workspace directory for a terminal (issue, repo) pair."""

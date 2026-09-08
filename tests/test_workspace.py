@@ -98,7 +98,7 @@ def test_compose_workspace_key_hyphen_heavy_components_distinct():
 def test_ensure_workspace_creates_composite_path(tmp_path):
     """ensure_workspace creates `{root}/{len}-{issue}-{repo}`."""
     hooks = HooksConfig()  # no hooks, just directory creation
-    result = _run(ensure_workspace(tmp_path, "SMI-14", "api", hooks))
+    result = _run(ensure_workspace(tmp_path, "SMI-14", hooks, "api"))
 
     expected = tmp_path / "6-SMI-14-api"
     assert expected.exists()
@@ -111,8 +111,8 @@ def test_ensure_workspace_creates_composite_path(tmp_path):
 def test_ensure_workspace_reuses_existing_dir(tmp_path):
     """Second call to ensure_workspace for same (issue, repo) reuses."""
     hooks = HooksConfig()
-    first = _run(ensure_workspace(tmp_path, "SMI-14", "api", hooks))
-    second = _run(ensure_workspace(tmp_path, "SMI-14", "api", hooks))
+    first = _run(ensure_workspace(tmp_path, "SMI-14", hooks, "api"))
+    second = _run(ensure_workspace(tmp_path, "SMI-14", hooks, "api"))
 
     assert first.path == second.path
     assert second.created_now is False
@@ -121,8 +121,8 @@ def test_ensure_workspace_reuses_existing_dir(tmp_path):
 def test_ensure_workspace_different_repos_different_paths(tmp_path):
     """Same issue, different repos → different workspace dirs."""
     hooks = HooksConfig()
-    ws_a = _run(ensure_workspace(tmp_path, "SMI-14", "api", hooks))
-    ws_b = _run(ensure_workspace(tmp_path, "SMI-14", "web", hooks))
+    ws_a = _run(ensure_workspace(tmp_path, "SMI-14", hooks, "api"))
+    ws_b = _run(ensure_workspace(tmp_path, "SMI-14", hooks, "web"))
 
     assert ws_a.path != ws_b.path
     assert ws_a.path.exists()
@@ -132,7 +132,7 @@ def test_ensure_workspace_different_repos_different_paths(tmp_path):
 def test_ensure_workspace_legacy_default_repo(tmp_path):
     """Legacy `_default` repo produces the length-prefixed key."""
     hooks = HooksConfig()
-    result = _run(ensure_workspace(tmp_path, "SMI-14", "_default", hooks))
+    result = _run(ensure_workspace(tmp_path, "SMI-14", hooks, "_default"))
 
     assert result.path == tmp_path / "6-SMI-14-_default"
     assert result.workspace_key == "6-SMI-14-_default"
@@ -141,10 +141,10 @@ def test_ensure_workspace_legacy_default_repo(tmp_path):
 def test_remove_workspace_removes_composite_path(tmp_path):
     """remove_workspace removes the composite-keyed dir."""
     hooks = HooksConfig()
-    ws = _run(ensure_workspace(tmp_path, "SMI-14", "api", hooks))
+    ws = _run(ensure_workspace(tmp_path, "SMI-14", hooks, "api"))
     assert ws.path.exists()
 
-    _run(remove_workspace(tmp_path, "SMI-14", "api", hooks))
+    _run(remove_workspace(tmp_path, "SMI-14", hooks, "api"))
     assert not ws.path.exists()
 
 
@@ -152,16 +152,16 @@ def test_remove_workspace_missing_is_idempotent(tmp_path):
     """remove_workspace on non-existent dir is a silent no-op."""
     hooks = HooksConfig()
     # Should not raise
-    _run(remove_workspace(tmp_path, "SMI-14", "api", hooks))
+    _run(remove_workspace(tmp_path, "SMI-14", hooks, "api"))
 
 
 def test_remove_workspace_only_targets_specified_repo(tmp_path):
     """Removing (issue, api) leaves (issue, web) workspace intact."""
     hooks = HooksConfig()
-    ws_a = _run(ensure_workspace(tmp_path, "SMI-14", "api", hooks))
-    ws_b = _run(ensure_workspace(tmp_path, "SMI-14", "web", hooks))
+    ws_a = _run(ensure_workspace(tmp_path, "SMI-14", hooks, "api"))
+    ws_b = _run(ensure_workspace(tmp_path, "SMI-14", hooks, "web"))
 
-    _run(remove_workspace(tmp_path, "SMI-14", "api", hooks))
+    _run(remove_workspace(tmp_path, "SMI-14", hooks, "api"))
 
     assert not ws_a.path.exists()
     assert ws_b.path.exists()
