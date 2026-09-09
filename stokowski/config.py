@@ -224,6 +224,9 @@ class StateConfig:
     max_rework: int | None = None    # gate only
     transitions: dict[str, str] = field(default_factory=dict)
     hooks: HooksConfig | None = None
+    # Fork: per-state container image. Highest precedence in the resolution
+    # order state -> docker.default_image. Inert unless docker.enabled.
+    docker_image: str | None = None
 
 
 @dataclass
@@ -540,6 +543,7 @@ def _parse_state_config(name: str, raw: dict[str, Any]) -> StateConfig:
         prompt=raw.get("prompt"),
         linear_state=str(raw.get("linear_state", "active")),
         runner=str(raw.get("runner", "claude")),
+        docker_image=raw.get("docker_image"),
         model=raw.get("model"),
         max_turns=raw.get("max_turns"),
         effort=raw.get("effort"),
@@ -1118,6 +1122,49 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
     # convergence (see tests_pending/README.md). Accepting `enabled: true` and
     # doing nothing would run agents unsandboxed on the host while the operator
     # believes they are contained — refuse instead of failing open.
+    if cfg.docker.enabled:
+        if not cfg.docker.default_image:
+            errors.append("docker.enabled is true but docker.default_image is not set")
+        if cfg.docker.inherit_claude_config:
+            host_dir = os.path.expandvars(os.path.expanduser(cfg.docker.host_claude_dir))
+            # In DooD mode this is a host path that does not exist inside the
+            # orchestrator container, so absence is only a warning.
+            if not os.environ.get("HOST_HOME") and not Path(host_dir).exists():
+                logger.warning(
+                    "docker.host_claude_dir '%s' does not exist — "
+                    "agents may fail to authenticate",
+                    host_dir,
+                )
+            # Docker-in-Docker: the orchestrator cannot write host-visible temp
+            # files without an operator-provided shim. Codex-only workflows do
+            # not consume plugin config and are exempt.
+            if os.path.exists("/.dockerenv"):
+                claude_states = sorted(
+                    name for name, sc in cfg.states.items()
+                    if sc.type == "agent" and sc.runner == "claude"
+                )
+                if claude_states:
+                    missing = [
+                        field_name for field_name, value in (
+                            ("docker.host_claude_dir_mount", cfg.docker.host_claude_dir_mount),
+                            ("docker.plugin_shim_host_path", cfg.docker.plugin_shim_host_path),
+                            ("docker.plugin_shim_container_path", cfg.docker.plugin_shim_container_path),
+                        ) if not value
+                    ]
+                    if missing:
+                        errors.append(
+                            "Docker-in-Docker mode detected with inherit_claude_config: true "
+                            f"and Claude Code state(s) present ({', '.join(claude_states)}), "
+                            f"but required shim fields are not set: {', '.join(missing)}. "
+                            "These fields are needed to rewrite plugin paths without touching "
+                            "host files. See CLAUDE.md (Docker mode) for setup."
+                        )
+    for name, sc in cfg.states.items():
+        if sc.docker_image and not cfg.docker.enabled:
+            logger.warning(
+                "State '%s' has docker_image set but docker.enabled is false", name
+            )
+
     for key in cfg.unwired_keys:
         errors.append(f"'{key}:' is set, but {UNWIRED_FORK_KEYS[key]}.")
 
