@@ -8,6 +8,8 @@ import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .models import Issue
 from typing import Any
 
 import yaml
@@ -159,13 +161,7 @@ class ServerConfig:
 # convergence and has not been re-applied yet. The YAML still parses, so
 # without an explicit refusal the operator gets a config that validates and a
 # feature that is not there. Each entry is deleted when its layer returns.
-UNWIRED_FORK_KEYS: dict[str, str] = {
-    "repos": (
-        "multi-repo routing is not wired in this build — every repo: label "
-        "would be ignored and all work would run against a single repo "
-        "(re-apply via tests_pending/test_repos_config.py)"
-    ),
-}
+UNWIRED_FORK_KEYS: dict[str, str] = {}
 
 
 @dataclass
@@ -414,6 +410,23 @@ class ServiceConfig:
             if var_name in os.environ:
                 env[var_name] = os.environ[var_name]
         return env
+
+    def resolve_repo(self, issue: "Issue") -> "RepoConfig":
+        """Which repo an issue belongs to, by label, then by default.
+
+        Case-insensitive first match on the registry's `label` field, then the
+        entry marked `default: true`. A legacy config has exactly one repo —
+        the synthetic `_default`, which is marked default — so every issue
+        resolves to it and single-repo behaviour is unchanged.
+        """
+        issue_labels_lower = [x.lower() for x in issue.labels]
+        for repo in self.repos.values():
+            if repo.label is not None and repo.label.lower() in issue_labels_lower:
+                return repo
+        for repo in self.repos.values():
+            if repo.default:
+                return repo
+        raise ValueError("No default repo configured")
 
     def resolved_api_key(self) -> str:
         # Legacy passthrough — delegates to first project.

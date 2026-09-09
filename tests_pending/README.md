@@ -22,13 +22,11 @@ That is what makes `git merge upstream/main` cheap from here on.
 
 | Test file | Feature | Needs |
 |---|---|---|
-| `test_docker_image_hybrid.py` | 3-level image resolution | `config.py` state/repo `docker_image` |
 | `test_log_retention.py` | Agent log rotation | `LoggingConfig` + runner wiring |
 | `test_attachment_tracking.py` | Linear attachment state | `tracking.py` attachment fns + orchestrator wiring |
 | `test_evaluator.py` | `evaluator` state type | `config.py` state type + orchestrator transition |
 | `test_state_machine.py` | Derived workflow transitions | `derive_workflow_transitions()` |
-| `test_repos_config.py` | `repos:` registry | `RepoConfig` parsing |
-| `test_prompt_multirepo.py` | Repo-aware prompts | `prompt.py` repo namespace |
+| `test_repos_config.py` | `repos:` registry validation | rewrite against upstream's config; still imports `WorkflowConfig` |
 | `test_tracking_multirepo.py` | Repo in tracking payload | attachment metadata `repo` field |
 | `test_rejection_coldstart.py` | Rejection recovery | rejection comment parsing |
 | `test_triage_env.py` | Triage repo routing | `STOKOWSKI_REPOS_JSON` injection |
@@ -38,19 +36,39 @@ That is what makes `git merge upstream/main` cheap from here on.
 
 ## What is already refused, and what merely does nothing
 
-`repos:` is refused by `validate_config` via `UNWIRED_FORK_KEYS` in `config.py`
-— accepting it would ignore every `repo:` label and run a multi-repo team
-against a single repo. Both `workflow.multi-repo*.example.yaml` files therefore
-fail to start, which is deliberate; the top-level README marks them pending.
-The check scans project blocks as well as the top level, because `projects:` is
-upstream's documented shape and a nested `repos:` bypassed an earlier version.
+`UNWIRED_FORK_KEYS` in `config.py` is now empty: both entries it carried
+(`docker.enabled` and `repos:`) have been re-applied. The mechanism stays,
+covered by a test against a synthetic key, because it is how the next removed
+feature avoids being silently ignored — the shape that let `repos:` be dropped
+while the README told operators to copy that file. It scans project blocks as
+well as the top level, since `projects:` is upstream's documented shape and a
+nested key bypassed an earlier version.
 
-Docker isolation is **done** — see below.
+Docker isolation and multi-repo routing are both **done** — see below.
 
 Delete the corresponding guard when you re-apply the layer — its test says so.
 That is not hypothetical: the Docker refusal and its guard test were both
 removed in the commit that wired Docker into dispatch, which is the order to
 follow. Wire it, prove it, then lift the guard.
+
+### Multi-repo routing — re-applied
+
+`RepoConfig` and the `repos:` registry are parsed and validated;
+`ServiceConfig.resolve_repo` routes an issue by its `repo:` label, falling back
+to the entry marked `default: true`. The orchestrator records that decision per
+issue and reuses it for the workspace key, the Docker image and the prompt, so
+a label edited mid-run cannot make cleanup look for a workspace that was never
+created under that name.
+
+Not re-applied: **triage**. Upstream's `WorkflowSpec` has no `triage` flag, so
+there is nothing to route an unlabelled ticket. Validation therefore requires a
+default repo, which is stricter than the fork's original rule and deliberately
+so — the alternative is unlabelled tickets going nowhere quietly.
+
+`tests/test_repo_routing.py` covers routing and, more importantly, that a
+workspace is removed under the key it was created with: creating under `api`
+and removing under `_default` leaves the directory and its Docker volume behind
+with nothing reported.
 
 ### Docker isolation — re-applied
 

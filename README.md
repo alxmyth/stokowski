@@ -199,13 +199,13 @@ Symphony is tightly coupled to Codex via its `app-server` JSON-RPC protocol. Sto
 
 Symphony assumes one Linear project maps to one repo. Stokowski supports the team-affine pattern where a single Linear project spans multiple repositories (common for infrastructure teams, platform teams, or teams owning N microservices):
 
-> **Temporarily unavailable.** Multi-repo routing was removed when this fork converged onto upstream and has not been re-applied yet. A `repos:` block is now **rejected at config validation** rather than silently ignored — see `tests_pending/README.md`. The section below describes the feature as it will return.
+> **Note.** Multi-repo routing is available again. Automatic triage (`triage: true`, `STOKOWSKI_REPOS_JSON`) has not been re-applied yet, so a multi-repo config must mark one repo `default: true` — validation says so if it does not.
 
 - **`repos:` registry in `workflow.yaml`** — declare each repo with `{name, label, clone_url, default, docker_image?}`. See `workflow.multi-repo.example.yaml` for a complete example without triage, or `workflow.multi-repo-triage.example.yaml` for automatic classification.
 - **Label-driven routing** — tickets are routed to a repo by a `repo:<name>` Linear label, applied by a triage agent or by humans. The existing multi-workflow label convention extends naturally to the repo axis.
 - **Backward compatible** — configs without a `repos:` section continue to work unchanged. A synthetic `_default` repo is created and hooks pass through the shell verbatim (no Jinja rendering), preserving existing credential-helper shell patterns.
 - **Hybrid `docker_image` resolution** — stage-level override → repo-level default → platform default. Heterogeneous stacks (one Node repo, one Python repo) each pick up their toolchain image without forking the workflow.
-- **Triage workflow support** — a workflow marked `triage: true` receives the repo list as `STOKOWSKI_REPOS_JSON` env var and applies `repo:*` labels automatically. See `prompts/triage.example.md`.
+- **Triage workflow support** *(pending re-application)* — a workflow marked `triage: true` receives the repo list as `STOKOWSKI_REPOS_JSON` env var and applies `repo:*` labels automatically. See `prompts/triage.example.md`. Until this returns, mark one repo `default: true` so unlabelled tickets have somewhere to go.
 - **v1 caps at one repo per ticket** — tickets with multiple `repo:*` labels are rejected with a Linear comment (deduped across ticks). v2 multi-repo-per-ticket is on the roadmap.
 
 </details>
@@ -440,16 +440,15 @@ Stokowski ships three worked examples — pick the one matching your team's setu
 | Example file | When to use |
 |---|---|
 | `workflow.example.yaml` | **Start here.** One Linear project, one Git repo. Shortest config, no multi-repo ceremony. |
-| `workflow.multi-repo.example.yaml` | *(pending re-application — will not start)* One Linear project spanning multiple repos. Operators (or agents) apply `repo:<name>` labels; unlabeled tickets go to a default repo. Demonstrates Jinja-templated hooks and the 3-level `docker_image` hybrid. |
-| `workflow.multi-repo-triage.example.yaml` | *(pending re-application — will not start)* Multi-repo + automatic classification. A triage agent reads each unlabeled ticket and applies `workflow:<name>` and `repo:<name>` labels before the main pipeline runs. |
+| `workflow.multi-repo.example.yaml` | One Linear project spanning multiple repos. Operators (or agents) apply `repo:<name>` labels; unlabeled tickets go to a default repo. Demonstrates Jinja-templated hooks and the 3-level `docker_image` hybrid. |
+| `workflow.multi-repo-triage.example.yaml` | *(triage pending — will not start)* Multi-repo + automatic classification. A triage agent reads each unlabeled ticket and applies `workflow:<name>` and `repo:<name>` labels before the main pipeline runs. |
 
 ```bash
 # Single-repo setup (most common starting point)
 cp workflow.example.yaml workflow.yaml
 
-# Multi-repo is pending re-application after the upstream convergence;
-# copying this today gives a config that refuses to start, by design.
-# cp workflow.multi-repo.example.yaml workflow.yaml
+# Or, for a multi-repo team
+cp workflow.multi-repo.example.yaml workflow.yaml
 ```
 
 Open `workflow.yaml` and update these fields:
