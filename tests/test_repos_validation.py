@@ -125,3 +125,39 @@ def test_an_explicitly_empty_registry_falls_back_to_legacy(tmp_path):
     (tmp_path / "p.md").write_text("stage\n")
     cfg = parse_workflow_file(str(tmp_path / "workflow.yaml")).config
     assert cfg.repos_synthesized is True
+
+
+def test_the_dead_workflows_block_is_refused_not_ignored(tmp_path):
+    """A top-level `workflows:` block is the fork's replaced model.
+
+    Nothing reads it, so every pipeline it declares — including a
+    `triage: true` one — was silently ignored while the config validated
+    clean. The shipped triage example carried exactly that and appeared to
+    work: dry-run printed a state machine, and the triage stage simply never
+    happened.
+
+    Refusing it is the contract docs/convergence.md states for a removed
+    feature whose config still parses.
+    """
+    errors = _errors(tmp_path, """
+        repos:
+          api: {label: "repo:api", clone_url: "https://x/a.git", default: true}
+        workflows:
+          triage:
+            triage: true
+            path: [work, done]
+    """)
+    assert any("workflows" in e for e in errors), (
+        f"a dead workflows: block validated clean; got {errors}"
+    )
+    assert any("silently ignored" in e or "read by nothing" in e for e in errors), (
+        "the error must say the block does nothing, not just that it is unknown"
+    )
+
+
+def test_configs_without_that_block_are_unaffected(tmp_path):
+    """The guard must not fire on the shape operators should actually use."""
+    assert not _errors(tmp_path, """
+        repos:
+          api: {label: "repo:api", clone_url: "https://x/a.git", default: true}
+    """)

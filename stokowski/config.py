@@ -165,7 +165,15 @@ class ServerConfig:
 # convergence and has not been re-applied yet. The YAML still parses, so
 # without an explicit refusal the operator gets a config that validates and a
 # feature that is not there. Each entry is deleted when its layer returns.
-UNWIRED_FORK_KEYS: dict[str, str] = {}
+UNWIRED_FORK_KEYS: dict[str, str] = {
+    "workflows": (
+        "a top-level `workflows:` block is the fork's old derived-transitions "
+        "model, which the convergence replaced — it is read by nothing, so "
+        "every pipeline it declares (including any `triage: true`) is silently "
+        "ignored. Move each pipeline to its own file under `workflows/` and "
+        "route to it with a `routing:` rule"
+    ),
+}
 
 
 @dataclass
