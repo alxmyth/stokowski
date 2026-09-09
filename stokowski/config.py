@@ -332,6 +332,30 @@ class WorkflowDefinition:
     prompt_template: str
 
 
+_RESERVED_LABEL_PREFIXES = ("workflow:", "repo:")
+
+_RESERVED_REPO_NAME = "_default"
+
+_PATH_SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._\-]+$")
+
+_CREDENTIAL_URL_RE = re.compile(r"^[^:]+://[^/]*:[^@]+@")
+
+_VALID_CLONE_URL_SCHEMES = ("https://", "ssh://", "git@")
+
+@dataclass
+class RepoConfig:
+    """A single repository registered in the repos: registry.
+
+    The v1 shape is minimum-for-routing. Deferred to MVP+:
+    per-repo extra_env and per-repo hooks overrides (see the multi-repo brainstorm).
+    """
+    name: str = ""                    # registry key; exposed to templates as repo.name
+    label: str | None = None          # Linear label for repo selection (e.g. "repo:api")
+    clone_url: str = ""               # clone URL used by root/templated hooks
+    default: bool = False             # at most one repo may be default
+    docker_image: str | None = None   # repo-level image (level 2 in the 3-level hybrid)
+
+
 @dataclass
 class ServiceConfig:
     """Top-level config. `projects` is the authoritative project list.
@@ -355,6 +379,10 @@ class ServiceConfig:
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     projects: list[ProjectConfig] = field(default_factory=list)
     workflow_dir: Path = field(default_factory=lambda: Path("."))
+    # Fork: the repos: registry. `repos_synthesized` marks the legacy
+    # single-repo fallback, which is exempt from most integrity checks.
+    repos: dict[str, "RepoConfig"] = field(default_factory=dict)
+    repos_synthesized: bool = False
     # Top-level keys present in the file that no longer have an implementation.
     unwired_keys: list[str] = field(default_factory=list)
 
@@ -934,6 +962,34 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
         init=bool(dk.get("init", True)),
     )
 
+    # Parse the repos: registry (fork feature). Absent or explicitly empty
+    # falls back to a synthetic `_default`, which keeps every single-repo
+    # config working unchanged.
+    repos_raw = config_raw.get("repos", None)
+    repos: dict[str, RepoConfig] = {}
+    repos_synthesized = False
+    if isinstance(repos_raw, dict) and repos_raw:
+        for repo_name, repo_data in repos_raw.items():
+            rd = repo_data or {}
+            repos[repo_name] = RepoConfig(
+                name=repo_name,
+                label=rd.get("label"),
+                clone_url=str(rd.get("clone_url", "")),
+                default=bool(rd.get("default", False)),
+                docker_image=rd.get("docker_image"),
+            )
+    else:
+        if repos_raw is not None:
+            log.warning(
+                "repos: section is present but empty — treating as legacy "
+                "single-repo config. Populate entries to enable multi-repo "
+                "routing, or remove the section to silence this warning."
+            )
+        repos["_default"] = RepoConfig(
+            name="_default", label=None, clone_url="", default=True, docker_image=None
+        )
+        repos_synthesized = True
+
     # Populate top-level fields from projects[0] for backward compat.
     p0 = projects[0]
     cfg = ServiceConfig(
@@ -946,6 +1002,8 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
         server=server,
         docker=docker,
         unwired_keys=_find_unwired_keys(config_raw),
+        repos=repos,
+        repos_synthesized=repos_synthesized,
         linear_states=p0.linear_states,
         prompts=p0.prompts,
         states=p0.states,
@@ -1109,6 +1167,170 @@ def _validate_states(
         log.warning("project '%s' state '%s' is unreachable", project.name, name)
 
 
+def _near_match_prefixes(prefix: str) -> list[str]:
+    """Generate simple transposition/typo variants of a reserved prefix.
+
+    Covers common typos: single-char transposition and trailing-s variants.
+    Not exhaustive — only catches the obvious mistakes an operator might make.
+    """
+    variants: set[str] = set()
+    base = prefix.rstrip(":")  # "workflow" / "repo"
+    # Swap adjacent characters (one pair at a time)
+    for i in range(len(base) - 1):
+        swapped = list(base)
+        swapped[i], swapped[i + 1] = swapped[i + 1], swapped[i]
+        variant = "".join(swapped) + ":"
+        if variant != prefix:
+            variants.add(variant)
+    # Trailing-s plural (e.g., repos: instead of repo:)
+    variants.add(base + "s:")
+    return list(variants)
+
+def _validate_repos(cfg: ServiceConfig) -> list[str]:
+    """R21 validation for the repos: registry. Returns list of errors.
+
+    Warnings are logged directly at WARNING level and do not populate the
+    returned list. The synthetic ``_default`` repo (cfg.repos_synthesized)
+    is exempt from integrity and path-safety checks.
+    """
+    errors: list[str] = []
+
+    # Empty cfg.repos is treated as "no multi-repo configured" (equivalent to
+    # legacy-synthesized). This only happens when a test builds ServiceConfig
+    # directly without going through parse_workflow_file; parsed configs
+    # always have at least the synthetic _default.
+    if not cfg.repos:
+        return errors
+
+    # Repo entry integrity + path safety + reserved-name check
+    seen_labels: dict[str, str] = {}
+    default_count = 0
+    for name, repo in cfg.repos.items():
+        is_synthetic_default = (
+            cfg.repos_synthesized and name == _RESERVED_REPO_NAME
+        )
+
+        # Path safety: registry name must match the sanitize_key regex so the
+        # composite workspace key is safe for filesystem paths.
+        if not _PATH_SAFE_NAME_RE.match(name):
+            errors.append(
+                f"Repo name '{name}' contains invalid characters "
+                f"(must match [A-Za-z0-9._-])"
+            )
+
+        # Operator-authored repos may not use the reserved _default name.
+        if name == _RESERVED_REPO_NAME and not cfg.repos_synthesized:
+            errors.append(
+                f"Repo name '_default' is reserved for the legacy synthesis "
+                f"branch; rename this entry (e.g., 'default-repo')"
+            )
+
+        if is_synthetic_default:
+            # Exempt from non-empty checks and duplicate-label checks.
+            if repo.default:
+                default_count += 1
+            continue
+
+        # Non-empty clone_url and label
+        if not repo.clone_url:
+            errors.append(f"Repo '{name}' has empty clone_url")
+        if not repo.label:
+            errors.append(f"Repo '{name}' has empty label")
+
+        # clone_url scheme check
+        if repo.clone_url:
+            if repo.clone_url.startswith("file://"):
+                errors.append(
+                    f"Repo '{name}' clone_url uses file:// scheme "
+                    f"(rejected for safety)"
+                )
+            elif _CREDENTIAL_URL_RE.match(repo.clone_url):
+                errors.append(
+                    f"Repo '{name}' clone_url contains embedded credentials "
+                    f"(user:pass@host); move credentials to a git credential "
+                    f"helper or an environment variable"
+                )
+            elif not repo.clone_url.startswith(_VALID_CLONE_URL_SCHEMES):
+                errors.append(
+                    f"Repo '{name}' clone_url must use https://, ssh://, or "
+                    f"git@ form (got: {repo.clone_url[:40]!r})"
+                )
+
+        # Unique labels across repos (case-insensitive)
+        if repo.label:
+            label_lower = repo.label.lower()
+            if label_lower in seen_labels:
+                errors.append(
+                    f"Duplicate repo label '{repo.label}' on repos "
+                    f"'{seen_labels[label_lower]}' and '{name}'"
+                )
+            else:
+                seen_labels[label_lower] = name
+
+        if repo.default:
+            default_count += 1
+
+    # Default constraint
+    if default_count > 1:
+        errors.append(
+            f"Multiple default repos defined ({default_count}); "
+            f"at most one repo may have default: true"
+        )
+
+    # Single-repo configs must mark their one repo as default. This enforces
+    # R3's "trivially defaulted" case explicitly rather than inferring it.
+    non_synthetic = [
+        r for n, r in cfg.repos.items()
+        if not (cfg.repos_synthesized and n == _RESERVED_REPO_NAME)
+    ]
+    if len(non_synthetic) == 1 and not non_synthetic[0].default:
+        errors.append(
+            f"Repo '{non_synthetic[0].name}' is the only repo defined but is "
+            f"not marked default: true; single-repo configs must mark their "
+            f"sole repo as default"
+        )
+
+    # Triage requirement: multi-repo (excluding synthetic) + no default →
+    # require exactly one workflow with triage=True so unlabeled tickets can
+    # be routed through triage to acquire a repo:* label.
+    if len(non_synthetic) > 1 and default_count == 0:
+        # Upstream's WorkflowSpec has no triage flag and the fork's triage layer
+        # is still parked (tests_pending/test_triage_env.py), so there is nothing
+        # to route an unlabelled ticket. Require an explicit default until it is
+        # re-applied, rather than silently dropping such tickets.
+        errors.append(
+            "Multi-repo config with no default repo: mark one repo "
+            "`default: true`. Routing unlabelled tickets by triage is not "
+            "wired in this build (tests_pending/test_triage_env.py)."
+        )
+
+    # Reserved-prefix warning: warn on operator-declared labels that
+    # near-match stokowski's reserved namespaces (typo protection). Checked
+    # across workflows and repos; emitted at WARNING level.
+    for prefix in _RESERVED_LABEL_PREFIXES:
+        near_match_typos = _near_match_prefixes(prefix)
+        for rule in cfg.routing.rules:
+            if rule.label and any(
+                rule.label.lower().startswith(t) for t in near_match_typos
+            ):
+                log.warning(
+                    "Routing rule for workflow '%s' has label '%s', a "
+                    "near-match to the reserved prefix '%s' — typo?",
+                    wf.name, wf.label, prefix,
+                )
+        for repo in cfg.repos.values():
+            if repo.label and any(
+                repo.label.lower().startswith(t) for t in near_match_typos
+            ):
+                log.warning(
+                    "Repo '%s' label '%s' looks like a near-match to the "
+                    "reserved prefix '%s' — typo?",
+                    repo.name, repo.label, prefix,
+                )
+
+    return errors
+
+
 def validate_config(cfg: ServiceConfig) -> list[str]:
     """Validate state machine config for dispatch readiness. Returns list of errors."""
     errors: list[str] = []
@@ -1160,6 +1382,8 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
             logger.warning(
                 "State '%s' has docker_image set but docker.enabled is false", name
             )
+
+    errors.extend(_validate_repos(cfg))
 
     for key in cfg.unwired_keys:
         errors.append(f"'{key}:' is set, but {UNWIRED_FORK_KEYS[key]}.")
