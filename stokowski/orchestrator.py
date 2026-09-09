@@ -65,6 +65,102 @@ def _resolve_docker_image(
     return platform_default or ""
 
 
+def cleanup_old_logs(log_dir: Path, max_age_days: int) -> int:
+    """Delete log files older than max_age_days. Returns count of deleted files."""
+    cutoff = time.time() - (max_age_days * 86400)
+    deleted = 0
+    for issue_dir in log_dir.iterdir():
+        if not issue_dir.is_dir():
+            continue
+        for log_file in issue_dir.iterdir():
+            if not log_file.is_file():
+                continue
+            try:
+                if log_file.stat().st_mtime < cutoff:
+                    log_file.unlink()
+                    deleted += 1
+            except OSError:
+                pass
+        # Remove empty issue directory
+        try:
+            if issue_dir.is_dir() and not any(issue_dir.iterdir()):
+                issue_dir.rmdir()
+        except OSError:
+            pass
+    if deleted:
+        logger.info(f"Log retention: deleted {deleted} old log files")
+    return deleted
+
+
+def enforce_size_limit(
+    log_dir: Path,
+    max_total_size_mb: int,
+    exempt_identifiers: set[str] | None = None,
+) -> int:
+    """Delete oldest log files when total size exceeds limit. Returns count deleted.
+
+    Files in directories matching exempt_identifiers are skipped (active agents).
+    """
+    exempt = exempt_identifiers or set()
+    max_bytes = max_total_size_mb * 1024 * 1024
+
+    # Collect all log files with their sizes and mtimes
+    files: list[tuple[Path, float, int]] = []  # (path, mtime, size)
+    total_size = 0
+    for issue_dir in log_dir.iterdir():
+        if not issue_dir.is_dir():
+            continue
+        for log_file in issue_dir.iterdir():
+            if not log_file.is_file():
+                continue
+            try:
+                stat = log_file.stat()
+                files.append((log_file, stat.st_mtime, stat.st_size))
+                total_size += stat.st_size
+            except OSError:
+                pass
+
+    if total_size <= max_bytes:
+        return 0
+
+    # Sort oldest first
+    files.sort(key=lambda x: x[1])
+
+    deleted = 0
+    for path, mtime, size in files:
+        if total_size <= max_bytes:
+            break
+        # Skip files for actively running agents
+        if path.parent.name in exempt:
+            continue
+        try:
+            path.unlink()
+            total_size -= size
+            deleted += 1
+        except OSError:
+            pass
+
+    # Clean up empty directories
+    for issue_dir in log_dir.iterdir():
+        if not issue_dir.is_dir():
+            continue
+        try:
+            if not any(issue_dir.iterdir()):
+                issue_dir.rmdir()
+        except OSError:
+            pass
+
+    if deleted:
+        logger.info(f"Log retention: deleted {deleted} files to enforce size limit")
+    if total_size > max_bytes:
+        logger.warning(
+            f"Log retention: still over size limit after cleanup "
+            f"({total_size // (1024*1024)}MB > {max_total_size_mb}MB) — "
+            f"remaining files may belong to active agents"
+        )
+    return deleted
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -184,6 +280,7 @@ class Orchestrator:
             # parsing and validating correctly. docker.enabled was, which meant
             # agents ran on the host while the config said they were contained.
             docker=full.config.docker,
+            logging=full.config.logging,
             repos=full.config.repos,
             repos_synthesized=full.config.repos_synthesized,
             unwired_keys=full.config.unwired_keys,

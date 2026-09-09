@@ -169,6 +169,27 @@ UNWIRED_FORK_KEYS: dict[str, str] = {}
 
 
 @dataclass
+class LoggingConfig:
+    """Agent run log retention configuration."""
+    enabled: bool = False
+    log_dir: str = ""
+    max_age_days: int = 14
+    max_total_size_mb: int = 500
+
+    def resolved_log_dir(self, base: Path | None = None) -> Path:
+        """Resolve ~ and $VAR in log_dir.
+
+        Args:
+            base: Base directory for resolving relative paths (e.g. workflow dir).
+        """
+        expanded = os.path.expanduser(os.path.expandvars(self.log_dir))
+        p = Path(expanded)
+        if not p.is_absolute() and base:
+            p = base / p
+        return p
+
+
+@dataclass
 class DockerConfig:
     """Docker isolation settings for agent containers."""
     enabled: bool = False
@@ -372,6 +393,7 @@ class ServiceConfig:
     agent: AgentConfig = field(default_factory=AgentConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
     linear_states: LinearStatesConfig = field(default_factory=LinearStatesConfig)
     prompts: PromptsConfig = field(default_factory=PromptsConfig)
     states: dict[str, StateConfig] = field(default_factory=dict)
@@ -963,6 +985,15 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
         name = _legacy_project_name(tracker_raw, path)
         projects.append(_build_project(name, synthetic_raw, {}, workflow_dir))
 
+    # Parse agent log retention (fork feature)
+    lg = config_raw.get("logging", {}) or {}
+    logging_cfg = LoggingConfig(
+        enabled=bool(lg.get("enabled", False)),
+        log_dir=str(lg.get("log_dir", "")),
+        max_age_days=int(lg.get("max_age_days", 14)),
+        max_total_size_mb=int(lg.get("max_total_size_mb", 500)),
+    )
+
     # Parse docker (fork feature: agent container isolation)
     dk = config_raw.get("docker", {}) or {}
     docker = DockerConfig(
@@ -1019,6 +1050,7 @@ def parse_workflow_file(path: str | Path) -> WorkflowDefinition:
         agent=agent,
         server=server,
         docker=docker,
+        logging=logging_cfg,
         unwired_keys=_find_unwired_keys(config_raw),
         repos=repos,
         repos_synthesized=repos_synthesized,

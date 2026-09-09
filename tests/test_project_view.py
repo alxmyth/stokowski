@@ -34,6 +34,10 @@ prompts: {global: g.md}
 linear_states: {todo: Todo, active: Doing, review: Review, done: Done}
 polling: {interval_ms: 4242}
 server: {port: 9876}
+logging:
+  enabled: true
+  max_age_days: 3
+  max_total_size_mb: 42
 docker:
   enabled: true
   default_image: "my/agent:latest"
@@ -90,6 +94,14 @@ def test_docker_survives_specifically(loaded):
     )
     assert view.docker.default_image == "my/agent:latest"
     assert view.docker.volume_prefix == "custom-prefix"
+
+
+def test_logging_survives_specifically(loaded):
+    """Named separately because the consequence is unbounded disk growth."""
+    _, view = loaded
+    assert view.logging.enabled is True
+    assert view.logging.max_age_days == 3
+    assert view.logging.max_total_size_mb == 42
 
 
 def test_repos_survive_specifically(loaded):
