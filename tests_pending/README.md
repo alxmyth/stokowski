@@ -23,16 +23,10 @@ That is what makes `git merge upstream/main` cheap from here on.
 | Test file | Feature | Needs |
 |---|---|---|
 | `test_log_retention.py` | Agent log rotation | `LoggingConfig` + runner wiring |
-| `test_attachment_tracking.py` | Linear attachment state | `tracking.py` attachment fns + orchestrator wiring |
 | `test_evaluator.py` | `evaluator` state type | `config.py` state type + orchestrator transition |
 | `test_state_machine.py` | Derived workflow transitions | `derive_workflow_transitions()` |
 | `test_repos_config.py` | `repos:` registry validation | rewrite against upstream's config; still imports `WorkflowConfig` |
-| `test_tracking_multirepo.py` | Repo in tracking payload | attachment metadata `repo` field |
-| `test_rejection_coldstart.py` | Rejection recovery | rejection comment parsing |
 | `test_triage_env.py` | Triage repo routing | `STOKOWSKI_REPOS_JSON` injection |
-| `test_cli_discovery.py` | Multi-path workflow discovery | `main.py` `resolve_workflow_paths()` |
-| `test_orchestrator_multi_project.py` | Our N-file multi-project | **likely superseded** by upstream `MultiOrchestrator` |
-| `test_multi_project_integration.py` | Our N-file multi-project | **likely superseded** — see above |
 
 ## What is already refused, and what merely does nothing
 
@@ -119,10 +113,31 @@ TypeError with the suite fully green. Describe this seam precisely or not at all
 4. `git mv tests_pending/test_x.py tests/`
 5. `pytest tests -q` must be green before the next one starts.
 
-## The two marked "likely superseded"
+## Decisions taken — these are not coming back
 
-Upstream's `MultiOrchestrator` + `ProjectConfig` already run N projects from one
-workflow file. Our model ran N *files* with independent Linear endpoints per
-project — genuinely more capable, but re-adding it means re-plumbing the file
-upstream changes most. Decide deliberately: if upstream's model is sufficient,
-delete these two files rather than carrying them. Do not leave the question open.
+Six features were dropped rather than re-applied. Recover any of them from the
+`pre-convergence` tag if a decision here proves wrong.
+
+**Our N-file multi-project model** (`test_orchestrator_multi_project.py`,
+`test_multi_project_integration.py`). Upstream's `MultiOrchestrator` takes a
+single `workflow_path` and runs every entry in `projects:`, which is the same
+capability from one file. Ours could give each project its own Linear endpoint,
+which upstream's cannot — but buying that back means re-plumbing the file
+upstream changes most, and no shipped config here uses it.
+
+**Multi-path CLI discovery** (`test_cli_discovery.py`). Existed to feed the
+N-file model. Upstream auto-detects `workflow.yaml` → `workflow.yml` →
+`WORKFLOW.md` inline in `cli()`, which had no coverage at all; that precedence
+is now tested in `tests/test_workflow_autodetect.py`.
+
+**Attachment-based state tracking** (`test_attachment_tracking.py`,
+`test_tracking_multirepo.py`, `test_rejection_coldstart.py`, plus the
+`linear.py` attachment API and its `test_attachment_api.py`). This one is a
+genuine loss and worth stating plainly: a single mutable attachment is a better
+record than an append-only comment log. It goes anyway because upstream owns
+state persistence, changes it constantly (#55 authorship, #57 gate recovery,
+comment ordering), and has since fixed the duplicate-comment problem that
+motivated attachments in the first place — `_announced_states` in
+`orchestrator.py`. Re-applying it would put the fork in permanent conflict on
+the hottest path in the codebase, to win a race upstream has already run.
+

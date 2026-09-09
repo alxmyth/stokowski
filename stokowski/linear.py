@@ -182,49 +182,6 @@ query($issueId: String!) {
 }
 """
 
-# ── Attachment API — parked, no caller in this build ───────────────────────
-# The orchestrator tracked state in a Linear attachment rather than a comment;
-# convergence onto upstream restored comment-based tracking, so nothing below
-# is called today. It is kept, not deleted, because it encodes API knowledge
-# that is expensive to re-derive and invisible in a git tag: Linear upserts an
-# attachment by URL rather than by id, `attachmentsForURL` is the read path,
-# and `stokowski://state/` is the key space this fork chose.
-# Re-wired by tests_pending/test_attachment_tracking.py. If that work is
-# abandoned, delete this block and tests/test_attachment_api.py together.
-
-ATTACHMENT_CREATE_MUTATION = """
-mutation AttachmentCreate(
-    $issueId: String!, $url: String!, $title: String!,
-    $subtitle: String, $metadata: JSONObject, $iconUrl: String
-) {
-    attachmentCreate(input: {
-        issueId: $issueId, url: $url, title: $title,
-        subtitle: $subtitle, metadata: $metadata, iconUrl: $iconUrl
-    }) {
-        success
-        attachment { id }
-    }
-}
-"""
-
-ATTACHMENTS_BY_URL_QUERY = """
-query AttachmentsByURL($url: String!) {
-    attachmentsForURL(url: $url) {
-        nodes { id metadata }
-    }
-}
-"""
-
-ATTACHMENT_DELETE_MUTATION = """
-mutation AttachmentDelete($id: String!) {
-    attachmentDelete(id: $id) {
-        success
-    }
-}
-"""
-
-STOKOWSKI_URL_PREFIX = "stokowski://state/"
-
 
 def _parse_datetime(val: str | None) -> datetime | None:
     if not val:
@@ -576,60 +533,4 @@ class LinearClient:
             logger.error(f"Failed to update state for {issue_id}: {e}")
             return False
 
-    async def upsert_stokowski_attachment(
-        self, issue_id: str, identifier: str, metadata: dict, subtitle: str
-    ) -> bool:
-        """Create or update the Stokowski state attachment on an issue."""
-        try:
-            data = await self._graphql(
-                ATTACHMENT_CREATE_MUTATION,
-                {
-                    "issueId": issue_id,
-                    "url": f"{STOKOWSKI_URL_PREFIX}{identifier}",
-                    "title": "Stokowski",
-                    "subtitle": subtitle,
-                    "metadata": metadata,
-                },
-            )
-            return data.get("attachmentCreate", {}).get("success", False)
-        except Exception as e:
-            logger.error(f"Failed to upsert attachment for {identifier}: {e}")
-            return False
 
-    async def fetch_stokowski_attachment(
-        self, identifier: str
-    ) -> dict | None:
-        """Fetch the Stokowski state attachment metadata for an issue."""
-        try:
-            data = await self._graphql(
-                ATTACHMENTS_BY_URL_QUERY,
-                {"url": f"{STOKOWSKI_URL_PREFIX}{identifier}"},
-            )
-            nodes = data.get("attachmentsForURL", {}).get("nodes", [])
-            if nodes:
-                return nodes[0].get("metadata")
-            return None
-        except Exception as e:
-            logger.error(f"Failed to fetch attachment for {identifier}: {e}")
-            return None
-
-    async def delete_stokowski_attachment(
-        self, identifier: str
-    ) -> bool:
-        """Delete the Stokowski state attachment for an issue."""
-        try:
-            data = await self._graphql(
-                ATTACHMENTS_BY_URL_QUERY,
-                {"url": f"{STOKOWSKI_URL_PREFIX}{identifier}"},
-            )
-            nodes = data.get("attachmentsForURL", {}).get("nodes", [])
-            if not nodes:
-                return False
-            att_id = nodes[0]["id"]
-            data = await self._graphql(
-                ATTACHMENT_DELETE_MUTATION, {"id": att_id}
-            )
-            return data.get("attachmentDelete", {}).get("success", False)
-        except Exception as e:
-            logger.error(f"Failed to delete attachment for {identifier}: {e}")
-            return False
