@@ -193,7 +193,11 @@ def test_enabling_docker_while_unwired_is_refused():
     cfg.docker = DockerConfig(enabled=True)
     errors = [e for e in validate_config(cfg) if "docker" in e]
     assert errors, "docker.enabled=true was accepted while Docker is not wired"
-    assert "unsandboxed" in errors[0], "the error must say what actually goes wrong"
+    # Order-independent: other docker validation rules may legitimately be
+    # reported alongside this one.
+    assert any("unsandboxed" in e for e in errors), (
+        f"no error says what actually goes wrong; got {errors!r}"
+    )
 
 
 def test_workspace_creation_does_not_use_the_merged_hooks():
