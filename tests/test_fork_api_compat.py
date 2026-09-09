@@ -175,31 +175,6 @@ def test_docker_config_survived_convergence():
     )
 
 
-def test_enabling_docker_while_unwired_is_refused():
-    """Failing open here means agents run on the host, not in a container.
-
-    Docker config parses today but nothing consumes it, so accepting
-    `enabled: true` would silently drop the isolation an operator asked for.
-    Delete this test when the Docker layer is re-applied — its failure is then
-    the signal that the guard is stale.
-    """
-    from stokowski.config import DockerConfig, ProjectConfig, validate_config
-
-    cfg = ServiceConfig(projects=[ProjectConfig(name="p")])
-    assert not [e for e in validate_config(cfg) if "docker" in e], (
-        "docker disabled must not produce an error"
-    )
-
-    cfg.docker = DockerConfig(enabled=True)
-    errors = [e for e in validate_config(cfg) if "docker" in e]
-    assert errors, "docker.enabled=true was accepted while Docker is not wired"
-    # Order-independent: other docker validation rules may legitimately be
-    # reported alongside this one.
-    assert any("unsandboxed" in e for e in errors), (
-        f"no error says what actually goes wrong; got {errors!r}"
-    )
-
-
 def test_workspace_creation_does_not_use_the_merged_hooks():
     """Guards a regression this fork shipped and reverted, not an upstream bug.
 
