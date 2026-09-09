@@ -1316,7 +1316,7 @@ def _validate_repos(cfg: ServiceConfig) -> list[str]:
                 log.warning(
                     "Routing rule for workflow '%s' has label '%s', a "
                     "near-match to the reserved prefix '%s' — typo?",
-                    wf.name, wf.label, prefix,
+                    rule.workflow, rule.label, prefix,
                 )
         for repo in cfg.repos.values():
             if repo.label and any(

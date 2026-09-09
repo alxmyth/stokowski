@@ -120,3 +120,40 @@ def test_disabled_docker_config_is_still_a_pass_through(tmp_path):
     assert got["argv"][0] == "claude"
     assert "docker" not in got["argv"]
     assert got["cwd"] == str(tmp_path)
+
+
+def test_reserved_prefix_near_match_warns_on_routing_rules(caplog):
+    """Exercises a warning path that had a NameError nothing would have caught.
+
+    Adapting this check from the fork's workflow model to upstream's routing
+    rules left `wf.name, wf.label` behind on the log call. It is inside a branch
+    that only fires on a typo'd label, so every test passed and the first
+    operator to mistype a workflow label would have hit a NameError instead of
+    the warning meant to help them.
+    """
+    import logging
+
+    from stokowski.config import (  # noqa: PLC0415
+        ProjectConfig,
+        RepoConfig,
+        RoutingConfig,
+        RoutingRule,
+        ServiceConfig,
+        _near_match_prefixes,
+        _validate_repos,
+    )
+
+    typo = next(t for t in _near_match_prefixes("workflow:") if t != "workflow:")
+    cfg = ServiceConfig(projects=[ProjectConfig(name="p")])
+    cfg.routing = RoutingConfig(rules=[RoutingRule(label=f"{typo}bug", workflow="bug-fix")])
+    cfg.repos = {
+        "api": RepoConfig(name="api", label="repo:api", clone_url="https://x/a.git", default=True),
+    }
+
+    with caplog.at_level(logging.WARNING):
+        _validate_repos(cfg)
+
+    assert any("near-match" in r.message or "near-match" in r.getMessage()
+               for r in caplog.records), (
+        f"the routing-rule near-match warning did not fire for label {typo!r}"
+    )
