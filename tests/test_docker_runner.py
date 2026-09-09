@@ -17,10 +17,10 @@ import pytest
 
 from stokowski.config import (
     DockerConfig,
+    ProjectConfig,
     ServiceConfig,
     StateConfig,
     TrackerConfig,
-    WorkflowConfig,
     validate_config,
 )
 from stokowski.docker_runner import (
@@ -67,21 +67,18 @@ def _write_plugin_fixture(host_dir: str) -> None:
 
 
 def _minimal_service_config(states: dict[str, StateConfig], docker: DockerConfig) -> ServiceConfig:
-    path = list(states.keys())
-    wf = WorkflowConfig(
-        name="_default",
-        default=True,
-        path=path,
-        entry_state=path[0],
-        terminal_state="terminal",
-        transitions={},
-    )
+    """A config just complete enough for validate_config to reach the docker rules.
+
+    Rewritten for upstream's structure after the convergence: `projects` is the
+    authoritative list and validate_config returns early without it. The fork's
+    old `workflows`/WorkflowConfig model is gone; these tests never depended on
+    it beyond making the config parse.
+    """
+    tracker = TrackerConfig(kind="linear", endpoint="x", api_key="k", project_slug="s")
     return ServiceConfig(
-        tracker=TrackerConfig(
-            kind="linear", endpoint="x", api_key="k", project_slug="s"
-        ),
+        tracker=tracker,
+        projects=[ProjectConfig(name="test", tracker=tracker, states=states)],
         states=states,
-        workflows={"_default": wf},
         docker=docker,
     )
 

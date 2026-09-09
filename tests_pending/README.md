@@ -22,7 +22,6 @@ That is what makes `git merge upstream/main` cheap from here on.
 
 | Test file | Feature | Needs |
 |---|---|---|
-| `test_docker_runner.py` | Docker agent isolation | `runner.py` dispatch hooks |
 | `test_docker_image_hybrid.py` | 3-level image resolution | `config.py` state/repo `docker_image` |
 | `test_log_retention.py` | Agent log rotation | `LoggingConfig` + runner wiring |
 | `test_attachment_tracking.py` | Linear attachment state | `tracking.py` attachment fns + orchestrator wiring |
@@ -39,16 +38,35 @@ That is what makes `git merge upstream/main` cheap from here on.
 
 ## What is already refused, and what merely does nothing
 
-Two of these features have config that still parses, so each is rejected at
-validation rather than accepted and ignored:
+`repos:` is refused by `validate_config` via `UNWIRED_FORK_KEYS` in `config.py`
+— accepting it would ignore every `repo:` label and run a multi-repo team
+against a single repo. Both `workflow.multi-repo*.example.yaml` files therefore
+fail to start, which is deliberate; the top-level README marks them pending.
+The check scans project blocks as well as the top level, because `projects:` is
+upstream's documented shape and a nested `repos:` bypassed an earlier version.
 
-- `docker.enabled: true` — refused by `validate_config`. Accepting it would run
-  agents on the host while the operator believed they were contained.
-- `repos:` — refused by `validate_config` via `UNWIRED_FORK_KEYS` in
-  `config.py`. Both `workflow.multi-repo*.example.yaml` files therefore fail to
-  start, which is deliberate; the README marks them pending.
+Docker isolation is **done** — see below.
 
 Delete the corresponding guard when you re-apply the layer — its test says so.
+That is not hypothetical: the Docker refusal and its guard test were both
+removed in the commit that wired Docker into dispatch, which is the order to
+follow. Wire it, prove it, then lift the guard.
+
+### Docker isolation — re-applied
+
+Wired through `_prepare_docker_args` in `runner.py`, a pass-through when docker
+is absent or disabled. `run_turn` and both runners take `docker_cfg`,
+`docker_image` and `workspace_key` as defaulted keywords; the orchestrator
+passes them at both dispatch sites and at all three `remove_workspace` sites.
+Docker mode uses `docker_env()`, not `agent_env()` — inheriting the parent
+environment into a container defeats the isolation.
+
+Pre-convergence this feature had 64 references in `orchestrator.py`; it now has
+five call-site edits. That difference is the whole point of re-applying a
+feature onto upstream's structure rather than restoring the old integration.
+
+`tests/test_docker_dispatch.py` asserts the launch path; `tests/test_docker_runner.py`
+came back from here with only its `_minimal_service_config` helper rewritten.
 
 `linear.py` also still carries the attachment API (`upsert_`/`fetch_`/
 `delete_stokowski_attachment`) with passing tests in `tests/test_attachment_api.py`,
@@ -69,9 +87,19 @@ TypeError with the suite fully green. Describe this seam precisely or not at all
 
 1. Add the feature to upstream's structure **additively** — a new dataclass, a
    new field with a default, a new branch guarded by that field. Do not
-   restructure a hot file; that is what re-creates the merge debt.
-2. `git mv tests_pending/test_x.py tests/`
-3. `pytest tests -q` must be green before the next one starts.
+   restructure a hot file; that is what re-creates the merge debt. A new
+   parameter must be a defaulted keyword, never a required positional, or it
+   breaks upstream's call sites (`tests/test_fork_api_compat.py` enforces this).
+2. Expect to **rewrite the test, not just move it.** These were written against
+   the fork's old config API, and several import symbols the convergence
+   removed. `test_docker_runner.py` needed only its `_minimal_service_config`
+   helper rebuilt on `ProjectConfig`; others may need more. An earlier version
+   of this file said "git mv" and that was too optimistic.
+3. Note that these files **cross-depend**: `test_docker_image_hybrid.py` is
+   blocked on `RepoConfig` and `test_log_retention.py` on `cleanup_old_logs`,
+   neither of which is a Docker concern. The table's rows are not independent.
+4. `git mv tests_pending/test_x.py tests/`
+5. `pytest tests -q` must be green before the next one starts.
 
 ## The two marked "likely superseded"
 
