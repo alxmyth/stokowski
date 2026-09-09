@@ -96,6 +96,10 @@ class WorkflowSpec:
     states: dict[str, StateConfig] = field(default_factory=dict)
     global_prompt: str | list[str] | None = None
     description: str = ""
+    # Fork: a triage pipeline classifies an unlabelled ticket and applies the
+    # repo:/workflow: labels the real pipelines route on. It receives the repo
+    # registry as STOKOWSKI_REPOS_JSON at dispatch.
+    triage: bool = False
 
     @property
     def entry_state(self) -> str | None:
@@ -750,6 +754,7 @@ def _load_workflow_dir(workflow_dir: Path) -> dict[str, WorkflowSpec]:
             states=_parse_states(raw.get("states") or {}),
             global_prompt=prompts_raw.get("global_prompt"),
             description=str(raw.get("description") or ""),
+            triage=bool(raw.get("triage", False)),
         )
     return found
 
@@ -1307,15 +1312,16 @@ def _validate_repos(cfg: ServiceConfig) -> list[str]:
     # require exactly one workflow with triage=True so unlabeled tickets can
     # be routed through triage to acquire a repo:* label.
     if len(non_synthetic) > 1 and default_count == 0:
-        # Upstream's WorkflowSpec has no triage flag and the fork's triage layer
-        # is still parked (tests_pending/test_triage_env.py), so there is nothing
-        # to route an unlabelled ticket. Require an explicit default until it is
-        # re-applied, rather than silently dropping such tickets.
-        errors.append(
-            "Multi-repo config with no default repo: mark one repo "
-            "`default: true`. Routing unlabelled tickets by triage is not "
-            "wired in this build (tests_pending/test_triage_env.py)."
-        )
+        # Without a default, an unlabelled ticket has nowhere to go unless a
+        # triage pipeline classifies it first.
+        triage_workflows = [w for w in cfg.workflows.values() if w.triage]
+        if len(triage_workflows) != 1:
+            errors.append(
+                "Multi-repo config with no default repo requires exactly one "
+                "workflow with triage: true to route unlabelled tickets "
+                f"(found: {len(triage_workflows)}). Alternatively mark one "
+                "repo `default: true`."
+            )
 
     # Reserved-prefix warning: warn on operator-declared labels that
     # near-match stokowski's reserved namespaces (typo protection). Checked

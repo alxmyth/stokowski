@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -177,6 +178,15 @@ class Orchestrator:
             routing=project.routing,
             projects=[project],
             workflow_dir=full.config.workflow_dir,
+            # Fork fields. These are top-level settings, not per-project, and
+            # this view is built by naming fields explicitly — so anything not
+            # listed here is silently reset to its default at runtime after
+            # parsing and validating correctly. docker.enabled was, which meant
+            # agents ran on the host while the config said they were contained.
+            docker=full.config.docker,
+            repos=full.config.repos,
+            repos_synthesized=full.config.repos_synthesized,
+            unwired_keys=full.config.unwired_keys,
         )
         return WorkflowDefinition(config=project_cfg, prompt_template=full.prompt_template)
 
@@ -399,6 +409,32 @@ class Orchestrator:
 
         if self._linear:
             await self._linear.close()
+
+    def _triage_env_for(self, issue: Issue) -> dict[str, str]:
+        """Extra env for a triage dispatch; empty for every other pipeline.
+
+        Triage classifies an unlabelled ticket and applies the labels the real
+        pipelines route on, so it has to know which repos exist. Every other
+        pipeline gets nothing — handing an agent the full registry invites it to
+        act on a repo it was not routed to.
+
+        The synthetic `_default` is excluded: it is the legacy single-repo
+        fallback and carries no label for an agent to apply.
+        """
+        workflow = self._workflow_for(issue)
+        if workflow is None or not workflow.triage:
+            return {}
+        return {
+            "STOKOWSKI_REPOS_JSON": json.dumps([
+                {
+                    "name": r.name,
+                    "label": r.label or "",
+                    "clone_url": r.clone_url or "",
+                }
+                for r in self.cfg.repos.values()
+                if r.name != "_default"
+            ])
+        }
 
     def _repo_config_for(self, issue: Issue) -> RepoConfig | None:
         """The RepoConfig this issue was routed to, or None if unresolvable."""
@@ -1312,6 +1348,7 @@ class Orchestrator:
             # and defeat the isolation the container exists to provide.
             agent_env = self.cfg.docker_env() if _docker else self.cfg.agent_env()
             agent_env["STOKOWSKI_ARTIFACTS"] = str(artifact_path)
+            agent_env.update(self._triage_env_for(issue))
             agent_env["STOKOWSKI_ISSUE"] = issue.identifier
             if state_name:
                 agent_env["STOKOWSKI_STATE"] = state_name
