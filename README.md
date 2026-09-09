@@ -213,34 +213,31 @@ Symphony assumes one Linear project maps to one repo. Stokowski supports the tea
 <details>
 <summary><strong>Multi-project orchestration</strong></summary>
 
-One orchestrator process can poll N Linear projects by binding multiple `workflow.<project>.yml` files. Each file stays a complete self-contained config — no nested schema, no cross-file coupling. Invoke with a single file (legacy), a directory, a glob, or an explicit list:
+One orchestrator process polls N Linear projects from a **single** workflow
+file. Each entry under `projects:` carries its own tracker, states and hooks;
+everything shared — polling, concurrency, the web server, Docker, the `repos:`
+registry — stays at the top level so an API key rotates in one place.
 
-```bash
-stokowski workflow.yaml                 # single project (legacy, unchanged)
-stokowski workflows/                    # directory → every *.yaml/.yml inside
-stokowski 'workflow.*.yml'              # glob
-stokowski workflow.a.yml workflow.b.yml # explicit list
+```yaml
+projects:
+  - name: alpha
+    tracker: {api_key: "$ALPHA_KEY", project_slug: alpha}
+    states: {...}
+  - name: beta
+    tracker: {api_key: "$BETA_KEY", project_slug: beta}
+    states: {...}
 ```
 
-**Or set it once via `.env`:**
+Then `stokowski workflow.yaml`, or just `stokowski` — it auto-detects
+`./workflow.yaml`, then `./workflow.yml`, then `./WORKFLOW.md`. An explicit
+path always wins over auto-detection.
 
-```bash
-# .env
-STOKOWSKI_WORKFLOW_PATH=examples/multi-project/
-```
-
-Then just `stokowski`. `STOKOWSKI_WORKFLOW_PATH` accepts the same shapes (file, directory, glob). Precedence: CLI args > env var > auto-detect (`./workflow.yaml` / `./workflow.yml` / `./WORKFLOW.md`). See `.env.example` for the full set of supported variables.
-
-Per-project isolation:
-- Own `tracker.api_key` — per-project API keys are first-class.
-- Own `linear_states`, `states`, `workflows`, `repos`, `hooks`, `workspace.root`, `docker.*`, `claude` defaults.
-- Own `LinearClient` — one httpx client per project, closed together at shutdown.
-
-Shared globals (first-file-wins, alphabetical-case-insensitive): `agent.max_concurrent_agents`, `server.port`. Shared global that reduces across files: `polling.interval_ms` (min wins). A broken edit to one project file does not stall healthy projects — per-file hot-reload with last-known-good preservation.
-
-Every dispatch adds `STOKOWSKI_LINEAR_PROJECT_SLUG` to the agent subprocess env alongside `STOKOWSKI_ISSUE_IDENTIFIER`. The dashboard snapshot emits `project_slug` on every running/gates/retrying entry.
-
-See `examples/multi-project/` for a worked two-file example with a README and `--dry-run` walkthrough.
+> **Changed.** This fork previously bound N separate `workflow.<project>.yml`
+> files via a directory, glob or `STOKOWSKI_WORKFLOW_PATH`. That model was
+> dropped when the fork converged onto upstream, which reaches the same result
+> from one file. The one capability lost is a per-project Linear *endpoint*;
+> per-project API keys and slugs are still first-class. See
+> `docs/convergence.md`.
 
 </details>
 
