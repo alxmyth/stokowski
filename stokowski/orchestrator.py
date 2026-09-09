@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from jinja2 import Environment, StrictUndefined, TemplateSyntaxError
+from jinja2 import Environment, StrictUndefined, TemplateSyntaxError, UndefinedError
 
 from .config import (
     RepoConfig,
@@ -30,7 +30,11 @@ from .config import (
 from .linear import LinearClient
 from .models import Issue, RetryEntry, RunAttempt
 from .pool import ConcurrencyPool
-from .prompt import assemble_prompt, build_lifecycle_section
+from .prompt import (
+    assemble_prompt,
+    build_lifecycle_section,
+    render_hooks_for_dispatch,
+)
 from .runner import run_agent_turn, run_turn
 from .tracking import make_gate_comment, make_state_comment, parse_latest_tracking, parse_evaluation_tier
 from . import artifacts as artifacts_mod
@@ -520,6 +524,39 @@ class Orchestrator:
         if self._linear:
             await self._linear.close()
 
+    def _hooks_for(self, repo: RepoConfig | None) -> HooksConfig:
+        """Root hooks with repo metadata rendered in.
+
+        A hook body like `git clone {{ repo.clone_url }} .` is a template, and
+        nothing else renders it — passing the raw config to run_hook sends the
+        braces to the shell, which then clones a repository literally named
+        `{{ repo.clone_url }}`.
+
+        A legacy config (repos_synthesized) bypasses rendering entirely, so a
+        hook containing literal `${...}` shell syntax keeps working.
+        """
+        if repo is None:
+            return self.cfg.hooks
+        return render_hooks_for_dispatch(
+            self.cfg.hooks, repo, self.cfg.repos_synthesized
+        )
+
+    def _hooks_for_teardown(self, repo: RepoConfig | None) -> HooksConfig:
+        """As above, but never raises — cleanup must not be blocked by a typo.
+
+        The hook would fail on execution anyway if the template is genuinely
+        broken; refusing to clean up on top of that helps nobody.
+        """
+        try:
+            return self._hooks_for(repo)
+        except (UndefinedError, TemplateSyntaxError) as e:
+            logger.warning(
+                "Hook rendering failed during teardown for repo=%s: %s — "
+                "passing raw hooks through (execution may fail)",
+                repo.name if repo else "?", e,
+            )
+            return self.cfg.hooks
+
     def _triage_env_for(self, issue: Issue) -> dict[str, str]:
         """Extra env for a triage dispatch; empty for every other pipeline.
 
@@ -584,7 +621,7 @@ class Orchestrator:
                 await remove_workspace(
                     ws_root,
                     issue.identifier,
-                    self.cfg.hooks,
+                    self._hooks_for_teardown(self._repo_config_for(issue)),
                     repo_name=self._repo_name_for(issue),
                     docker_cfg=self.cfg.docker_if_enabled,
                 )
@@ -816,7 +853,7 @@ class Orchestrator:
                 await remove_workspace(
                     ws_root,
                     issue.identifier,
-                    self.cfg.hooks,
+                    self._hooks_for_teardown(self._repo_config_for(issue)),
                     repo_name=self._repo_name_for(issue),
                     docker_cfg=self.cfg.docker_if_enabled,
                 )
@@ -1384,10 +1421,24 @@ class Orchestrator:
             _state_image = _resolve_docker_image(
                 state_cfg, _repo, self.cfg.docker.default_image
             )
+            try:
+                _hooks = self._hooks_for(_repo)
+            except (UndefinedError, TemplateSyntaxError) as render_err:
+                # A typo'd variable or unparseable brace is a config problem,
+                # not a transient failure — retrying it forever helps nobody.
+                attempt.status = "config_error"
+                attempt.error = (
+                    f"Hook template failed to render for repo "
+                    f"'{_repo.name if _repo else '?'}': {render_err}"
+                )
+                logger.error(attempt.error, extra={"linked_to": issue.identifier})
+                self._on_worker_exit(issue, attempt)
+                return
+
             ws = await ensure_workspace(
                 ws_root,
                 issue.identifier,
-                self.cfg.hooks,
+                _hooks,
                 repo_name=_repo.name,
                 docker_cfg=_docker,
                 docker_image=_state_image,

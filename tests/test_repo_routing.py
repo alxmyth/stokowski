@@ -92,3 +92,68 @@ def test_distinct_repos_get_distinct_workspaces(tmp_path):
     b = asyncio.run(ensure_workspace(tmp_path, "ENG-1", hooks, repo_name="web"))
     assert a.path != b.path
     assert a.path.exists() and b.path.exists()
+
+
+def test_hook_templates_are_rendered_before_they_reach_the_shell():
+    """The seam that shipped a regression: a helper with no caller.
+
+    `render_hooks_for_dispatch` existed, was well tested, and nothing called
+    it — so `git clone {{ repo.clone_url }} .` went to the shell verbatim and
+    cloned a repository literally named `{{ repo.clone_url }}`. Every test
+    passed, because every test called the helper directly.
+
+    This asserts the wiring, not the helper.
+    """
+    import ast
+    from pathlib import Path as _Path
+
+    src = (_Path(__file__).resolve().parent.parent / "stokowski" / "orchestrator.py").read_text()
+    tree = ast.parse(src)
+    callers = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "id", None) == "render_hooks_for_dispatch"
+    ]
+    assert callers, (
+        "orchestrator.py never calls render_hooks_for_dispatch, so hook "
+        "templates reach run_hook unrendered and the braces go to the shell"
+    )
+
+
+def test_a_repo_hook_template_resolves_to_the_routed_repo():
+    """End to end through the orchestrator's own helper, not the bare function."""
+    from stokowski.config import HooksConfig as _Hooks
+    from stokowski.orchestrator import Orchestrator
+
+    cfg = _cfg()
+    cfg.hooks = _Hooks(after_create="git clone {{ repo.clone_url }} .")
+
+    orch = Orchestrator.__new__(Orchestrator)
+    from stokowski.config import WorkflowDefinition
+    orch.workflow = WorkflowDefinition(config=cfg, prompt_template="")
+
+    rendered = orch._hooks_for(cfg.repos["api"])
+    assert rendered.after_create == "git clone https://x/a.git .", rendered.after_create
+    assert "{{" not in rendered.after_create
+
+    # A legacy config bypasses rendering, so literal shell braces still work.
+    legacy = _cfg()
+    legacy.repos = {"_default": RepoConfig(name="_default", default=True)}
+    legacy.repos_synthesized = True
+    legacy.hooks = _Hooks(after_create='echo "${HOME}" && echo {literal}')
+    orch.workflow = WorkflowDefinition(config=legacy, prompt_template="")
+    assert orch._hooks_for(legacy.repos["_default"]).after_create == 'echo "${HOME}" && echo {literal}'
+
+
+def test_teardown_never_raises_on_a_broken_template():
+    """A typo must not also block cleanup — the workspace still has to go."""
+    from stokowski.config import HooksConfig as _Hooks, WorkflowDefinition
+    from stokowski.orchestrator import Orchestrator
+
+    cfg = _cfg()
+    cfg.hooks = _Hooks(before_remove="rm -rf {{ repo.clne_url }}")  # typo
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.workflow = WorkflowDefinition(config=cfg, prompt_template="")
+
+    out = orch._hooks_for_teardown(cfg.repos["api"])
+    assert out is not None, "teardown rendering must degrade, not raise"
