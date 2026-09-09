@@ -63,11 +63,11 @@ linear_states:
   gate_approved: "Gate Approved"
   rework: "Rework"
   terminal:
-    - Done
-    - Closed
-    - Cancelled
-    - Canceled
-    - Duplicate
+  - Done
+  - Closed
+  - Cancelled
+  - Canceled
+  - Duplicate
 
 polling:
   interval_ms: 15000
@@ -170,6 +170,8 @@ states:
     session: fresh
 
   # ── Main pipeline (the full CE flow) ─────────────────────────────────
+    transitions:
+      complete: investigate
   investigate:
     type: agent
     prompt: prompts/investigate.example.md
@@ -178,12 +180,16 @@ states:
     max_turns: 8
     session: inherit
 
+    transitions:
+      complete: research-review
   research-review:
     type: gate
     linear_state: review
     rework_to: investigate
     max_rework: 3
 
+    transitions:
+      approve: implement
   implement:
     type: agent
     prompt: prompts/implement.example.md
@@ -192,12 +198,16 @@ states:
     max_turns: 30
     session: inherit
 
+    transitions:
+      complete: implementation-review
   implementation-review:
     type: gate
     linear_state: review
     rework_to: implement
     max_rework: 5
 
+    transitions:
+      approve: code-review
   code-review:
     type: agent
     prompt: prompts/review.example.md
@@ -207,12 +217,16 @@ states:
     max_turns: 10
     session: fresh
 
+    transitions:
+      complete: merge-review
   merge-review:
     type: gate
     linear_state: review
     rework_to: implement
     max_rework: 5
 
+    transitions:
+      approve: merge
   merge:
     type: agent
     prompt: prompts/merge.example.md
@@ -220,6 +234,8 @@ states:
     max_turns: 5
     session: inherit
 
+    transitions:
+      complete: done
   done:
     type: terminal
     linear_state: terminal
@@ -255,14 +271,14 @@ workflows:
   main:
     label: "workflow:main"
     path:
-      - investigate
-      - research-review
-      - implement
-      - implementation-review
-      - code-review
-      - merge-review
-      - merge
-      - done
+    - investigate
+    - research-review
+    - implement
+    - implementation-review
+    - code-review
+    - merge-review
+    - merge
+    - done
 
   # Add additional pipelines here (e.g., `quick-fix`, `refinement`) and
   # the triage agent can pick between them. Each workflow is a named path

@@ -27,9 +27,6 @@ ENV_ERRORS = ("missing tracker API key",)
 
 # Configs that cannot validate yet. Value = why. Empty is the goal.
 PENDING = {
-    "workflow.multi-repo-triage.example.yaml": "repos: registry and derived workflow transitions",
-    "examples/multi-project/workflow.alpha.yaml": "repos: registry and N-file multi-project",
-    "examples/multi-project/workflow.beta.yaml": "repos: registry and N-file multi-project",
 }
 
 
@@ -48,7 +45,9 @@ def test_the_walk_finds_the_configs():
     """A discovery test that finds nothing guarantees nothing."""
     names = {p.name for p in _shipped()}
     assert "workflow.example.yaml" in names, "the primary example is not being validated"
-    assert len(_shipped()) >= 4, f"only found {len(_shipped())} shipped configs"
+    # Three today: the primary example plus the two multi-repo ones. The guard
+    # exists so a glob that stops matching cannot make this file vacuous.
+    assert len(_shipped()) >= 3, f"only found {len(_shipped())} shipped configs"
 
 
 @pytest.mark.parametrize("path", _shipped(), ids=lambda p: p.name)
