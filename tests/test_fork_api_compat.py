@@ -211,14 +211,23 @@ def test_workspace_creation_does_not_use_the_merged_hooks():
         if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "ensure_workspace"
     ]
     assert calls, "ensure_workspace call not found in orchestrator.py"
+    # The invariant is "root hooks", not one literal expression: the value may
+    # be self.cfg.hooks directly, or the repo-rendered form of it. What it must
+    # never be is hooks_cfg, the state-merged object.
+    allowed = {"self.cfg.hooks", "_hooks", "self._hooks_for(_repo)"}
     for call in calls:
         rendered = ast.unparse(call.args[2]) if len(call.args) > 2 else "<missing>"
-        assert rendered == "self.cfg.hooks", (
+        assert rendered != "hooks_cfg", (
+            f"orchestrator.py:{call.lineno} passes the merged hooks_cfg to "
+            f"ensure_workspace. That drops the root's after_create for any state "
+            f"declaring a hooks block, creating an empty workspace that is then "
+            f"dispatched into. Read this test's docstring before changing it."
+        )
+        assert rendered in allowed, (
             f"orchestrator.py:{call.lineno} passes {rendered!r} as hooks to "
-            f"ensure_workspace. Passing the merged hooks_cfg drops the root's "
-            f"after_create for any state that declares a hooks block, creating "
-            f"an empty workspace that is dispatched into. Read this test's "
-            f"docstring before changing it."
+            f"ensure_workspace, which is neither the root hooks nor their "
+            f"repo-rendered form. If that is deliberate, add it to `allowed` "
+            f"and say why — but check it is not hooks_cfg in disguise."
         )
 
 
