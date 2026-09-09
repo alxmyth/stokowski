@@ -382,7 +382,12 @@ class Orchestrator:
             )
             ws_root = self.cfg.workspace.resolved_root()
             for issue in terminal:
-                await remove_workspace(ws_root, issue.identifier, self.cfg.hooks)
+                await remove_workspace(
+                    ws_root,
+                    issue.identifier,
+                    self.cfg.hooks,
+                    docker_cfg=self.cfg.docker_if_enabled,
+                )
             if terminal:
                 logger.info(f"Cleaned {len(terminal)} terminal workspaces")
         except Exception as e:
@@ -608,7 +613,12 @@ class Orchestrator:
             # Clean up workspace
             try:
                 ws_root = self.cfg.workspace.resolved_root()
-                await remove_workspace(ws_root, issue.identifier, self.cfg.hooks)
+                await remove_workspace(
+                    ws_root,
+                    issue.identifier,
+                    self.cfg.hooks,
+                    docker_cfg=self.cfg.docker_if_enabled,
+                )
             except Exception as e:
                 logger.warning(f"Failed to remove workspace for {issue.identifier}: {e}", extra={"linked_to": issue.identifier})
             # Clean up tracking state
@@ -1160,7 +1170,15 @@ class Orchestrator:
             # dispatched into it. Upstream's inconsistency — a state-level
             # after_create override is ignored — is the lesser bug, and belongs
             # upstream with the merge semantics question, not patched here.
-            ws = await ensure_workspace(ws_root, issue.identifier, self.cfg.hooks)
+            _docker = self.cfg.docker_if_enabled
+            _state_image = (state_cfg.docker_image or "") if state_cfg else ""
+            ws = await ensure_workspace(
+                ws_root,
+                issue.identifier,
+                self.cfg.hooks,
+                docker_cfg=_docker,
+                docker_image=_state_image,
+            )
             attempt.workspace_path = str(ws.path)
 
             # Evidence directory, created fresh each turn and excluded from git
@@ -1221,7 +1239,11 @@ class Orchestrator:
             prompt = await self._render_prompt_async(issue, attempt.attempt, state_name)
 
             # Build env vars for the agent subprocess from workflow.yaml config
-            agent_env = self.cfg.agent_env()
+            # docker_env() forwards only explicitly declared variables;
+            # agent_env() inherits the parent environment. Inheriting into a
+            # container would hand the agent the operator's whole environment
+            # and defeat the isolation the container exists to provide.
+            agent_env = self.cfg.docker_env() if _docker else self.cfg.agent_env()
             agent_env["STOKOWSKI_ARTIFACTS"] = str(artifact_path)
             agent_env["STOKOWSKI_ISSUE"] = issue.identifier
             if state_name:
@@ -1244,6 +1266,9 @@ class Orchestrator:
                     on_event=self._on_agent_event,
                     on_pid=self._on_child_pid,
                     env=agent_env,
+                    docker_cfg=_docker,
+                    docker_image=_state_image,
+                    workspace_key=ws.workspace_key,
                 )
             else:
                 # Legacy mode: multi-turn loop
@@ -1286,6 +1311,9 @@ class Orchestrator:
                         on_event=self._on_agent_event,
                         on_pid=self._on_child_pid,
                         env=agent_env,
+                        docker_cfg=_docker,
+                        docker_image=_state_image,
+                        workspace_key=ws.workspace_key,
                     )
 
                     if attempt.status != "succeeded":
@@ -1805,7 +1833,10 @@ class Orchestrator:
                 if attempt:
                     ws_root = self.cfg.workspace.resolved_root()
                     await remove_workspace(
-                        ws_root, attempt.issue_identifier, self.cfg.hooks
+                        ws_root,
+                        attempt.issue_identifier,
+                        self.cfg.hooks,
+                        docker_cfg=self.cfg.docker_if_enabled,
                     )
 
                 self.running.pop(issue_id, None)

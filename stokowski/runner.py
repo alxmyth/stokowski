@@ -9,9 +9,53 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from .config import ClaudeConfig, HooksConfig
+from .config import ClaudeConfig, DockerConfig, HooksConfig
+from .docker_runner import build_docker_run_args, container_name_for
 from .events import EventCallback, process_event
 from .models import Issue, RunAttempt
+
+
+def _prepare_docker_args(
+    docker_cfg: DockerConfig | None,
+    args: list[str],
+    workspace_path: Path,
+    workspace_key: str,
+    issue: Issue,
+    attempt: RunAttempt,
+    env: dict[str, str] | None,
+    docker_image: str = "",
+    needs_plugin_config: bool = False,
+) -> tuple[list[str], str | None, str | None, dict[str, str] | None]:
+    """Wrap CLI args in `docker run` when Docker isolation is enabled.
+
+    Returns (args, container_name, cwd, env). With Docker enabled, cwd and env
+    are None because `docker run` carries them itself.
+
+    A pure pass-through when docker_cfg is None or disabled — that is what
+    keeps this an additive seam rather than a rewrite of the launch path.
+
+    `needs_plugin_config` opts in to Claude Code plugin-config rewriting; only
+    the Claude runner sets it, so DooD shim fields are never consulted for a
+    Codex turn.
+    """
+    if not (docker_cfg and docker_cfg.enabled):
+        return args, None, str(workspace_path), env
+
+    container_name = container_name_for(
+        issue.identifier, attempt.turn_count + 1, attempt.attempt
+    )
+    attempt.container_name = container_name
+    image = docker_image or docker_cfg.default_image
+    docker_args = build_docker_run_args(
+        docker_cfg=docker_cfg,
+        image=image,
+        command=args,
+        workspace_key=workspace_key,
+        env=env or {},
+        container_name=container_name,
+        needs_plugin_config=needs_plugin_config,
+    )
+    return docker_args, container_name, None, None
 
 logger = logging.getLogger("stokowski.runner")
 
@@ -115,6 +159,9 @@ async def run_codex_turn(
     turn_timeout_ms: int = 3_600_000,
     stall_timeout_ms: int = 300_000,
     env: dict[str, str] | None = None,
+    docker_cfg: DockerConfig | None = None,
+    docker_image: str = "",
+    workspace_key: str = "",
 ) -> RunAttempt:
     """Run a single Codex turn. Returns updated RunAttempt.
 
@@ -147,14 +194,25 @@ async def run_codex_turn(
     attempt.last_event_at = datetime.now(timezone.utc)
 
     try:
+        exec_args, _container, exec_cwd, exec_env = _prepare_docker_args(
+            docker_cfg=docker_cfg,
+            args=args,
+            workspace_path=workspace_path,
+            workspace_key=workspace_key,
+            issue=issue,
+            attempt=attempt,
+            env=env,
+            docker_image=docker_image,
+            needs_plugin_config=False,
+        )
         proc = await asyncio.create_subprocess_exec(
-            *args,
-            cwd=str(workspace_path),
+            *exec_args,
+            cwd=exec_cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
             limit=10 * 1024 * 1024,  # 10MB line buffer (default 64KB)
-            env=env,
+            env=exec_env,
         )
         if on_pid and proc.pid:
             on_pid(proc.pid, True)
@@ -277,6 +335,9 @@ async def run_agent_turn(
     on_event: EventCallback | None = None,
     on_pid: PidCallback | None = None,
     env: dict[str, str] | None = None,
+    docker_cfg: DockerConfig | None = None,
+    docker_image: str = "",
+    workspace_key: str = "",
 ) -> RunAttempt:
     """Run a single Claude Code turn. Returns updated RunAttempt."""
     args = build_claude_args(
@@ -308,14 +369,25 @@ async def run_agent_turn(
     attempt.last_event_at = datetime.now(timezone.utc)
 
     try:
+        exec_args, _container, exec_cwd, exec_env = _prepare_docker_args(
+            docker_cfg=docker_cfg,
+            args=args,
+            workspace_path=workspace_path,
+            workspace_key=workspace_key,
+            issue=issue,
+            attempt=attempt,
+            env=env,
+            docker_image=docker_image,
+            needs_plugin_config=True,
+        )
         proc = await asyncio.create_subprocess_exec(
-            *args,
-            cwd=str(workspace_path),
+            *exec_args,
+            cwd=exec_cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
             limit=10 * 1024 * 1024,  # 10MB line buffer (default 64KB)
-            env=env,
+            env=exec_env,
         )
         if on_pid and proc.pid:
             on_pid(proc.pid, True)
@@ -451,6 +523,9 @@ async def run_turn(
     on_event: EventCallback | None = None,
     on_pid: PidCallback | None = None,
     env: dict[str, str] | None = None,
+    docker_cfg: DockerConfig | None = None,
+    docker_image: str = "",
+    workspace_key: str = "",
 ) -> RunAttempt:
     """Route to the correct runner based on runner_type."""
     if runner_type == "codex":
@@ -465,6 +540,9 @@ async def run_turn(
             turn_timeout_ms=claude_cfg.turn_timeout_ms,
             stall_timeout_ms=claude_cfg.stall_timeout_ms,
             env=env,
+            docker_cfg=docker_cfg,
+            docker_image=docker_image,
+            workspace_key=workspace_key,
         )
     elif runner_type == "claude":
         return await run_agent_turn(
@@ -477,6 +555,9 @@ async def run_turn(
             on_event=on_event,
             on_pid=on_pid,
             env=env,
+            docker_cfg=docker_cfg,
+            docker_image=docker_image,
+            workspace_key=workspace_key,
         )
     else:
         raise ValueError(f"Unknown runner type: {runner_type}")
