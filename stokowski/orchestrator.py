@@ -32,7 +32,7 @@ from .models import Issue, RetryEntry, RunAttempt
 from .pool import ConcurrencyPool
 from .prompt import assemble_prompt, build_lifecycle_section
 from .runner import run_agent_turn, run_turn
-from .tracking import make_gate_comment, make_state_comment, parse_latest_tracking
+from .tracking import make_gate_comment, make_state_comment, parse_latest_tracking, parse_evaluation_tier
 from . import artifacts as artifacts_mod
 from . import report as report_mod
 from .events import summarise_tool_input
@@ -159,6 +159,19 @@ def enforce_size_limit(
             f"remaining files may belong to active agents"
         )
     return deleted
+
+
+def _select_evaluator_transition(tier: str, auto_approve: bool) -> str:
+    """Which transition an evaluator state fires for a given tier.
+
+    "approve" only when the evaluator approved AND the state opted into
+    auto_approve. Everything else takes "complete", which enters the gate for
+    human review — so a misparse, an unknown tier or a missing result fails
+    toward a person rather than past one.
+    """
+    if tier == "approve" and auto_approve:
+        return "approve"
+    return "complete"
 
 
 class Orchestrator:
@@ -1884,8 +1897,23 @@ class Orchestrator:
 
         if attempt.status == "succeeded":
             if attempt.state_name and attempt.state_name in self._states_for(issue):
-                # State machine mode: transition via "complete"
-                asyncio.create_task(self._safe_transition(issue, "complete"))
+                # State machine mode. An evaluator state reviews the prior stage
+                # and reports a tier; everything else transitions via "complete".
+                state_cfg = self._states_for(issue)[attempt.state_name]
+                transition = "complete"
+                if state_cfg.type == "evaluator":
+                    tier, _summary, _findings = parse_evaluation_tier(
+                        attempt.result_text or ""
+                    )
+                    transition = _select_evaluator_transition(
+                        tier, state_cfg.auto_approve
+                    )
+                    logger.info(
+                        f"Evaluation issue={issue.identifier} state={attempt.state_name} "
+                        f"tier={tier} transition={transition}",
+                        extra={"linked_to": issue.identifier},
+                    )
+                asyncio.create_task(self._safe_transition(issue, transition))
             else:
                 # Legacy mode
                 self._schedule_retry(issue, attempt_num=1, delay_ms=1000)
