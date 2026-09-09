@@ -243,34 +243,6 @@ def test_merge_state_config_replaces_hooks_wholesale():
     assert merged.timeout_ms == 60_000, "root timeout_ms is no longer discarded"
 
 
-def test_unwired_fork_config_keys_are_refused():
-    """A removed feature whose config key still parses is a silent downgrade.
-
-    `repos:` survived the convergence in two shipped example files and in the
-    README's copy-this instruction, while `RepoConfig` parsing did not. The
-    config validated cleanly and every `repo:` label was ignored, so a
-    multi-repo pipeline quietly ran against one repo.
-
-    Each entry is deleted from UNWIRED_FORK_KEYS when its layer is re-applied.
-    """
-    from stokowski.config import UNWIRED_FORK_KEYS, parse_workflow_file, validate_config
-
-    assert UNWIRED_FORK_KEYS, "registry is empty — delete this test with the last entry"
-
-    for name in ("workflow.multi-repo.example.yaml", "workflow.multi-repo-triage.example.yaml"):
-        path = REPO / name
-        if not path.exists():
-            continue
-        errors = validate_config(parse_workflow_file(str(path)).config)
-        assert any("repos:" in e for e in errors), (
-            f"{name} ships a repos: block but validates clean — an operator "
-            f"following README's copy instruction gets a silent single-repo run"
-        )
-
-    # Upstream's own example must stay clean, or the guard is too broad.
-    assert not validate_config(parse_workflow_file(str(REPO / "workflow.example.yaml")).config)
-
-
 def test_the_scanner_sees_alias_style_imports(tmp_path):
     """Guards the guard: an earlier version skipped these silently.
 
@@ -300,41 +272,23 @@ def test_the_scanner_ignores_unrelated_modules(tmp_path):
     assert _cross_seam_calls(package_dir=tmp_path) == []
 
 
-def test_unwired_keys_are_found_inside_project_blocks():
-    """`projects:` is upstream's documented multi-project shape.
+def test_the_unwired_key_scan_still_covers_project_blocks(monkeypatch):
+    """The registry is empty today; the mechanism still has to work.
 
-    The guard originally scanned only the top level, so a `repos:` block nested
-    under a project entry validated completely clean — the same silent
-    single-repo downgrade the guard exists to prevent, reached by the shape the
-    docs steer operators toward.
+    `UNWIRED_FORK_KEYS` is how a removed feature's config key gets refused
+    rather than silently ignored — the shape that let `repos:` be dropped while
+    the README told operators to copy that file. Both entries have since been
+    re-applied, so this exercises the scan against a synthetic key instead of a
+    live one, and specifically through `projects:`, which bypassed an earlier
+    version of the scan.
     """
-    import textwrap
+    from stokowski import config as config_mod  # noqa: PLC0415
 
-    from stokowski.config import parse_workflow_file, validate_config  # noqa: PLC0415
+    monkeypatch.setattr(config_mod, "UNWIRED_FORK_KEYS", {"widgets": "widgets are not wired"})
 
-    import tempfile
-    from pathlib import Path as _Path
-
-    body = textwrap.dedent("""
-        polling: {interval_ms: 15000}
-        projects:
-          - name: alpha
-            tracker: {kind: linear, api_key: "$LINEAR_API_KEY", project_slug: abc}
-            repos:
-              - {name: api, label: "repo:api", clone_url: "git@x:a.git", default: true}
-            prompts: {global: g.md}
-            linear_states: {todo: Todo, active: Doing, review: Review, done: Done}
-            states:
-              implement: {type: agent, prompt: p.md, transitions: {complete: done}}
-              done: {type: terminal}
-    """)
-    with tempfile.TemporaryDirectory() as d:
-        f = _Path(d) / "nested.yaml"
-        f.write_text(body)
-        cfg = parse_workflow_file(str(f)).config
-        assert "repos" in cfg.unwired_keys, (
-            "a repos: block nested under projects: was not detected; the guard "
-            "is scanning only the top level and can be bypassed by the shape "
-            "the multi-project docs recommend"
-        )
-        assert any("repos:" in e for e in validate_config(cfg))
+    assert config_mod._find_unwired_keys({"widgets": {}}) == ["widgets"], "top-level key missed"
+    assert config_mod._find_unwired_keys(
+        {"projects": [{"name": "a", "widgets": {}}]}
+    ) == ["widgets"], "a key nested under projects: was not detected"
+    assert config_mod._find_unwired_keys({"projects": [{"name": "a"}]}) == []
+    assert config_mod._find_unwired_keys({}) == []

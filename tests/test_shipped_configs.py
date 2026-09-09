@@ -27,7 +27,6 @@ ENV_ERRORS = ("missing tracker API key",)
 
 # Fork configs whose feature is parked in tests_pending/. Value = why.
 PENDING = {
-    "workflow.multi-repo.example.yaml": "repos: registry (multi-repo routing)",
     "workflow.multi-repo-triage.example.yaml": "repos: registry and derived workflow transitions",
     "examples/multi-project/workflow.alpha.yaml": "repos: registry and N-file multi-project",
     "examples/multi-project/workflow.beta.yaml": "repos: registry and N-file multi-project",

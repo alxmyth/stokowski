@@ -479,6 +479,7 @@ def assemble_prompt(
     last_run_at: str | None = None,
     comments: list[dict[str, Any]] | None = None,
     global_prompt: str | list[str] | None = None,
+    repo: RepoConfig | None = None,
 ) -> str:
     """Orchestrate three-layer prompt assembly.
 
@@ -504,12 +505,21 @@ def assemble_prompt(
     Returns:
         The fully assembled prompt string.
     """
+    # Resolve here only as a fallback. The orchestrator passes the repo it
+    # actually routed to, so the prompt names the same repo the workspace was
+    # keyed under even if the issue's labels changed mid-run.
+    if repo is None:
+        try:
+            repo = cfg.resolve_repo(issue)
+        except ValueError:
+            repo = None
+
     context = build_template_context(
         issue=issue,
         state_name=state_name,
         run=run,
         attempt=attempt,
-        last_run_at=last_run_at,
+        last_run_at=last_run_at,        repo=repo,
     )
 
     parts: list[str] = []
@@ -562,7 +572,7 @@ def assemble_prompt(
         linear_states=cfg.linear_states,
         run=run,
         is_rework=is_rework,
-        recent_comments=recent,
+        recent_comments=recent,        repo=repo,
     )
     parts.append(lifecycle)
 

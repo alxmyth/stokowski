@@ -132,6 +132,10 @@ class Orchestrator:
         # the pipeline under a working agent.
         self._issue_workflow: dict[str, str] = {}   # issue_id -> internal state name
         self._issue_state_runs: dict[str, int] = {}       # issue_id -> run number for current state
+        # issue_id -> repo name. The cancel path has an issue identifier but
+        # no labels, and removing a workspace under the wrong repo key would
+        # silently leave the real one on disk.
+        self._issue_repo: dict[str, str] = {}
         # (issue_id, state, run) already announced in Linear. Two call sites
         # post the entering-a-state comment — the transition, and the worker
         # that picks the state up ~1s later — and a continuation can re-enter
@@ -396,6 +400,31 @@ class Orchestrator:
         if self._linear:
             await self._linear.close()
 
+    def _repo_config_for(self, issue: Issue) -> RepoConfig | None:
+        """The RepoConfig this issue was routed to, or None if unresolvable."""
+        cached = self._issue_repo.get(issue.id)
+        if cached and cached in self.cfg.repos:
+            return self.cfg.repos[cached]
+        try:
+            return self.cfg.resolve_repo(issue)
+        except ValueError:
+            return None
+
+    def _repo_name_for(self, issue: Issue) -> str:
+        """Repo key for an issue's workspace, preferring the recorded decision.
+
+        Labels can change between dispatch and cleanup, and resolving afresh
+        then yields a different key than the workspace was created under —
+        which would leave the real directory and volume behind.
+        """
+        cached = self._issue_repo.get(issue.id)
+        if cached:
+            return cached
+        try:
+            return self.cfg.resolve_repo(issue).name
+        except ValueError:
+            return "_default"
+
     async def _startup_cleanup(self):
         """Remove workspaces for issues already in terminal states."""
         try:
@@ -410,6 +439,7 @@ class Orchestrator:
                     ws_root,
                     issue.identifier,
                     self.cfg.hooks,
+                    repo_name=self._repo_name_for(issue),
                     docker_cfg=self.cfg.docker_if_enabled,
                 )
             if terminal:
@@ -641,6 +671,7 @@ class Orchestrator:
                     ws_root,
                     issue.identifier,
                     self.cfg.hooks,
+                    repo_name=self._repo_name_for(issue),
                     docker_cfg=self.cfg.docker_if_enabled,
                 )
             except Exception as e:
@@ -1195,14 +1226,15 @@ class Orchestrator:
             # after_create override is ignored — is the lesser bug, and belongs
             # upstream with the merge semantics question, not patched here.
             _docker = self.cfg.docker_if_enabled
-            # Label-driven repo routing is not wired yet, so this resolves
-            # against the default registry entry — which for a single-repo
-            # config is the synthetic `_default`. The precedence order is live
-            # regardless, so a state- or repo-level image is honoured today.
-            _repo = next(
-                (r for r in self.cfg.repos.values() if r.default),
-                RepoConfig(name="_default", default=True),
-            )
+            # Route by repo: label, falling back to the default entry. For a
+            # single-repo config this is always the synthetic `_default`.
+            try:
+                _repo = self.cfg.resolve_repo(issue)
+                self._issue_repo[issue.id] = _repo.name
+            except ValueError:
+                # Validation rejects a multi-repo config with no default, so
+                # this is only reachable for a hand-built config in a test.
+                _repo = RepoConfig(name="_default", default=True)
             _state_image = _resolve_docker_image(
                 state_cfg, _repo, self.cfg.docker.default_image
             )
@@ -1210,6 +1242,7 @@ class Orchestrator:
                 ws_root,
                 issue.identifier,
                 self.cfg.hooks,
+                repo_name=_repo.name,
                 docker_cfg=_docker,
                 docker_image=_state_image,
             )
@@ -1398,6 +1431,7 @@ class Orchestrator:
                 last_run_at=last_run_at,
                 comments=comments,
                 global_prompt=(wf.global_prompt if (wf := self._workflow_for(issue)) else None),
+                repo=self._repo_config_for(issue),
             )
 
         # Legacy fallback
@@ -1429,6 +1463,7 @@ class Orchestrator:
                 last_run_at=last_run_at,
                 comments=None,
                 global_prompt=(wf.global_prompt if (wf := self._workflow_for(issue)) else None),
+                repo=self._repo_config_for(issue),
             )
 
         # Legacy mode: use workflow prompt_template with Jinja2
@@ -1870,6 +1905,7 @@ class Orchestrator:
                         ws_root,
                         attempt.issue_identifier,
                         self.cfg.hooks,
+                        repo_name=self._issue_repo.get(attempt.issue_id, "_default"),
                         docker_cfg=self.cfg.docker_if_enabled,
                     )
 
