@@ -13,10 +13,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from jinja2 import BaseLoader, Environment, Undefined
+from jinja2 import BaseLoader, Environment, StrictUndefined, Undefined
 
 from .config import (
+    HooksConfig,
     LinearStatesConfig,
+    RepoConfig,
     ServiceConfig,
     StateConfig,
     global_prompt_paths,
@@ -90,6 +92,7 @@ def build_template_context(
     run: int = 1,
     attempt: int = 1,
     last_run_at: str | None = None,
+    repo: RepoConfig | None = None,
 ) -> dict[str, Any]:
     """Build the Jinja2 template context dict from issue and run metadata.
 
@@ -103,7 +106,7 @@ def build_template_context(
     Returns:
         A flat dict suitable for Jinja2 rendering.
     """
-    return {
+    ctx: dict[str, Any] = {
         "issue_id": issue.id,
         "issue_identifier": issue.identifier,
         "issue_title": issue.title,
@@ -118,6 +121,78 @@ def build_template_context(
         "attempt": attempt,
         "last_run_at": last_run_at or "",
     }
+    if repo is not None:
+        # Exposed to templates as {{ repo.name }}, {{ repo.clone_url }},
+        # {{ repo.label }}. Empty strings rather than None so a template never
+        # renders the word "None" into a clone command.
+        ctx["repo"] = {
+            "name": repo.name,
+            "clone_url": repo.clone_url or "",
+            "label": repo.label or "",
+        }
+    return ctx
+
+
+def render_hook_template(
+    hook_script: str, repo: RepoConfig
+) -> str:
+    """Render a hook shell script with repo metadata using StrictUndefined.
+
+    Unlike ``render_template`` (which silently drops undefined variables),
+    this raises on any typo or missing variable — hooks execute as shell
+    and a silent empty-string substitution would produce dangerous behavior
+    like ``git clone $EMPTY``.
+
+    Context exposed: a nested ``repo`` namespace identical to the prompt
+    context — ``{{ repo.name }}``, ``{{ repo.clone_url }}``, ``{{ repo.label }}``.
+
+    This helper is ONLY invoked when the config has an explicit ``repos:``
+    section (``cfg.repos_synthesized == False``). Legacy configs bypass
+    Jinja rendering entirely so hook bodies with literal ``{``/``}``
+    (e.g. shell function syntax ``!f() { ...; }; f``) continue to work
+    unchanged.
+    """
+    env = Environment(loader=BaseLoader(), undefined=StrictUndefined)
+    template = env.from_string(hook_script)
+    return template.render(repo={
+        "name": repo.name,
+        "clone_url": repo.clone_url or "",
+        "label": repo.label or "",
+    })
+
+
+def render_hooks_for_dispatch(
+    hooks: HooksConfig, repo: RepoConfig | None, synthesized: bool
+) -> HooksConfig:
+    """Return a HooksConfig with fields Jinja-rendered over repo metadata.
+
+    When ``synthesized`` is True (legacy 1:1 config, no ``repos:`` section
+    in YAML), hook scripts are returned verbatim with NO rendering. This
+    preserves R19 backward compatibility for configs containing literal
+    ``{``/``}`` characters in shell bodies.
+
+    When ``synthesized`` is False, each non-empty hook field is rendered
+    with ``render_hook_template``. Undefined variable references raise
+    ``jinja2.UndefinedError`` which the orchestrator catches and surfaces
+    as a Linear comment on the ticket.
+
+    The original ``hooks`` object is not mutated; a new ``HooksConfig`` is
+    returned.
+    """
+    if synthesized or repo is None:
+        return hooks
+
+    def _render(script: str | None) -> str | None:
+        return render_hook_template(script, repo) if script else script
+
+    return HooksConfig(
+        after_create=_render(hooks.after_create),
+        before_run=_render(hooks.before_run),
+        after_run=_render(hooks.after_run),
+        before_remove=_render(hooks.before_remove),
+        on_stage_enter=_render(hooks.on_stage_enter),
+        timeout_ms=hooks.timeout_ms,
+    )
 
 
 def comment_author(comment: dict[str, Any]) -> str:
@@ -159,6 +234,7 @@ def build_lifecycle_section(
     run: int = 1,
     is_rework: bool = False,
     recent_comments: list[dict[str, Any]] | None = None,
+    repo: RepoConfig | None = None,
 ) -> str:
     """Generate the auto-injected lifecycle section.
 
@@ -187,6 +263,13 @@ def build_lifecycle_section(
     lines.append(f"- **Issue:** {issue.identifier} — {issue.title}")
     if issue.url:
         lines.append(f"- **URL:** {issue.url}")
+    # Only for an explicitly registered repo. The synthetic `_default` is the
+    # legacy single-repo fallback, where the agent has always inferred the
+    # codebase from cwd — naming it there is noise.
+    if repo is not None and repo.name != "_default":
+        lines.append(f"- **Repository:** {repo.name}")
+        if repo.clone_url:
+            lines.append(f"- **Clone URL:** {repo.clone_url}")
     lines.append(f"- **State:** {state_name}")
     lines.append(f"- **Run:** {run}")
     lines.append("")
