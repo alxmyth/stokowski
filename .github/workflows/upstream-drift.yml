@@ -63,14 +63,13 @@ jobs:
             echo "::notice::$behind commit(s) behind upstream. Run: git fetch upstream && git merge upstream/main"
           fi
 
-      - name: Report convergence debt
+      - name: Report fork divergence
         run: |
-          pending=$(ls tests_pending/test_*.py 2>/dev/null | wc -l | tr -d ' ')
-          echo "Fork features awaiting re-application: $pending"
+          # Files this fork changes that upstream also owns are what make a
+          # merge expensive; see docs/convergence.md.
+          patched=$(grep -rl "FORK PATCH" stokowski/ 2>/dev/null | wc -l | tr -d ' ')
+          echo "Files carrying a fork patch on an upstream line: $patched"
           {
             echo ""
-            echo "| Fork features awaiting re-application | $pending |"
+            echo "| Files carrying a fork patch on an upstream line | $patched |"
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$pending" -gt 0 ]; then
-            echo "::notice::$pending fork feature test file(s) still in tests_pending/ — see its README."
-          fi

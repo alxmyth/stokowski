@@ -11,7 +11,7 @@ positional arguments expecting `hooks` there, and every agent dispatch would
 have raised TypeError — with the whole suite green.
 
 These tests bind the orchestrator's real call shapes against our real
-signatures. When a fork feature is re-applied from `tests_pending/`, any
+signatures. When a fork feature is re-applied, any
 parameter it adds must stay keyword-optional or these fail.
 """
 from __future__ import annotations

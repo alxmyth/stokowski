@@ -181,3 +181,53 @@ def get_comments_since(
         result.append(comment)
 
     return result
+
+
+EVAL_PATTERN = re.compile(r"<!-- stokowski:evaluation ({.*?}) -->")
+
+_TIER_FALLBACK = re.compile(
+    r"\btier[:\s]+[\"']?(approve|review-required)[\"']?", re.IGNORECASE
+)
+
+def parse_evaluation_tier(
+    result_text: str,
+) -> tuple[str, str, list[str]]:
+    """Parse evaluation tier from agent result text.
+
+    Uses last-match semantics (like TRANSITION_PATTERN) to prevent
+    prompt injection from workspace content. Fallback keyword search
+    always returns review-required (never approve from fallback).
+    Defaults to review-required on any parse failure (fail-safe).
+    """
+    if not result_text:
+        return "review-required", "", []
+
+    # Primary: structured comment (last match wins)
+    matches = EVAL_PATTERN.findall(result_text)
+    if matches:
+        try:
+            data = json.loads(matches[-1])
+            tier = data.get("tier", "review-required")
+            if tier not in ("approve", "review-required"):
+                tier = "review-required"
+            summary = str(data.get("summary", ""))
+            findings = data.get("findings", [])
+            findings = [f for f in findings if isinstance(f, str)]
+            return tier, summary, findings
+        except (json.JSONDecodeError, AttributeError):
+            logger.warning("Malformed evaluation JSON, falling back")
+
+    # Fallback: keyword search — always returns review-required
+    fallback = _TIER_FALLBACK.search(result_text)
+    if fallback:
+        logger.info(
+            "Evaluation tier detected via keyword fallback, "
+            "forcing review-required"
+        )
+        return "review-required", "", []
+
+    # Default: review-required (fail-safe)
+    logger.warning(
+        "Could not parse evaluation tier, defaulting to review-required"
+    )
+    return "review-required", "", []

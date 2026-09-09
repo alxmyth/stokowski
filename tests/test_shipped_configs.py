@@ -25,7 +25,7 @@ REPO = Path(__file__).resolve().parent.parent
 # Linear key on purpose, so these are noise here.
 ENV_ERRORS = ("missing tracker API key",)
 
-# Fork configs whose feature is parked in tests_pending/. Value = why.
+# Configs that cannot validate yet. Value = why. Empty is the goal.
 PENDING = {
     "workflow.multi-repo-triage.example.yaml": "repos: registry and derived workflow transitions",
     "examples/multi-project/workflow.alpha.yaml": "repos: registry and N-file multi-project",

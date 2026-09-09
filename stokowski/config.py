@@ -111,7 +111,7 @@ class WorkflowSpec:
         machine does not contain, and it can never transition out.
         """
         for name, sc in self.states.items():
-            if sc.type == "agent":
+            if sc.type in ("agent", "evaluator"):
                 return name
         return None
 
@@ -248,6 +248,10 @@ class StateConfig:
     # Fork: per-state container image. Highest precedence in the resolution
     # order state -> docker.default_image. Inert unless docker.enabled.
     docker_image: str | None = None
+    # Fork: an `evaluator` state runs an agent that reviews the prior stage and
+    # emits a tier. auto_approve lets an `approve` tier skip the human gate;
+    # left false, every evaluation still lands in front of a person.
+    auto_approve: bool = False
 
 
 @dataclass
@@ -299,7 +303,7 @@ class ProjectConfig:
     @property
     def entry_state(self) -> str | None:
         for name, sc in self.states.items():
-            if sc.type == "agent":
+            if sc.type in ("agent", "evaluator"):
                 return name
         return None
 
@@ -327,7 +331,7 @@ class ProjectConfig:
         if ls.todo and ls.todo not in seen:
             seen.append(ls.todo)
         for sc in self.all_states().values():
-            if sc.type == "agent":
+            if sc.type in ("agent", "evaluator"):
                 linear_name = _resolve_linear_state_name(sc.linear_state, ls)
                 if linear_name and linear_name not in seen:
                     seen.append(linear_name)
@@ -482,7 +486,7 @@ class ServiceConfig:
         if self.projects:
             return self.projects[0].entry_state
         for name, sc in self.states.items():
-            if sc.type == "agent":
+            if sc.type in ("agent", "evaluator"):
                 return name
         return None
 
@@ -510,7 +514,7 @@ class ServiceConfig:
         if ls.todo and ls.todo not in seen:
             seen.append(ls.todo)
         for sc in self.states.values():
-            if sc.type == "agent":
+            if sc.type in ("agent", "evaluator"):
                 linear_name = _resolve_linear_state_name(sc.linear_state, ls)
                 if linear_name and linear_name not in seen:
                     seen.append(linear_name)
@@ -611,6 +615,7 @@ def _parse_state_config(name: str, raw: dict[str, Any]) -> StateConfig:
         linear_state=str(raw.get("linear_state", "active")),
         runner=str(raw.get("runner", "claude")),
         docker_image=raw.get("docker_image"),
+        auto_approve=bool(raw.get("auto_approve", False)),
         model=raw.get("model"),
         max_turns=raw.get("max_turns"),
         effort=raw.get("effort"),
@@ -1159,7 +1164,7 @@ def _validate_states(
             errors.append(f"{prefix} state '{name}': invalid type: {sc.type}")
             continue
 
-        if sc.type == "agent":
+        if sc.type in ("agent", "evaluator"):
             has_agent = True
             if not sc.prompt:
                 errors.append(f"{prefix} state '{name}': agent state missing 'prompt' field")
@@ -1204,7 +1209,7 @@ def _validate_states(
         errors.append(f"{prefix}: no terminal states defined")
 
     # Warn about unreachable states
-    entry = next((n for n, sc in states.items() if sc.type == "agent"), None)
+    entry = next((n for n, sc in states.items() if sc.type in ("agent", "evaluator")), None)
     reachable: set[str] = set()
     if entry:
         reachable.add(entry)
@@ -1410,7 +1415,7 @@ def validate_config(cfg: ServiceConfig) -> list[str]:
             if os.path.exists("/.dockerenv"):
                 claude_states = sorted(
                     name for name, sc in cfg.states.items()
-                    if sc.type == "agent" and sc.runner == "claude"
+                    if sc.type in ("agent", "evaluator") and sc.runner == "claude"
                 )
                 if claude_states:
                     missing = [
