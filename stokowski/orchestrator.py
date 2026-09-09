@@ -14,6 +14,7 @@ from typing import Any
 from jinja2 import Environment, StrictUndefined, TemplateSyntaxError
 
 from .config import (
+    RepoConfig,
     ClaudeConfig,
     HooksConfig,
     ProjectConfig,
@@ -38,6 +39,29 @@ from .ledger import Ledger
 from .workspace import ensure_workspace, remove_workspace
 
 logger = logging.getLogger("stokowski")
+
+
+def _resolve_docker_image(
+    state_cfg: StateConfig | None,
+    repo: RepoConfig,
+    platform_default: str,
+) -> str:
+    """Three-level Docker image resolution, most specific first.
+
+    1. ``state_cfg.docker_image`` — the workflow stage declares it, which wins
+       when a stage is repo-agnostic and should run the same image everywhere.
+    2. ``repo.docker_image`` — the registry entry's default, for toolchain-bound
+       stages on a heterogeneous team.
+    3. ``platform_default`` — ``docker.default_image``.
+
+    Returns "" when nothing is configured; the caller decides whether that is
+    acceptable.
+    """
+    if state_cfg and state_cfg.docker_image:
+        return state_cfg.docker_image
+    if repo.docker_image:
+        return repo.docker_image
+    return platform_default or ""
 
 
 class Orchestrator:
@@ -1171,7 +1195,17 @@ class Orchestrator:
             # after_create override is ignored — is the lesser bug, and belongs
             # upstream with the merge semantics question, not patched here.
             _docker = self.cfg.docker_if_enabled
-            _state_image = (state_cfg.docker_image or "") if state_cfg else ""
+            # Label-driven repo routing is not wired yet, so this resolves
+            # against the default registry entry — which for a single-repo
+            # config is the synthetic `_default`. The precedence order is live
+            # regardless, so a state- or repo-level image is honoured today.
+            _repo = next(
+                (r for r in self.cfg.repos.values() if r.default),
+                RepoConfig(name="_default", default=True),
+            )
+            _state_image = _resolve_docker_image(
+                state_cfg, _repo, self.cfg.docker.default_image
+            )
             ws = await ensure_workspace(
                 ws_root,
                 issue.identifier,
