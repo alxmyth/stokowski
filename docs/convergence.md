@@ -103,4 +103,29 @@ cannot fail, both read as coverage.** Hence:
 behind. The previous automation only tagged a backup; it ran for months and
 caught nothing, which is why this one fails instead of reporting.
 
-Routine sync: `git fetch upstream && git merge upstream/main`.
+Routine sync: `git fetch upstream && git merge upstream/main`. **Merge, never
+rebase.** The convergence gave this fork a shared merge base rather than a
+replayable patch stack, so a rebase replays smithc's absorbed pre-convergence
+commits and conflicts against content already in the tree -- reproduced: it dies
+on the first commit of the replay, `0ce5da5`, on the four hot files.
+
+### The Release workflow is disabled on this fork
+
+`.github/workflows/release.yml` was disabled on 2026-09-10 via
+`gh workflow disable release.yml --repo alxmyth/stokowski`. That is a repository
+setting and leaves **no trace in git**, so this note is the only record of it.
+
+Why: it fires on every push to `main` with `contents: write` and can `git tag`
+and `gh release create`. It is guarded only by a regex over the head commit's
+subject, with no owner check, so it runs here as readily as upstream. Today it
+cuts nothing only by accident -- this fork is ~100 commits ahead, so a sync can
+never fast-forward, and a merge commit's subject matches neither release
+pattern. A fast-forward would flip that to a real tag and release on the fork.
+
+It is disabled from the repo side rather than guarded in the file because
+release.yml is byte-identical to upstream's and upstream actively edits it; an
+`if: github.repository == ...` guard would plant a patch on a hot upstream file
+and would be invisible to `upstream-drift.yml`, which counts `FORK PATCH`
+markers under `stokowski/` only.
+
+Do not re-enable it without a replacement guard.
