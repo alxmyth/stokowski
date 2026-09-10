@@ -29,8 +29,12 @@ tripwire test that fails when a merge reverts it and names the patch in its
 failure message. `tests/test_fork_patches.py` is that registry; a document
 listing them would go stale the first time someone merged without reading it.
 
-Both are candidates to send upstream. The null-comment-body guard fixes a crash
-that makes three of upstream's *own* tests fail on their `main`.
+Both are candidates to send upstream. The null-comment-body guard fixes a real
+crash: three call sites in upstream's `tracking.py` do `comment.get("body", "")`,
+whose default applies only to a *missing* key, so a present-but-null body raises
+`TypeError` — and one of them, `parse_latest_tracking`, decides which state an
+issue resumes in. Upstream has no coverage for it and their suite is green on
+their `main` (269 passed, 1 skipped), so a PR must carry its own failing test.
 
 ## Features re-applied
 
