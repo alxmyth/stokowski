@@ -104,16 +104,26 @@ behind. The previous automation only tagged a backup; it ran for months and
 caught nothing, which is why this one fails instead of reporting.
 
 Routine sync: `git fetch upstream && git merge upstream/main`. **Merge, never
-rebase.** The convergence gave this fork a shared merge base rather than a
-replayable patch stack, so a rebase replays smithc's absorbed pre-convergence
-commits and conflicts against content already in the tree -- reproduced: it dies
-on the first commit of the replay, `0ce5da5`, on the four hot files.
+rebase.** Since 2026-11-13 the history is linear on top of upstream v1.1.0:
+smithc's 47 commits and our 24 were replayed onto it, followed by the
+convergence commit and everything after. That is still not a cheap patch stack.
+About seventy of those commits edit upstream's hot files and the convergence
+commit takes most of those edits back out, so a rebase would replay both halves
+against every new upstream change to those files. A merge only has to
+reconcile the current tree.
+
+The merge-based history from before that is kept under the tag
+`pre-linear-rebase`, and the fork as it stood before the convergence under
+`pre-convergence`. On the same date the GitHub repository was re-forked so its
+parent is Sugar-Coffee/stokowski rather than smithc/stokowski.
 
 ### The Release workflow is disabled on this fork
 
 `.github/workflows/release.yml` was disabled on 2026-09-10 via
-`gh workflow disable release.yml --repo alxmyth/stokowski`. That is a repository
-setting and leaves **no trace in git**, so this note is the only record of it.
+`gh workflow disable release.yml --repo alxmyth/stokowski`, and again on
+2026-11-13 after the repository was re-forked, since a new fork starts with it
+enabled. That is a repository setting and leaves **no trace in git**, so this
+note is the only record of it.
 
 Why: it fires on every push to `main` with `contents: write` and can `git tag`
 and `gh release create`. It is guarded only by a regex over the head commit's
